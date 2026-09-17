@@ -1,8 +1,8 @@
 """GS global ledger aligned with simplified design §6 and §8.
 
-The ledger keeps GS intent separate from task-observed results. Replays are
-accepted only when immutable command identity matches, and result merging is
-fenced by the original command context before revision ordering is considered.
+The ledger stores GS intent separately from task-observed results. Replays are
+accepted only for the same immutable business operation; result merging is
+fenced by the exact OperationContext and ReplicaKey before revision ordering.
 """
 
 from __future__ import annotations
@@ -11,13 +11,16 @@ import copy
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Tuple
+from typing import Any, Tuple
 
 from multi_task_scheduler.orchestration.contracts import (
+    IdleCandidate,
+    IdleCandidateReport,
     NodePlacement,
     OperationCommand,
     OperationResult,
     PlacementSpec,
+    ReplicaKey,
     RuntimeCapabilities,
 )
 from multi_task_scheduler.orchestration.operation_journal import Phase
@@ -40,18 +43,12 @@ class TaskRecord:
 
 @dataclass
 class NativeReplicaRecord:
+    key: ReplicaKey
     owner_task_session: str
-    replica_id: str
     node: NodePlacement
     gpu_uuids: Tuple[str, ...]
-    runtime_epoch: int = 0
     status: str = "ACTIVE"
     revision: int = 0
-
-    @property
-    def node_blocks(self) -> Tuple[NodePlacement, ...]:
-        """Compatibility projection for older read-only callers."""
-        return (self.node,)
 
 
 @dataclass
@@ -76,7 +73,7 @@ class GpuRecord:
 class LeaseRecord:
     lease_id: str
     donor_session: str
-    gpu_keys: Tuple[Tuple[str, str], ...] = ()  # (node_id, gpu_uuid)
+    gpu_keys: Tuple[Tuple[str, str], ...] = ()
     borrower_session: str | None = None
     lease_epoch: int = 0
     state: str = "PLANNED"
@@ -89,25 +86,19 @@ class LeaseRecord:
 
 @dataclass(frozen=True)
 class IdleObservation:
-    source_session: str
-    replica_id: str
+    candidate: IdleCandidate
     source_seq: int
-    production_epoch: int
-    observed_age: float
     valid_until: float
-    reason: str = ""
 
     @property
-    def key(self) -> Tuple[str, str]:
-        return (self.source_session, self.replica_id)
+    def key(self) -> ReplicaKey:
+        return self.candidate.key
 
 
 @dataclass
 class OperationRecord:
     operation_id: str
     command: OperationCommand
-    payload_digest: str
-    command_seq: int
     accepted_at: float = field(default_factory=time.monotonic)
     phase: Phase = Phase.VALIDATE
     final_result: OperationResult | None = None
@@ -130,24 +121,16 @@ class ProtocolInstance:
 
 @dataclass(frozen=True)
 class ResourceManifest:
-    """Registration payload: first-release single-node placement + ownership."""
-
     owner_task_session: str
     placement: PlacementSpec
     replica_id: str
     runtime_epoch: int = 0
 
-
-@dataclass(frozen=True)
-class IdleReport:
-    """LB -> GS idle-candidate report; complete-set replacement semantics."""
-
-    source_session: str
-    source_seq: int
-    production_epoch: int
-    candidate_ids: Tuple[str, ...] = ()
-    candidate_reasons: Mapping[str, str] = field(default_factory=dict)
-    valid_for_ms: int = 1000
+    def __post_init__(self) -> None:
+        if not self.owner_task_session or not self.replica_id:
+            raise ValueError("resource manifest identities must be nonempty")
+        if self.runtime_epoch < 0:
+            raise ValueError("runtime_epoch must be nonnegative")
 
 
 class Ledger:
@@ -156,14 +139,12 @@ class Ledger:
     def __init__(self, protocol: ProtocolInstance) -> None:
         self.protocol = protocol
         self.tasks: dict[Tuple[str, str], TaskRecord] = {}
-        self.native_replicas: dict[Tuple[str, str], NativeReplicaRecord] = {}
+        self.native_replicas: dict[ReplicaKey, NativeReplicaRecord] = {}
         self.gpus: dict[Tuple[str, str, str], GpuRecord] = {}
         self.leases: dict[str, LeaseRecord] = {}
-        self.idle_observations: dict[Tuple[str, str], IdleObservation] = {}
+        self.idle_observations: dict[ReplicaKey, IdleObservation] = {}
         self.operations: dict[str, OperationRecord] = {}
-        self._idle_reports: dict[str, IdleReport] = {}
-
-    # -- tasks ----------------------------------------------------------- #
+        self._idle_reports: dict[Tuple[str, str], IdleCandidateReport] = {}
 
     def register_task(
         self,
@@ -193,10 +174,8 @@ class Ledger:
         record.last_probe = time.monotonic()
         return record
 
-    # -- resources -------------------------------------------------------- #
-
     def register_resources(self, manifest: ResourceManifest) -> NativeReplicaRecord:
-        """Validate single-node physical identities atomically, then record M/GPU facts."""
+        """Validate single-node physical identities atomically, then record GS facts."""
         if not any(
             record.task_session == manifest.owner_task_session
             for record in self.tasks.values()
@@ -223,18 +202,19 @@ class Ledger:
         }
         self.gpus.update(new_gpus)
 
-        replica_key = (manifest.owner_task_session, manifest.replica_id)
-        replica = NativeReplicaRecord(
-            owner_task_session=manifest.owner_task_session,
+        key = ReplicaKey(
+            task_session=manifest.owner_task_session,
             replica_id=manifest.replica_id,
-            node=node,
-            gpu_uuids=manifest.placement.gpu_uuids,
             runtime_epoch=manifest.runtime_epoch,
         )
-        self.native_replicas[replica_key] = replica
+        replica = NativeReplicaRecord(
+            key=key,
+            owner_task_session=manifest.owner_task_session,
+            node=node,
+            gpu_uuids=node.gpu_uuids,
+        )
+        self.native_replicas[key] = replica
         return replica
-
-    # -- GPU authorization (GS-only) ------------------------------------- #
 
     def set_current_user(
         self,
@@ -258,8 +238,6 @@ class Ledger:
         gpu.lease_epoch = 0
         gpu.state = "FREE"
 
-    # -- leases ----------------------------------------------------------- #
-
     def open_lease(self, lease: LeaseRecord) -> None:
         if lease.lease_id in self.leases:
             raise ValueError(f"lease already exists: {lease.lease_id}")
@@ -268,101 +246,73 @@ class Ledger:
     def get_lease(self, lease_id: str) -> LeaseRecord:
         return self.leases[lease_id]
 
-    # -- idle observations ------------------------------------------------ #
-
-    def upsert_idle_observation(self, report: IdleReport, valid_until: float) -> None:
+    def upsert_idle_report(self, report: IdleCandidateReport, valid_until: float) -> None:
+        if report.gs_epoch != self.protocol.gs_epoch:
+            raise ValueError("stale idle report gs_epoch")
         if not math.isfinite(valid_until):
-            raise ValueError("Idle observations require a finite expiry")
-        if type(report.source_seq) is not int or report.source_seq < 0:
-            raise ValueError("source_seq must be a nonnegative integer")
-        previous = self._idle_reports.get(report.source_session)
+            raise ValueError("idle observations require a finite expiry")
+        report_key = (report.task_session, report.lb_session)
+        previous = self._idle_reports.get(report_key)
         if previous is not None:
             if report.source_seq < previous.source_seq:
                 return
             if report.source_seq == previous.source_seq:
                 if report != previous:
                     raise ValueError("conflicting idle report replay")
-                return  # A repeated observation never renews its TTL.
-            if report.production_epoch < previous.production_epoch:
-                raise ValueError("stale production epoch")
+                return
+            if report.production_revision < previous.production_revision:
+                raise ValueError("stale production revision")
+
         self.idle_observations = {
             key: value
             for key, value in self.idle_observations.items()
-            if key[0] != report.source_session
+            if key.task_session != report.task_session
         }
-        self._idle_reports[report.source_session] = copy.deepcopy(report)
-        for replica_id in report.candidate_ids:
-            obs = IdleObservation(
-                source_session=report.source_session,
-                replica_id=replica_id,
+        self._idle_reports[report_key] = copy.deepcopy(report)
+        for candidate in report.candidates:
+            self.idle_observations[candidate.key] = IdleObservation(
+                candidate=candidate,
                 source_seq=report.source_seq,
-                production_epoch=report.production_epoch,
-                observed_age=0.0,
                 valid_until=valid_until,
-                reason=report.candidate_reasons.get(replica_id, ""),
             )
-            self.idle_observations[obs.key] = obs
 
     def stale_idle_observations(self, now: float) -> Tuple[IdleObservation, ...]:
-        return tuple(o for o in self.idle_observations.values() if o.valid_until <= now)
-
-    # -- operations ------------------------------------------------------- #
+        return tuple(
+            observation
+            for observation in self.idle_observations.values()
+            if observation.valid_until <= now
+        )
 
     @staticmethod
     def _command_identity(command: OperationCommand) -> tuple:
-        """Fields that must stay identical for one operation_id replay.
-
-        remaining_budget_ms is deliberately excluded: retries may carry a lower
-        remaining transport budget without changing the business operation.
-        """
+        """Business identity; remaining transport budget may decrease on retry."""
         return (
-            command.protocol_version,
-            command.gs_epoch,
-            command.target_task_id,
-            command.target_task_session,
-            command.operation_id,
+            command.ctx,
             command.kind,
-            command.lease_id,
-            command.lease_epoch,
-            command.command_seq,
-            command.replica_id,
-            command.expected_runtime_epoch,
-            command.expected_revision,
+            command.target,
+            command.authorization,
             command.placement,
-            command.candidate_epoch,
+            command.candidate,
             command.recall_mode,
             command.payload_digest,
         )
 
     def record_operation(self, command: OperationCommand) -> OperationRecord:
-        existing = self.operations.get(command.operation_id)
+        existing = self.operations.get(command.ctx.operation_id)
         if existing is not None:
             if self._command_identity(existing.command) != self._command_identity(command):
-                raise ValueError(f"conflicting replay for operation {command.operation_id}")
+                raise ValueError(f"conflicting replay for operation {command.ctx.operation_id}")
             return existing
         record = OperationRecord(
-            operation_id=command.operation_id,
+            operation_id=command.ctx.operation_id,
             command=command,
-            payload_digest=command.payload_digest,
-            command_seq=command.command_seq,
         )
-        self.operations[command.operation_id] = record
+        self.operations[command.ctx.operation_id] = record
         return record
 
     @staticmethod
     def _result_matches_command(command: OperationCommand, result: OperationResult) -> bool:
-        ctx = result.identity_fields
-        return (
-            ctx.protocol_version == command.protocol_version
-            and ctx.gs_epoch == command.gs_epoch
-            and ctx.task_id == command.target_task_id
-            and ctx.task_session == command.target_task_session
-            and ctx.operation_id == command.operation_id
-            and ctx.lease_id == command.lease_id
-            and ctx.lease_epoch == command.lease_epoch
-            and ctx.command_seq == command.command_seq
-            and ctx.expected_revision == command.expected_revision
-        )
+        return result.ctx == command.ctx and result.target == command.target
 
     def merge_operation_result(
         self, operation_id: str, result: OperationResult
@@ -370,7 +320,7 @@ class Ledger:
         record = self.operations.get(operation_id)
         if record is None:
             raise ValueError(f"unknown operation {operation_id!r}")
-        if result.identity_fields.operation_id != operation_id:
+        if result.ctx.operation_id != operation_id:
             raise ValueError("operation result id does not match merge target")
         if not self._result_matches_command(record.command, result):
             raise ValueError(f"stale or mismatched operation result for {operation_id!r}")
