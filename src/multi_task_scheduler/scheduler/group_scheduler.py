@@ -1,7 +1,8 @@
 """Shared GroupScheduler actor for simplified design §3/§8.
 
 GS owns global resource authorization and intent. It forwards lifecycle commands
-to the attached TaskRunner and never converts ACK/health into fake completion.
+to the attached TaskRunner and never converts ACK/health/status into physical
+release proof.
 """
 
 import time
@@ -17,6 +18,7 @@ from multi_task_scheduler.orchestration.contracts import (
     QueryResult,
 )
 from multi_task_scheduler.orchestration.operation_journal import (
+    OperationKind,
     OperationStatus,
     Outcome,
     Phase,
@@ -32,6 +34,13 @@ from multi_task_scheduler.scheduler.lease import LeaseState, LeaseStateMachine
 
 RUNTIME_KIND = "verl-multi-task:experimental_fully_async_standalone:p1"
 PROTOCOL_VERSION = 1
+
+_EXPECTED_LEASE_STATE = {
+    OperationKind.DONATE: LeaseState.DONOR_DRAINING,
+    OperationKind.ADD: LeaseState.BORROWER_PREPARING,
+    OperationKind.REMOVE: LeaseState.RECALLING,
+    OperationKind.RESTORE: LeaseState.DONOR_RESTORING,
+}
 
 
 @ray.remote(num_cpus=0)
@@ -115,6 +124,44 @@ class GroupScheduler:
         )
         return Ack(accepted=True, revision=report.source_seq)
 
+    def _validate_lease_authorization(self, command: OperationCommand) -> None:
+        lease = self.ledger.leases.get(command.ctx.lease_id)
+        if lease is None:
+            raise ValueError("unknown lease")
+        authorization = command.authorization
+        if lease.lease_epoch != command.ctx.lease_epoch:
+            raise ValueError("stale lease_epoch")
+        if authorization.donor_session != lease.donor_session:
+            raise ValueError("authorization donor_session does not match lease")
+        if lease.borrower_session is None:
+            raise ValueError("lease has no borrower_session")
+        if authorization.borrower_session != lease.borrower_session:
+            raise ValueError("authorization borrower_session does not match lease")
+        if lease.placement is None:
+            raise ValueError("lease has no placement evidence")
+        if authorization.placement_digest != lease.placement.placement_digest:
+            raise ValueError("authorization placement does not match lease")
+
+        expected_state = _EXPECTED_LEASE_STATE[command.kind]
+        if LeaseState(lease.state) is not expected_state:
+            raise ValueError(
+                f"lease state {lease.state} does not authorize {command.kind.value}"
+            )
+
+        expected_session = (
+            lease.donor_session
+            if command.kind in {OperationKind.DONATE, OperationKind.RESTORE}
+            else lease.borrower_session
+        )
+        if command.ctx.task_session != expected_session:
+            raise ValueError("operation targets the wrong lease participant")
+
+        if command.kind in {OperationKind.ADD, OperationKind.RESTORE}:
+            if lease.last_release_digest is None:
+                raise ValueError("lease has no GS-confirmed prior release evidence")
+            if authorization.prior_release_digest != lease.last_release_digest:
+                raise ValueError("prior_release_digest does not match GS-confirmed release")
+
     def _validate_command_fence(self, command: OperationCommand) -> None:
         protocol = self.ledger.protocol
         if command.ctx.protocol_version != protocol.protocol_version:
@@ -134,9 +181,10 @@ class GroupScheduler:
             raise ValueError("target runtime belongs to a different task_session")
         if task_key not in self.controllers:
             raise ValueError("target TaskRunner controller is not attached")
+        self._validate_lease_authorization(command)
 
     def submit_operation(self, command: OperationCommand) -> OperationResult:
-        """Record GS intent, forward once to TR, and return TR's ACCEPTED result."""
+        """Record GS intent, forward once to TR, and return TR's current result."""
         if not isinstance(command, OperationCommand):
             raise TypeError("submit_operation requires OperationCommand")
         self._validate_command_fence(command)
@@ -168,8 +216,6 @@ class GroupScheduler:
                 phase=Phase.VALIDATE,
                 phase_revision=0,
             )
-            # GS has recorded intent but cannot prove whether a dispatched RPC
-            # reached TaskRunner; this fallback must remain conservative.
             outcome = Outcome.UNKNOWN
         return QueryResult(found=True, value=result, outcome=outcome)
 
@@ -248,13 +294,24 @@ class GroupScheduler:
         self,
         lease_id: str,
         new_state: str,
-        supporting_result_state: OperationStatus | None = None,
         operation_id: str | None = None,
     ) -> dict:
-        self.lease_sm.advance(
+        """Advance authorization using the authoritative operation result when required."""
+        supporting_result = None
+        if operation_id is not None:
+            record = self.ledger.operations.get(operation_id)
+            if record is None:
+                raise ValueError(f"unknown operation {operation_id!r}")
+            queried = self.query_operation(record.command.ctx.task_session, operation_id)
+            if queried.found:
+                supporting_result = queried.value
+        lease = self.lease_sm.advance(
             lease_id,
             LeaseState(new_state),
-            supporting_result_state=supporting_result_state,
-            operation_id=operation_id,
+            supporting_result=supporting_result,
         )
-        return {"lease_id": lease_id, "state": new_state}
+        return {
+            "lease_id": lease_id,
+            "state": lease.state,
+            "last_release_digest": lease.last_release_digest,
+        }
