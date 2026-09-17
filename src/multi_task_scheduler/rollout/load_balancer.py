@@ -1,14 +1,9 @@
-"""Native routing subclass with an orchestration overlay and no scheduling side effects.
+"""Native routing subclass with a conservative orchestration R view.
 
-The native ``acquire_server`` / ``release_server`` / ``add_servers`` routing stays
-inherited; this overlay tracks a separate orchestration view: the monotonically
-increasing ``routing_epoch``, the ``routable_ids`` set, the ``draining_ids`` set,
-and per-replica attempt bookkeeping. ``begin_drain`` atomically advances the
-epoch and drops the target from the routable set (section 4.1).
-
-The async ``RoutingProtocol`` adapter used by ``ScaleTransaction`` maps the
-Trainer/Rollouter's head-server descriptor to a ``replica_id`` before calling
-these concrete methods.
+Native request selection remains inherited.  The overlay owns only routing
+eligibility, a monotonic route revision and attempt facts used by lifecycle
+operations.  It never discards unresolved attempts in order to manufacture a
+successful remove.
 """
 
 from verl.workers.rollout.llm_server import DEFAULT_ROUTING_CACHE_SIZE, GlobalRequestLoadBalancer
@@ -31,28 +26,66 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         self.routable_ids = set(servers)
         self.draining_ids = set()
         self.attempts = {}
+        self.route_metadata = {
+            replica_id: {"serving_version": None, "ce_revision": None, "lease_valid": True}
+            for replica_id in servers
+        }
 
     def begin_drain(self, replica_id: str) -> int:
-        """Atomically advance routing_epoch and remove the target from routable."""
+        """Atomically close new routing and advance the per-task route fence."""
         self.draining_ids.add(replica_id)
         self.routable_ids.discard(replica_id)
         self.routing_epoch += 1
         return self.routing_epoch
 
-    def commit_routable(self, replica_id: str) -> int:
-        """Publish a target as routable after bootstrap/CE evidence is verified."""
+    def commit_routable(
+        self,
+        replica_id: str,
+        *,
+        serving_version: int,
+        ce_revision: int,
+        lease_valid: bool,
+    ) -> int:
+        """Open routing only with explicit weight/member/lease commit evidence."""
+        if serving_version < 0 or ce_revision < 0:
+            raise ValueError("serving_version and ce_revision must be nonnegative")
+        if not lease_valid:
+            raise ValueError("cannot route a replica without a valid lease/identity fence")
+        self.route_metadata[replica_id] = {
+            "serving_version": serving_version,
+            "ce_revision": ce_revision,
+            "lease_valid": True,
+        }
         self.routable_ids.add(replica_id)
         self.draining_ids.discard(replica_id)
         self.routing_epoch += 1
         return self.routing_epoch
 
+    def _has_unsettled_attempts(self, replica_id: str) -> bool:
+        attempts = self.attempts.get(replica_id)
+        if attempts is None:
+            return False
+        if isinstance(attempts, dict):
+            terminal = {"TERMINAL", "RELEASED"}
+            for value in attempts.values():
+                state = getattr(value, "state", value)
+                state = getattr(state, "value", state)
+                if state not in terminal:
+                    return True
+            return False
+        return bool(attempts)
+
     def finish_remove(self, replica_id: str) -> bool:
-        """Drop the target once its attempts are drained and CE excluded."""
+        """Commit R=REMOVED only when no unresolved attempt remains."""
+        if self._has_unsettled_attempts(replica_id):
+            return False
         self.draining_ids.discard(replica_id)
         self.routable_ids.discard(replica_id)
+        self.route_metadata.pop(replica_id, None)
         self.attempts.pop(replica_id, None)
+        self.routing_epoch += 1
         return True
 
     def query_routing_operation(self, operation_id: str) -> str:
-        """Reconciliation hook after a lost routing receipt (section 4.1)."""
+        """Reconciliation hook; unknown is not evidence that nothing executed."""
         return "unknown"
