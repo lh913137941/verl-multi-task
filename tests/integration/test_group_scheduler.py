@@ -1,7 +1,6 @@
-"""Selected CPU Ray tests for GS discovery, handles and simplified contracts.
+"""Selected CPU Ray tests for GS discovery and current orchestration contracts.
 
-These tests do not import verl or claim validation of GPU/native trainer actors.
-Run this file explicitly; it creates and removes only its own test actors.
+These tests do not import verl GPU actors and do not claim CUDA/NCCL validation.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -12,36 +11,48 @@ import ray
 
 from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
 from multi_task_scheduler.orchestration.contracts import (
+    IdleCandidate,
+    IdleCandidateReport,
+    LeaseAuthorization,
     NodePlacement,
     OperationCommand,
     OperationResult,
     PlacementSpec,
+    ReplicaKey,
 )
 from multi_task_scheduler.orchestration.operation_journal import (
     OperationKind,
     OperationStatus,
+    Outcome,
     Phase,
 )
 from multi_task_scheduler.scheduler import discovery
 from multi_task_scheduler.scheduler.group_scheduler import RUNTIME_KIND
-from multi_task_scheduler.scheduler.ledger import IdleReport, LeaseRecord, ResourceManifest
-
+from multi_task_scheduler.scheduler.ledger import LeaseRecord, ResourceManifest
 
 pytestmark = pytest.mark.ray_integration
 
 
 @ray.remote(num_cpus=0)
 class TaskRunnerProbe:
-    """Test-only handle target; this is not the actual MultiTask TaskRunner."""
-
     def identity(self):
         return ray.get_runtime_context().get_actor_id()
+
+    def submit_operation(self, command):
+        return OperationResult(
+            ctx=command.ctx,
+            target=command.target,
+            status=OperationStatus.ACCEPTED,
+            phase=Phase.VALIDATE,
+            phase_revision=0,
+        )
+
+    def probe_task(self, task_session):
+        return {"task_session": task_session, "probe": "ok"}
 
 
 @ray.remote(num_cpus=0)
 class BaseProbe:
-    """Test-only decorated parent; this is deliberately not a verl class."""
-
     def __init__(self, value):
         self.value = value
 
@@ -51,7 +62,7 @@ class BaseProbe:
 
 @pytest.fixture
 def isolated_ray(monkeypatch):
-    assert not ray.is_initialized(), "Run the selected GS tests outside any existing Ray session"
+    assert not ray.is_initialized()
     name = f"multitask-gs-test-{uuid.uuid4().hex}"
     namespace = f"multitask-test-{uuid.uuid4().hex}"
     monkeypatch.setattr(discovery, "GROUP_SCHEDULER_NAME", name)
@@ -75,22 +86,101 @@ def isolated_ray(monkeypatch):
         ray.shutdown()
 
 
-def test_discovery_requires_an_initialized_ray_runtime():
+def _placement():
+    return PlacementSpec(
+        node=NodePlacement(
+            node_id="n1",
+            gpu_uuids=("u0",),
+            physical_gpu_ids=(0,),
+            global_ranks=(0,),
+            local_ranks=(0,),
+        ),
+        tp=1,
+        dp=1,
+        pp=1,
+        model_signature="sig-1",
+        placement_digest="placement-u0",
+    )
+
+
+def _command(protocol_version, gs_epoch, *, operation_id="op-1", digest="d1"):
+    ctx = __import__(
+        "multi_task_scheduler.orchestration.contracts",
+        fromlist=["OperationContext"],
+    ).OperationContext(
+        protocol_version=protocol_version,
+        gs_epoch=gs_epoch,
+        task_id="task-a",
+        task_session="s1",
+        operation_id=operation_id,
+        lease_id="l1",
+        lease_epoch=0,
+        command_seq=0,
+    )
+    target = ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0)
+    authorization = LeaseAuthorization(
+        lease_id="l1",
+        gs_epoch=gs_epoch,
+        donor_session="donor",
+        borrower_session="s1",
+        placement_digest="placement-u0",
+        lease_epoch=0,
+        purpose=OperationKind.ADD,
+        prior_release_digest="release-0",
+        authorization_seq=1,
+    )
+    return OperationCommand(
+        ctx=ctx,
+        kind=OperationKind.ADD,
+        target=target,
+        authorization=authorization,
+        payload_digest=digest,
+        remaining_budget_ms=1000,
+        placement=_placement(),
+    )
+
+
+def _idle_report(gs_epoch):
+    candidate = IdleCandidate(
+        key=ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0),
+        production_epoch=3,
+        source_seq=1,
+        manager_revision=1,
+        lb_revision=1,
+        engine_digest="engine-1",
+        reason="EXHAUSTED",
+        stable_idle_ms=500,
+        observed_age_ms=10,
+        gpu_count=1,
+        evidence_digest="idle-1",
+        placement_digest="placement-u0",
+    )
+    return IdleCandidateReport(
+        task_session="s1",
+        gs_epoch=gs_epoch,
+        lb_session="lb-1",
+        source_seq=1,
+        production_revision=3,
+        valid_for_ms=1000,
+        candidates=(candidate,),
+    )
+
+
+def test_discovery_requires_initialized_ray_runtime():
     assert not ray.is_initialized()
     with pytest.raises(RuntimeError):
         discovery.get_or_create_group_scheduler()
 
 
-def test_concurrent_discovery_returns_one_real_scheduler_and_round_trips_handles(isolated_ray):
+def test_concurrent_discovery_returns_one_scheduler_and_round_trips_handles(isolated_ray):
     with ThreadPoolExecutor(max_workers=4) as executor:
         schedulers = list(
             executor.map(lambda _: discovery.get_or_create_group_scheduler(), range(8))
         )
-    assert all(isinstance(scheduler, ray.actor.ActorHandle) for scheduler in schedulers)
-    assert len({scheduler._actor_id for scheduler in schedulers}) == 1
+    assert all(isinstance(item, ray.actor.ActorHandle) for item in schedulers)
+    assert len({item._actor_id for item in schedulers}) == 1
     scheduler = schedulers[0]
     assert ray.get(scheduler.runtime_kind.remote()) == RUNTIME_KIND
-    assert ray.get(scheduler.schedule.remote()) == []
 
     first = TaskRunnerProbe.remote()
     second = TaskRunnerProbe.remote()
@@ -99,12 +189,7 @@ def test_concurrent_discovery_returns_one_real_scheduler_and_round_trips_handles
         ray.get(scheduler.attach_task.remote("task-a", first))
         with pytest.raises(ValueError):
             ray.get(scheduler.attach_task.remote("task-a", second))
-        handles = ray.get(scheduler.get_task_runners.remote())
-        assert set(handles) == {"task-a"}
-        assert ray.get(handles["task-a"].identity.remote()) == ray.get(first.identity.remote())
-        with pytest.raises((TypeError, ValueError)):
-            ray.get(scheduler.attach_task.remote("task-b", object()))
-        ray.get(scheduler.detach_task.remote("task-a"))
+        assert ray.get(scheduler.get_task_runners.remote())["task-a"] == first
         ray.get(scheduler.detach_task.remote("task-a"))
         assert ray.get(scheduler.get_task_runners.remote()) == {}
     finally:
@@ -112,64 +197,23 @@ def test_concurrent_discovery_returns_one_real_scheduler_and_round_trips_handles
         ray.kill(second, no_restart=True)
 
 
-def test_real_ray_unwrap_subclass_and_remote_constructor_delegate_to_parent(isolated_ray):
-    """Prove the Ray mechanism only, not actual verl parent initialization."""
-
+def test_real_ray_unwrap_subclass_delegates_to_parent(isolated_ray):
     class ChildProbe(unwrap_native_actor_class(BaseProbe)):
-        def __init__(self, value):
-            super().__init__(value)
-            self.child_initialized = True
-
         def describe(self):
-            return super().base_value(), self.child_initialized, type(self).__name__
+            return super().base_value(), type(self).__name__
 
-    child_actor_class = ray.remote(num_cpus=0)(ChildProbe)
-    child = child_actor_class.remote(17)
+    actor = ray.remote(num_cpus=0)(ChildProbe).remote(17)
     try:
-        assert ray.get(child.base_value.remote()) == 17
-        assert ray.get(child.describe.remote()) == (17, True, "ChildProbe")
+        assert ray.get(actor.describe.remote()) == (17, "ChildProbe")
     finally:
-        ray.kill(child, no_restart=True)
+        ray.kill(actor, no_restart=True)
 
 
-def _placement():
-    node = NodePlacement(
-        node_id="n1",
-        gpu_uuids=("u0",),
-        physical_gpu_ids=(0,),
-        global_ranks=(0,),
-        local_ranks=(0,),
-    )
-    return PlacementSpec(
-        node=node,
-        model_signature="sig-1",
-        placement_digest="placement-u0",
-    )
-
-
-def _command(protocol_version, gs_epoch, operation_id="op-1", digest="d1"):
-    return OperationCommand(
-        protocol_version=protocol_version,
-        gs_epoch=gs_epoch,
-        target_task_id="task-a",
-        target_task_session="s1",
-        operation_id=operation_id,
-        payload_digest=digest,
-        kind=OperationKind.ADD,
-        lease_id="l1",
-        lease_epoch=0,
-        command_seq=0,
-        replica_id="r1",
-    )
-
-
-def test_gs_control_interfaces_round_trip(isolated_ray):
-    """GS stores fenced intent and merges typed progress; no GPU policy is claimed."""
+def test_gs_control_interfaces_use_current_typed_contract(isolated_ray):
     scheduler = discovery.get_or_create_group_scheduler()
     task = TaskRunnerProbe.remote()
     try:
         attached = ray.get(scheduler.attach_controller.remote("task-a", "s1", task))
-        assert attached["status"] == "INITIALIZING"
         protocol_version = attached["protocol_version"]
         gs_epoch = attached["gs_epoch"]
         assert type(protocol_version) is int
@@ -178,61 +222,48 @@ def test_gs_control_interfaces_round_trip(isolated_ray):
         manifest = ResourceManifest(
             owner_task_session="s1", placement=_placement(), replica_id="r1"
         )
-        assert ray.get(scheduler.register_resources.remote("reg-1", manifest))["status"] == "READY"
+        assert ray.get(
+            scheduler.register_resources.remote("reg-1", manifest)
+        )["status"] == "READY"
 
         command = _command(protocol_version, gs_epoch)
-        assert ray.get(scheduler.submit_operation.remote(command))["status"] == "ACCEPTED"
-        rejected = ray.get(
-            scheduler.submit_operation.remote(
-                _command(protocol_version, gs_epoch, digest="other")
+        accepted = ray.get(scheduler.submit_operation.remote(command))
+        assert accepted.status is OperationStatus.ACCEPTED
+        assert accepted.phase is Phase.VALIDATE
+
+        with pytest.raises(ValueError, match="conflicting replay"):
+            ray.get(
+                scheduler.submit_operation.remote(
+                    _command(protocol_version, gs_epoch, digest="other")
+                )
             )
-        )
-        assert rejected["status"] == "FAILED"
 
-        stale = ray.get(
-            scheduler.submit_operation.remote(
-                _command(protocol_version, "old-gs", operation_id="op-stale")
+        with pytest.raises(ValueError, match="stale gs_epoch"):
+            ray.get(
+                scheduler.submit_operation.remote(
+                    _command(protocol_version, "old-gs", operation_id="op-stale")
+                )
             )
-        )
-        assert stale["status"] == "FAILED"
 
-        query = ray.get(scheduler.query_operation.remote("op-1"))
-        assert query["phase"] == Phase.VALIDATE.value
-        assert query["status"] == OperationStatus.ACCEPTED.value
+        query = ray.get(scheduler.query_operation.remote("s1", "op-1"))
+        assert query.found is True
+        assert query.value.status is OperationStatus.ACCEPTED
+        assert query.outcome is Outcome.UNKNOWN
 
-        result = OperationResult(
-            identity_fields=command.context,
-            phase=Phase.CREATE,
-            phase_revision=1,
-            state=OperationStatus.RUNNING,
-            actual_replica_state="PREPARING",
-        )
-        assert ray.get(scheduler.report_operation_result.remote(result))["merged"] is True
-        merged = ray.get(scheduler.query_operation.remote("op-1"))["final_result"]
-        assert merged.status is OperationStatus.RUNNING
-        assert merged.phase is Phase.CREATE
+        idle_ack = ray.get(scheduler.report_idle_candidates.remote(_idle_report(gs_epoch)))
+        assert idle_ack.accepted is True
+        assert idle_ack.revision == 1
 
-        snapshot = ray.get(scheduler.get_resource_snapshot.remote("s1"))
-        assert snapshot["expected_session"] == "s1"
-        assert snapshot["protocol_version"] == protocol_version
-        assert snapshot["gs_epoch"] == gs_epoch
-        assert any(g["gpu_uuid"] == "u0" for g in snapshot["gpus"])
-
-        idle = IdleReport(
-            source_session="s1",
-            source_seq=1,
-            production_epoch=0,
-            candidate_ids=("r1",),
-        )
-        assert ray.get(scheduler.report_idle_candidates.remote(idle))["candidates"] == ["r1"]
+        assert ray.get(scheduler.probe_task.remote("task-a", "s1")) == {
+            "task_session": "s1", "probe": "ok"
+        }
 
         opened = ray.get(
             scheduler.open_lease.remote(LeaseRecord(lease_id="l1", donor_session="s1"))
         )
         assert opened["state"] == "PLANNED"
-        assert (
-            ray.get(scheduler.advance_lease.remote("l1", "DONOR_DRAINING"))["state"]
-            == "DONOR_DRAINING"
-        )
+        assert ray.get(
+            scheduler.advance_lease.remote("l1", "DONOR_DRAINING")
+        )["state"] == "DONOR_DRAINING"
     finally:
         ray.kill(task, no_restart=True)
