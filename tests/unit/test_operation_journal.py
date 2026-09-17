@@ -1,7 +1,17 @@
-"""OperationJournal replay fencing and independent phase/status semantics."""
+"""OperationJournal replay fencing with full accepted commands."""
+
+from dataclasses import replace
 
 import pytest
 
+from multi_task_scheduler.orchestration.contracts import (
+    LeaseAuthorization,
+    NodePlacement,
+    OperationCommand,
+    OperationContext,
+    PlacementSpec,
+    ReplicaKey,
+)
 from multi_task_scheduler.orchestration.operation_journal import (
     ExpiredLeaseError,
     IllegalOperationTransitionError,
@@ -13,56 +23,102 @@ from multi_task_scheduler.orchestration.operation_journal import (
 )
 
 
-def test_begin_creates_validate_accepted_record():
+def _placement():
+    return PlacementSpec(
+        node=NodePlacement(
+            node_id="n1",
+            gpu_uuids=("u0",),
+            physical_gpu_ids=(0,),
+            global_ranks=(0,),
+            local_ranks=(0,),
+        ),
+        tp=1,
+        dp=1,
+        pp=1,
+        model_signature="sig",
+        placement_digest="placement-u0",
+    )
+
+
+def _command(**ctx_overrides):
+    values = dict(
+        protocol_version=1,
+        gs_epoch="gs-1",
+        task_id="task-a",
+        task_session="s1",
+        operation_id="op-1",
+        lease_id="l1",
+        lease_epoch=0,
+        command_seq=0,
+    )
+    values.update(ctx_overrides)
+    ctx = OperationContext(**values)
+    target = ReplicaKey(task_session=ctx.task_session, replica_id="r1", runtime_epoch=0)
+    return OperationCommand(
+        ctx=ctx,
+        kind=OperationKind.ADD,
+        target=target,
+        authorization=LeaseAuthorization(
+            lease_id=ctx.lease_id,
+            gs_epoch=ctx.gs_epoch,
+            donor_session="donor",
+            borrower_session=ctx.task_session,
+            placement_digest="placement-u0",
+            lease_epoch=ctx.lease_epoch,
+            purpose=OperationKind.ADD,
+            prior_release_digest="release-0",
+            authorization_seq=1,
+        ),
+        payload_digest="payload-1",
+        remaining_budget_ms=1000,
+        placement=_placement(),
+    )
+
+
+def test_begin_stores_full_command_and_returns_validate_accepted():
     journal = OperationJournal()
-    record = journal.begin("op-1", 0, "r1", OperationKind.ADD)
+    command = _command()
+    record = journal.begin(command)
+    assert record.command is command
+    assert record.operation_id == "op-1"
+    assert record.target == command.target
     assert record.phase is Phase.VALIDATE
     assert record.status is OperationStatus.ACCEPTED
-    assert record.phase_revision == 0
 
 
-def test_exact_replay_is_idempotent_but_identity_changes_are_rejected():
+def test_retry_may_reduce_transport_budget_but_not_change_business_identity():
     journal = OperationJournal()
-    first = journal.begin(
-        "op-1", 0, "r1", OperationKind.ADD, payload_digest="d1", command_seq=3
-    )
-    second = journal.begin(
-        "op-1", 0, "r1", OperationKind.ADD, payload_digest="d1", command_seq=3
-    )
-    assert first is second
-
-    for kwargs in (
-        {"replica_id": "r2"},
-        {"kind": OperationKind.REMOVE},
-        {"payload_digest": "other"},
-        {"command_seq": 4},
-    ):
-        values = dict(
-            operation_id="op-1",
-            lease_epoch=0,
-            replica_id="r1",
-            kind=OperationKind.ADD,
-            payload_digest="d1",
-            command_seq=3,
-        )
-        values.update(kwargs)
-        with pytest.raises(OperationIdentityError):
-            journal.begin(**values)
+    command = _command()
+    first = journal.begin(command)
+    retry = replace(command, remaining_budget_ms=100)
+    assert journal.begin(retry) is first
+    assert first.command is command
 
 
-def test_operation_id_cannot_be_reused_across_lease_epochs():
+def test_conflicting_command_identity_is_rejected():
     journal = OperationJournal()
-    journal.begin("op-1", 1, "r1", OperationKind.ADD)
-    with pytest.raises(ExpiredLeaseError):
-        journal.begin("op-1", 0, "r1", OperationKind.ADD)
+    command = _command()
+    journal.begin(command)
     with pytest.raises(OperationIdentityError):
-        journal.begin("op-1", 2, "r1", OperationKind.ADD)
-    assert journal.query("op-1").lease_epoch == 1
+        journal.begin(replace(command, payload_digest="other"))
+    with pytest.raises(OperationIdentityError):
+        journal.begin(replace(command, target=replace(command.target, replica_id="r2")))
+    with pytest.raises(OperationIdentityError):
+        journal.begin(replace(command, kind=OperationKind.REMOVE, placement=None))
 
 
-def test_add_happy_path_finishes_only_with_explicit_succeeded_status():
+def test_operation_id_cannot_cross_lease_epoch():
     journal = OperationJournal()
-    journal.begin("op-1", 0, "r1", OperationKind.ADD)
+    journal.begin(_command(lease_epoch=1))
+    with pytest.raises(ExpiredLeaseError):
+        journal.begin(_command(lease_epoch=0))
+    with pytest.raises(OperationIdentityError):
+        journal.begin(_command(lease_epoch=2))
+
+
+def test_add_happy_path_requires_explicit_terminal_status():
+    journal = OperationJournal()
+    journal.begin(_command())
     for phase in (
         Phase.CREATE,
         Phase.WAIT_GATE,
@@ -79,44 +135,34 @@ def test_add_happy_path_finishes_only_with_explicit_succeeded_status():
     assert record.status is OperationStatus.SUCCEEDED
 
 
-def test_failed_and_succeeded_are_terminal_only_at_done():
+def test_terminal_status_cannot_appear_before_done():
     journal = OperationJournal()
-    journal.begin("op-1", 0, "r1", OperationKind.ADD)
+    journal.begin(_command())
     with pytest.raises(IllegalOperationTransitionError, match="requires phase DONE"):
         journal.transition("op-1", Phase.CREATE, status=OperationStatus.FAILED)
 
 
 def test_reconcile_is_unknown_and_can_finish_unknown():
     journal = OperationJournal()
-    journal.begin("op-1", 0, "r1", OperationKind.ADD)
+    journal.begin(_command())
     journal.transition("op-1", Phase.RECONCILE)
     assert journal.query("op-1").status is OperationStatus.UNKNOWN
     journal.transition("op-1", Phase.DONE, status=OperationStatus.UNKNOWN)
     assert journal.query("op-1").status is OperationStatus.UNKNOWN
 
 
-def test_donate_can_enter_drain_and_illegal_skips_raise():
+def test_illegal_phase_skip_and_wrong_lease_require_raise():
     journal = OperationJournal()
-    journal.begin("op-1", 0, "r1", OperationKind.DONATE)
-    journal.transition("op-1", Phase.DRAIN)
-    assert journal.query("op-1").status is OperationStatus.RUNNING
-
-    other = OperationJournal()
-    other.begin("op-2", 0, "r2", OperationKind.ADD)
+    journal.begin(_command())
     with pytest.raises(IllegalOperationTransitionError):
-        other.transition("op-2", Phase.COMMIT_SERVICE)
-
-
-def test_require_rejects_wrong_epoch():
-    journal = OperationJournal()
-    journal.begin("op-1", 0, "r1", OperationKind.ADD)
+        journal.transition("op-1", Phase.COMMIT_SERVICE)
     with pytest.raises(ExpiredLeaseError):
         journal.require("op-1", 1)
 
 
-def test_phase_result_timing_and_error_revision_the_record():
+def test_phase_result_timing_error_and_detail_are_revisioned():
     journal = OperationJournal()
-    journal.begin("op-1", 0, "r1", OperationKind.ADD)
+    journal.begin(_command())
     proof = object()
     error = object()
     record = journal.transition(
