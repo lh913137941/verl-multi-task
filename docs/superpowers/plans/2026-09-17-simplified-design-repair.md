@@ -6,21 +6,21 @@
 
 ## 已确认的缺陷与修复顺序
 
-- [ ] 空泡观测：缺失计数默认为 0；选择函数把当前窗口 epoch 当作观测 epoch。
+- [x] 空泡观测：缺失计数默认为 0；选择函数把当前窗口 epoch 当作观测 epoch。
   改为 UNKNOWN/None 拒绝候选，并检查真实观测代次与完整性。
-- [ ] GS 候选：无限 TTL、旧报告覆盖新报告、空报告不撤销、重复报告续期。
+- [x] GS 候选：无限 TTL、旧报告覆盖新报告、空报告不撤销、重复报告续期。
   改为有限相对 TTL、单调报告和整集合替换。
-- [ ] 幂等：同 operation_id 的更高 lease_epoch 会覆盖原记录；缺失 digest 或
+- [x] 幂等：同 operation_id 的更高 lease_epoch 会覆盖原记录；缺失 digest 或
   改 command_seq 可绕过冲突；结果合并不检查完整身份。阻止替换及迟到结果。
-- [ ] 同步门：实际 Trainer 原生同步没有进入 G；异常释放 G 后继续调度。
+- [x] 同步门：实际 Trainer 原生同步没有进入 G；异常释放 G 后继续调度。
   通过继承委托包住原生同步；异常/取消标为 BLOCKED，普通新操作拒绝。
-- [ ] 生命周期：从旧版 14 状态迁移到 8 状态，区分 native sleep 与 borrowed
+- [x] 生命周期：从旧版 14 状态迁移到 8 状态，区分 native sleep 与 borrowed
   destroy，保留隔离和有证据的补偿边。
-- [ ] 样本去重：旧 key 含 turn，返回 bool 混淆去重和原生满丢；改为完整逻辑
+- [x] 样本去重：旧 key 含 turn，返回 bool 混淆去重和原生满丢；改为完整逻辑
   样本 key 与首次 CompletionEvidence，保留原生满丢返回语义。
-- [ ] 事务/绑定：禁止空 manifest/版本标签冒充快照、未完成清理时发布、LB 假
+- [x] 事务/绑定：禁止空 manifest/版本标签冒充快照、未完成清理时发布、LB 假
   drain/假 remove、CE overlay 冒充原生 E 提交、字符串 COMMITTED 冒充释放。
-- [ ] 补充接线测试、更新当前能力说明，并记录尚未实现的设备和原生 hook 边界。
+- [x] 补充接线测试、更新当前能力说明，并记录尚未实现的设备和原生 hook 边界。
 
 ## 验证边界
 
