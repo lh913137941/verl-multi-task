@@ -1,17 +1,15 @@
-"""Global lease state machine (section 5.6), pure Python.
+"""Global lease authorization state machine for simplified design §8-§14.
 
-Every authorization change is written to the ledger *before* a command is
-issued, and each receipt-backed transition must be supported by a matching
-operation result — a lease never advances on "RPC already sent" alone.
-
-Receipt-backed transitions require the exact operation result state the design
-names; the authorization steps (issue DONATE, authorize ADD, issue REMOVE,
-authorize RESTORE) are GS decisions with no receipt.
+Authorization changes are GS decisions. Receipt-backed edges advance only from
+a matching terminal operation status; ``ACCEPTED``/``RUNNING`` never transfer
+GPU authority.
 """
 
 from __future__ import annotations
 
 from enum import Enum
+
+from multi_task_scheduler.orchestration.operation_journal import OperationStatus
 
 from .ledger import LeaseRecord
 
@@ -35,7 +33,7 @@ class IllegalLeaseTransitionError(RuntimeError):
 
 
 class MissingReceiptError(RuntimeError):
-    """A receipt-backed lease transition lacked its supporting operation result."""
+    """A receipt-backed lease transition lacked a matching successful result."""
 
 
 _ALLOWED = {
@@ -44,26 +42,23 @@ _ALLOWED = {
     LeaseState.DONOR_RELEASED: {LeaseState.BORROWER_PREPARING},
     LeaseState.BORROWER_PREPARING: {LeaseState.BORROWER_ACTIVE, LeaseState.RECONCILING},
     LeaseState.BORROWER_ACTIVE: {LeaseState.RECALLING, LeaseState.RECONCILING},
-    LeaseState.RECALLING: {LeaseState.BORROWER_RELEASED},
+    LeaseState.RECALLING: {LeaseState.BORROWER_RELEASED, LeaseState.RECONCILING},
     LeaseState.BORROWER_RELEASED: {LeaseState.DONOR_RESTORING},
-    LeaseState.DONOR_RESTORING: {LeaseState.CLOSED, LeaseState.QUARANTINED},
+    LeaseState.DONOR_RESTORING: {LeaseState.CLOSED, LeaseState.RECONCILING, LeaseState.QUARANTINED},
     LeaseState.CLOSED: set(),
     LeaseState.RECONCILING: set(),
     LeaseState.QUARANTINED: set(),
 }
 
-# Receipt state (OperationResult.state) each receipt-backed edge requires.
 _RECEIPT_REQUIRED = {
-    (LeaseState.DONOR_DRAINING, LeaseState.DONOR_RELEASED): "COMMITTED",
-    (LeaseState.BORROWER_PREPARING, LeaseState.BORROWER_ACTIVE): "COMMITTED",
-    (LeaseState.RECALLING, LeaseState.BORROWER_RELEASED): "COMMITTED",
-    (LeaseState.DONOR_RESTORING, LeaseState.CLOSED): "COMMITTED",
+    (LeaseState.DONOR_DRAINING, LeaseState.DONOR_RELEASED): OperationStatus.SUCCEEDED,
+    (LeaseState.BORROWER_PREPARING, LeaseState.BORROWER_ACTIVE): OperationStatus.SUCCEEDED,
+    (LeaseState.RECALLING, LeaseState.BORROWER_RELEASED): OperationStatus.SUCCEEDED,
+    (LeaseState.DONOR_RESTORING, LeaseState.CLOSED): OperationStatus.SUCCEEDED,
 }
 
 
 class LeaseStateMachine:
-    """Advance a lease only along the section 5.6 edges."""
-
     def __init__(self) -> None:
         self._leases: dict[str, LeaseRecord] = {}
 
@@ -79,7 +74,7 @@ class LeaseStateMachine:
         lease_id: str,
         new_state: LeaseState,
         *,
-        supporting_result_state: str | None = None,
+        supporting_result_state: OperationStatus | str | None = None,
         operation_id: str | None = None,
     ) -> LeaseRecord:
         lease = self._leases[lease_id]
@@ -94,11 +89,24 @@ class LeaseStateMachine:
 
         required = _RECEIPT_REQUIRED.get((current, new_state))
         if required is not None:
-            if supporting_result_state != required:
+            try:
+                supplied = (
+                    OperationStatus(supporting_result_state)
+                    if supporting_result_state is not None
+                    else None
+                )
+            except ValueError:
+                supplied = None
+            if supplied is not required:
+                supplied_value = (
+                    supporting_result_state.value
+                    if isinstance(supporting_result_state, OperationStatus)
+                    else supporting_result_state
+                )
                 raise MissingReceiptError(
                     f"lease {lease_id} {current.value} -> {new_state.value} "
-                    f"requires a {required} operation result, "
-                    f"got {supporting_result_state!r}"
+                    f"requires a {required.value} operation result, "
+                    f"got {supplied_value!r}"
                 )
 
         lease.state = new_state.value
