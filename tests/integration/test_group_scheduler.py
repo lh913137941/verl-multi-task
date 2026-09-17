@@ -44,6 +44,9 @@ class TaskRunnerProbe:
         return ray.get_runtime_context().get_actor_id()
 
     def submit_operation(self, command):
+        existing = self.operations.get(command.ctx.operation_id)
+        if existing is not None:
+            return existing
         result = OperationResult(
             ctx=command.ctx,
             target=command.target,
@@ -54,15 +57,20 @@ class TaskRunnerProbe:
         self.operations[command.ctx.operation_id] = result
         return result
 
+    def set_operation_result(self, result):
+        self.operations[result.ctx.operation_id] = result
+
     def query_operation(self, task_session, operation_id):
         result = self.operations.get(operation_id)
         if result is None or result.ctx.task_session != task_session:
             return QueryResult(found=False, value=None, outcome=Outcome.UNKNOWN)
-        return QueryResult(
-            found=True,
-            value=result,
-            outcome=Outcome.KNOWN_NOT_APPLIED,
-        )
+        if result.status is OperationStatus.ACCEPTED:
+            outcome = Outcome.KNOWN_NOT_APPLIED
+        elif result.status is OperationStatus.SUCCEEDED:
+            outcome = Outcome.KNOWN_APPLIED
+        else:
+            outcome = Outcome.UNKNOWN
+        return QueryResult(found=True, value=result, outcome=outcome)
 
     def probe_task(self, task_session):
         return {"task_session": task_session, "probe": "ok"}
@@ -261,6 +269,22 @@ def test_gs_control_interfaces_use_current_typed_contract(isolated_ray):
         assert accepted.status is OperationStatus.ACCEPTED
         assert accepted.phase is Phase.VALIDATE
 
+        query = ray.get(scheduler.query_operation.remote("s1", "op-1"))
+        assert query.found is True
+        assert query.value.status is OperationStatus.ACCEPTED
+        assert query.outcome is Outcome.KNOWN_NOT_APPLIED
+
+        progressed = OperationResult(
+            ctx=command.ctx,
+            target=command.target,
+            status=OperationStatus.RUNNING,
+            phase=Phase.CREATE,
+            phase_revision=1,
+        )
+        ray.get(task.set_operation_result.remote(progressed))
+        replayed = ray.get(scheduler.submit_operation.remote(command))
+        assert replayed == progressed
+
         with pytest.raises(ValueError, match="conflicting replay"):
             ray.get(
                 scheduler.submit_operation.remote(
@@ -274,11 +298,6 @@ def test_gs_control_interfaces_use_current_typed_contract(isolated_ray):
                     _command(protocol_version, "old-gs", operation_id="op-stale")
                 )
             )
-
-        query = ray.get(scheduler.query_operation.remote("s1", "op-1"))
-        assert query.found is True
-        assert query.value.status is OperationStatus.ACCEPTED
-        assert query.outcome is Outcome.KNOWN_NOT_APPLIED
 
         idle_ack = ray.get(scheduler.report_idle_candidates.remote(_idle_report(gs_epoch)))
         assert idle_ack.accepted is True
