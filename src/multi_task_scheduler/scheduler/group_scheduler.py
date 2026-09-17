@@ -1,8 +1,7 @@
 """Shared GroupScheduler actor for simplified design §3/§8.
 
-The actor owns the GS ledger and lease authorization. It records intent before
-issuing work and validates protocol/session fencing at the public operation
-entry; it does not infer device release from task health.
+GS owns global resource authorization and intent. It forwards lifecycle commands
+to the attached TaskRunner and never converts ACK/health into fake completion.
 """
 
 import time
@@ -11,10 +10,19 @@ import uuid
 import ray
 from ray.actor import ActorHandle
 
-from multi_task_scheduler.orchestration.contracts import OperationCommand, OperationResult
-from multi_task_scheduler.orchestration.operation_journal import OperationStatus
+from multi_task_scheduler.orchestration.contracts import (
+    IdleCandidateReport,
+    OperationCommand,
+    OperationResult,
+    QueryResult,
+)
+from multi_task_scheduler.orchestration.operation_journal import (
+    OperationStatus,
+    Outcome,
+    Phase,
+)
+from multi_task_scheduler.orchestration.receipts import Ack
 from multi_task_scheduler.scheduler.ledger import (
-    IdleReport,
     Ledger,
     LeaseRecord,
     ProtocolInstance,
@@ -28,7 +36,7 @@ PROTOCOL_VERSION = 1
 
 @ray.remote(num_cpus=0)
 class GroupScheduler:
-    """Keep task controllers and authoritative GS ledger/lease state."""
+    """Keep task controllers plus authoritative GS ledger/lease state."""
 
     def __init__(self) -> None:
         self.task_runners: dict[str, ActorHandle] = {}
@@ -44,12 +52,11 @@ class GroupScheduler:
         )
         self.lease_sm = LeaseStateMachine()
 
-    # -- discovery / legacy ------------------------------------------------- #
-
     def runtime_kind(self) -> str:
         return RUNTIME_KIND
 
     def attach_task(self, task_id: str, task_runner: ActorHandle) -> None:
+        """Runtime discovery hook used before task_session registration exists."""
         if not isinstance(task_id, str) or not task_id:
             raise ValueError("task_id must be a nonempty TaskRunner Actor ID")
         if not isinstance(task_runner, ActorHandle):
@@ -66,10 +73,8 @@ class GroupScheduler:
         return dict(self.task_runners)
 
     def schedule(self) -> list:
-        """No automatic cross-task policy is implemented in this pass."""
+        """Cross-task policy is outside this implementation pass."""
         return []
-
-    # -- §8.1 GS <-> task control interfaces ------------------------------- #
 
     def attach_controller(
         self,
@@ -87,7 +92,6 @@ class GroupScheduler:
         self.ledger.register_task(task_id, task_session, task_runner=handle)
         self.controllers[(task_id, task_session)] = handle
         return {
-            "status": "INITIALIZING",
             "task_id": task_id,
             "task_session": task_session,
             "protocol_version": self.ledger.protocol.protocol_version,
@@ -96,116 +100,120 @@ class GroupScheduler:
 
     def register_resources(self, registration_id: str, manifest: ResourceManifest) -> dict:
         if not isinstance(manifest, ResourceManifest):
-            raise TypeError("register_resources requires a ResourceManifest")
+            raise TypeError("register_resources requires ResourceManifest")
         self.ledger.register_resources(manifest)
+        for record in self.ledger.tasks.values():
+            if record.task_session == manifest.owner_task_session:
+                record.status = "READY"
         return {"registration_id": registration_id, "status": "READY"}
 
-    def probe_task(self, probe_id: str, known_revisions: dict | None = None) -> dict:
-        tasks = [
-            {
-                "task_id": r.task_id,
-                "task_session": r.task_session,
-                "status": r.status,
-            }
-            for r in self.ledger.tasks.values()
-        ]
-        leases = [
-            {"lease_id": lease.lease_id, "state": lease.state}
-            for lease in self.ledger.leases.values()
-        ]
-        return {"probe_id": probe_id, "tasks": tasks, "leases": leases}
-
-    def report_idle_candidates(self, report: IdleReport) -> dict:
-        if not isinstance(report, IdleReport):
-            raise TypeError("report_idle_candidates requires an IdleReport")
-        if type(report.valid_for_ms) is not int or report.valid_for_ms <= 0:
-            raise ValueError("valid_for_ms must be a positive integer")
-        self.ledger.upsert_idle_observation(
+    def report_idle_candidates(self, report: IdleCandidateReport) -> Ack:
+        if not isinstance(report, IdleCandidateReport):
+            raise TypeError("report_idle_candidates requires IdleCandidateReport")
+        self.ledger.upsert_idle_report(
             report, valid_until=time.monotonic() + report.valid_for_ms / 1000
         )
-        return {"source_seq": report.source_seq, "candidates": list(report.candidate_ids)}
+        return Ack(accepted=True, revision=report.source_seq)
 
     def _validate_command_fence(self, command: OperationCommand) -> None:
         protocol = self.ledger.protocol
-        if command.protocol_version != protocol.protocol_version:
+        if command.ctx.protocol_version != protocol.protocol_version:
             raise ValueError(
-                f"protocol version mismatch: {command.protocol_version} != {protocol.protocol_version}"
+                "protocol version mismatch: "
+                f"{command.ctx.protocol_version} != {protocol.protocol_version}"
             )
-        if command.gs_epoch != protocol.gs_epoch:
+        if command.ctx.gs_epoch != protocol.gs_epoch:
             raise ValueError("stale gs_epoch")
-        if (command.target_task_id, command.target_task_session) not in self.ledger.tasks:
+        task_key = (command.ctx.task_id, command.ctx.task_session)
+        task = self.ledger.tasks.get(task_key)
+        if task is None:
             raise ValueError("unknown target task session")
+        if task.status != "READY":
+            raise ValueError("target task is not READY")
+        if command.target.task_session != command.ctx.task_session:
+            raise ValueError("target runtime belongs to a different task_session")
+        if task_key not in self.controllers:
+            raise ValueError("target TaskRunner controller is not attached")
 
-    def submit_operation(self, command: OperationCommand) -> dict:
-        """Validate/fence intent and return quickly without claiming completion."""
+    def submit_operation(self, command: OperationCommand) -> OperationResult:
+        """Record GS intent, forward once to TR, and return TR's ACCEPTED result."""
         if not isinstance(command, OperationCommand):
-            raise TypeError("submit_operation requires an OperationCommand")
-        try:
-            self._validate_command_fence(command)
-            self.ledger.record_operation(command)
-        except ValueError as exc:
-            return {
-                "status": OperationStatus.FAILED.value,
-                "state": OperationStatus.FAILED.value,  # compatibility
-                "operation_id": command.operation_id,
-                "error": str(exc),
-            }
-        return {
-            "status": OperationStatus.ACCEPTED.value,
-            "state": OperationStatus.ACCEPTED.value,  # compatibility
-            "operation_id": command.operation_id,
-        }
+            raise TypeError("submit_operation requires OperationCommand")
+        self._validate_command_fence(command)
+        record = self.ledger.record_operation(command)
+        if record.final_result is not None:
+            return record.final_result
+        controller = self.controllers[(command.ctx.task_id, command.ctx.task_session)]
+        result = ray.get(controller.submit_operation.remote(command), timeout=30)
+        if not isinstance(result, OperationResult):
+            raise TypeError("TaskRunner returned a non-OperationResult")
+        self.ledger.merge_operation_result(command.ctx.operation_id, result)
+        return result
 
-    def query_operation(self, operation_id: str) -> dict | None:
+    def query_operation(
+        self, task_session: str, operation_id: str
+    ) -> QueryResult[OperationResult]:
         record = self.ledger.operations.get(operation_id)
-        if record is None:
-            return None
-        final = record.final_result
-        return {
-            "operation_id": operation_id,
-            "phase": record.phase.value,
-            "status": (
-                final.status.value if final is not None else OperationStatus.ACCEPTED.value
-            ),
-            "final_result": final,
-        }
+        if record is None or record.command.ctx.task_session != task_session:
+            return QueryResult(found=False, value=None, outcome=Outcome.UNKNOWN)
+        if record.final_result is not None:
+            result = record.final_result
+        else:
+            result = OperationResult(
+                ctx=record.command.ctx,
+                target=record.command.target,
+                status=OperationStatus.ACCEPTED,
+                phase=Phase.VALIDATE,
+                phase_revision=0,
+            )
+        outcome = (
+            Outcome.KNOWN_APPLIED
+            if result.status in {OperationStatus.SUCCEEDED, OperationStatus.FAILED}
+            else Outcome.UNKNOWN
+        )
+        return QueryResult(found=True, value=result, outcome=outcome)
+
+    def probe_task(self, task_id: str, task_session: str):
+        controller = self.controllers.get((task_id, task_session))
+        if controller is None:
+            raise ValueError("unknown target task session")
+        return ray.get(controller.probe_task.remote(task_session), timeout=30)
 
     def get_resource_snapshot(self, expected_session: str) -> dict:
+        """GS physical-ledger inspection; not a ReleaseEvidence substitute."""
         return {
             "protocol_version": self.ledger.protocol.protocol_version,
             "gs_epoch": self.ledger.protocol.gs_epoch,
             "expected_session": expected_session,
             "tasks": [
                 {
-                    "task_id": r.task_id,
-                    "task_session": r.task_session,
-                    "status": r.status,
-                    "initial_gpus": r.initial_gpus,
+                    "task_id": record.task_id,
+                    "task_session": record.task_session,
+                    "status": record.status,
+                    "initial_gpus": record.initial_gpus,
                 }
-                for r in self.ledger.tasks.values()
+                for record in self.ledger.tasks.values()
             ],
             "gpus": [
                 {
-                    "node_id": g.node_id,
-                    "gpu_uuid": g.gpu_uuid,
-                    "state": g.state,
-                    "current_user": g.current_user,
+                    "node_id": gpu.node_id,
+                    "gpu_uuid": gpu.gpu_uuid,
+                    "state": gpu.state,
+                    "current_user": gpu.current_user,
                 }
-                for g in self.ledger.gpus.values()
+                for gpu in self.ledger.gpus.values()
             ],
         }
 
-    def report_operation_result(self, result: OperationResult) -> dict:
+    def report_operation_result(self, result: OperationResult) -> Ack:
         if not isinstance(result, OperationResult):
-            raise TypeError("report_operation_result requires an OperationResult")
-        self.ledger.merge_operation_result(result.identity_fields.operation_id, result)
-        return {"operation_id": result.identity_fields.operation_id, "merged": True}
-
-    # -- lease authorization ------------------------------------------------ #
+            raise TypeError("report_operation_result requires OperationResult")
+        self.ledger.merge_operation_result(result.ctx.operation_id, result)
+        return Ack(accepted=True, revision=result.phase_revision)
 
     def open_lease(self, lease: LeaseRecord) -> dict:
         if not isinstance(lease, LeaseRecord):
-            raise TypeError("open_lease requires a LeaseRecord")
+            raise TypeError("open_lease requires LeaseRecord")
         self.ledger.open_lease(lease)
         self.lease_sm.register(lease)
         return {"lease_id": lease.lease_id, "state": lease.state}
@@ -214,7 +222,7 @@ class GroupScheduler:
         self,
         lease_id: str,
         new_state: str,
-        supporting_result_state: str | None = None,
+        supporting_result_state: OperationStatus | None = None,
         operation_id: str | None = None,
     ) -> dict:
         self.lease_sm.advance(
