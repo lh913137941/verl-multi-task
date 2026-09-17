@@ -207,6 +207,14 @@ class LeaseStateMachine:
             raise MissingEvidenceError(
                 "release evidence must reference the matching service-removal proof"
             )
+        if lease.placement is None:
+            raise MissingEvidenceError("lease placement is required to verify per-GPU release")
+        expected_gpu_uuids = set(lease.placement.node.gpu_uuids)
+        released_gpu_uuids = {gpu.gpu_uuid for gpu in release.per_gpu}
+        if released_gpu_uuids != expected_gpu_uuids:
+            raise MissingEvidenceError(
+                "release evidence must exactly cover every GPU in the lease placement"
+            )
         lease.last_release_digest = release.header.digest
         self._record_operation(lease, result.ctx.operation_id)
         return result
