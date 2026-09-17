@@ -24,8 +24,8 @@ from multi_task_scheduler.orchestration.contracts import (
 )
 from multi_task_scheduler.orchestration.operation_journal import (
     OperationJournal,
-    OperationStatus,
     Outcome,
+    operation_outcome,
 )
 from multi_task_scheduler.orchestration.receipts import ReleaseEvidence, ServiceEvidence
 from multi_task_scheduler.scheduler.discovery import get_or_create_group_scheduler
@@ -81,17 +81,6 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             error=record.error,
         )
 
-    @staticmethod
-    def _query_outcome(record) -> Outcome:
-        if record.status is OperationStatus.ACCEPTED:
-            return Outcome.KNOWN_NOT_APPLIED
-        if record.status is OperationStatus.SUCCEEDED:
-            return Outcome.KNOWN_APPLIED
-        if record.status is OperationStatus.FAILED:
-            error_outcome = getattr(record.error, "outcome", None)
-            return Outcome.UNKNOWN if error_outcome is None else Outcome(error_outcome)
-        return Outcome.UNKNOWN
-
     def submit_operation(self, command: OperationCommand) -> OperationResult:
         """Validate/idempotently accept one complete lifecycle command.
 
@@ -114,7 +103,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         return QueryResult(
             found=True,
             value=self._result_from_record(record),
-            outcome=self._query_outcome(record),
+            outcome=operation_outcome(record.status, record.error),
         )
 
     def probe_task(self, task_session: str):

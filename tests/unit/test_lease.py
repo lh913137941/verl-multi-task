@@ -184,12 +184,6 @@ def test_full_happy_path_requires_release_and_service_evidence():
         supporting_result=_service_result("donor", "op-restore", ServiceAction.ADD),
     )
     assert sm.get("l1").state == LeaseState.CLOSED.value
-    assert sm.get("l1").operation_ids == (
-        "op-donate",
-        "op-add",
-        "op-remove",
-        "op-restore",
-    )
 
 
 def test_succeeded_status_without_release_evidence_cannot_handoff_gpu():
@@ -271,7 +265,7 @@ def test_service_activation_requires_add_evidence_not_status_only():
         release_digest="release-d1",
     )
     remove_result = _service_result("borrower", "op-add", ServiceAction.REMOVE)
-    with pytest.raises(MissingEvidenceError, match="ServiceEvidence\(ADD\)"):
+    with pytest.raises(MissingEvidenceError, match=r"ServiceEvidence\(ADD\)"):
         sm.advance(
             "l1",
             LeaseState.BORROWER_ACTIVE,

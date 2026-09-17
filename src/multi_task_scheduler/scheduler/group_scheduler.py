@@ -22,6 +22,7 @@ from multi_task_scheduler.orchestration.operation_journal import (
     OperationStatus,
     Outcome,
     Phase,
+    operation_outcome,
 )
 from multi_task_scheduler.orchestration.receipts import Ack
 from multi_task_scheduler.scheduler.ledger import (
@@ -229,19 +230,7 @@ class GroupScheduler:
     def _local_query_result(record) -> QueryResult[OperationResult]:
         if record.final_result is not None:
             result = record.final_result
-            if result.status is OperationStatus.SUCCEEDED:
-                outcome = Outcome.KNOWN_APPLIED
-            elif result.status is OperationStatus.ACCEPTED:
-                outcome = Outcome.KNOWN_NOT_APPLIED
-            elif result.status is OperationStatus.FAILED:
-                error_outcome = getattr(result.error, "outcome", None)
-                outcome = (
-                    Outcome.UNKNOWN
-                    if error_outcome is None
-                    else Outcome(error_outcome)
-                )
-            else:
-                outcome = Outcome.UNKNOWN
+            outcome = operation_outcome(result.status, result.error)
         else:
             result = OperationResult(
                 ctx=record.command.ctx,
@@ -250,6 +239,9 @@ class GroupScheduler:
                 phase=Phase.VALIDATE,
                 phase_revision=0,
             )
+            # GS has recorded intent but has no authoritative TaskRunner result;
+            # unlike the TaskRunner journal, this fallback cannot assert that
+            # side effects are definitely not applied.
             outcome = Outcome.UNKNOWN
         return QueryResult(found=True, value=result, outcome=outcome)
 

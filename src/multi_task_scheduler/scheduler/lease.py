@@ -178,12 +178,6 @@ class LeaseStateMachine:
             )
         return service
 
-    @staticmethod
-    def _record_operation(lease: LeaseRecord, operation_id: str) -> None:
-        if operation_id not in lease.operation_ids:
-            lease.operation_ids = (*lease.operation_ids, operation_id)
-        lease.last_operation_id = operation_id
-
     def _validate_release_edge(
         self,
         lease: LeaseRecord,
@@ -216,7 +210,6 @@ class LeaseStateMachine:
                 "release evidence must exactly cover every GPU in the lease placement"
             )
         lease.last_release_digest = release.header.digest
-        self._record_operation(lease, result.ctx.operation_id)
         return result
 
     def _validate_service_edge(
@@ -228,7 +221,6 @@ class LeaseStateMachine:
         expected_session = self._expected_session(lease, role)
         result = self._require_result_identity(lease, result, expected_session)
         self._require_service(result, ServiceAction.ADD)
-        self._record_operation(lease, result.ctx.operation_id)
         return result
 
     def advance(

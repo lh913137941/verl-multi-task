@@ -380,21 +380,6 @@ class CleanupInventory:
 
 
 @dataclass(frozen=True)
-class RuntimeReady:
-    key: ReplicaKey
-    receiver_ready: bool
-    serving_ready: bool
-    loaded_version: int | None
-    inventory_revision: int
-
-    def __post_init__(self) -> None:
-        if self.loaded_version is not None and self.loaded_version < 0:
-            raise ValueError("loaded_version must be nonnegative")
-        if self.inventory_revision < 0:
-            raise ValueError("inventory_revision must be nonnegative")
-
-
-@dataclass(frozen=True)
 class OperationError:
     code: str
     detail: str
@@ -422,11 +407,12 @@ class OperationCommand:
     remaining_budget_ms: int
     placement: PlacementSpec | None = None
     candidate: IdleCandidate | None = None
-    recall_mode: RecallMode = RecallMode.NATURAL
+    recall_mode: RecallMode | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", OperationKind(self.kind))
-        object.__setattr__(self, "recall_mode", RecallMode(self.recall_mode))
+        if self.recall_mode is not None:
+            object.__setattr__(self, "recall_mode", RecallMode(self.recall_mode))
         if not self.payload_digest:
             raise ValueError("payload_digest must be nonempty")
         if self.remaining_budget_ms < 0:
@@ -441,6 +427,8 @@ class OperationCommand:
             raise ValueError("authorization gs_epoch must match operation context")
         if self.authorization.purpose is not self.kind:
             raise ValueError("authorization purpose must match operation kind")
+        if self.kind in {OperationKind.ADD, OperationKind.RESTORE} and self.recall_mode is not None:
+            raise ValueError("ADD/RESTORE must not carry recall_mode")
         if self.kind is not OperationKind.REMOVE and self.recall_mode is RecallMode.FORCE_VERIFIED:
             raise ValueError("FORCE_VERIFIED is valid only for REMOVE")
         if self.kind is OperationKind.ADD:

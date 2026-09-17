@@ -8,13 +8,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import TypeAlias, Tuple
+from typing import Tuple
 
 from .contracts import (
     CleanupInventory,
     OperationContext,
     OperationError,
-    PreparedReplica,
     ProcessIdentity,
     RecallMode,
     ReleaseKind,
@@ -312,18 +311,3 @@ class NeverPublishedProof:
     def __post_init__(self) -> None:
         if not (self.no_route_commit and self.no_ce_membership and self.fenced):
             raise ValueError("NeverPublishedProof requires queried absence and a commit fence")
-
-
-CleanupPermit: TypeAlias = ServiceEvidence | NeverPublishedProof
-PhaseResult: TypeAlias = (
-    PreparedReplica
-    | DrainTicket
-    | WeightEvidence
-    | ExitEvidence
-    | ServiceEvidence
-    | ReleaseEvidence
-    | CommitReceipt
-    | AdmissionSnapshot
-    | Ack
-    | NeverPublishedProof
-)

@@ -16,14 +16,13 @@ from typing import Any, Tuple
 from multi_task_scheduler.orchestration.contracts import (
     IdleCandidate,
     IdleCandidateReport,
-    NodePlacement,
     OperationCommand,
     OperationResult,
     PlacementSpec,
     ReplicaKey,
     RuntimeCapabilities,
 )
-from multi_task_scheduler.orchestration.operation_journal import Phase
+from multi_task_scheduler.orchestration.operation_journal import Phase, command_identity
 
 
 @dataclass
@@ -31,24 +30,9 @@ class TaskRecord:
     task_id: str
     task_session: str
     status: str = "INITIALIZING"
-    config_summary: str = ""
-    model_signature: str = ""
     capabilities: RuntimeCapabilities | None = None
     initial_gpus: int = 0
-    min_active_gpus: int = 0
-    max_active_gpus: int = 0
-    last_probe: float = 0.0
     task_runner: Any = None
-
-
-@dataclass
-class NativeReplicaRecord:
-    key: ReplicaKey
-    owner_task_session: str
-    node: NodePlacement
-    gpu_uuids: Tuple[str, ...]
-    status: str = "ACTIVE"
-    revision: int = 0
 
 
 @dataclass
@@ -73,16 +57,11 @@ class GpuRecord:
 class LeaseRecord:
     lease_id: str
     donor_session: str
-    gpu_keys: Tuple[Tuple[str, str], ...] = ()
     borrower_session: str | None = None
     lease_epoch: int = 0
     state: str = "PLANNED"
-    operation_ids: Tuple[str, ...] = ()
-    last_operation_id: str | None = None
     last_release_digest: str | None = None
-    deadline: float | None = None
     placement: PlacementSpec | None = None
-    model_constraints: str = ""
 
     def __post_init__(self) -> None:
         if not self.lease_id or not self.donor_session:
@@ -155,7 +134,6 @@ class Ledger:
     def __init__(self, protocol: ProtocolInstance) -> None:
         self.protocol = protocol
         self.tasks: dict[Tuple[str, str], TaskRecord] = {}
-        self.native_replicas: dict[ReplicaKey, NativeReplicaRecord] = {}
         self.gpus: dict[Tuple[str, str, str], GpuRecord] = {}
         self.leases: dict[str, LeaseRecord] = {}
         self.idle_observations: dict[ReplicaKey, IdleObservation] = {}
@@ -168,10 +146,6 @@ class Ledger:
         task_session: str,
         *,
         capabilities: RuntimeCapabilities | None = None,
-        config_summary: str = "",
-        model_signature: str = "",
-        min_active_gpus: int = 0,
-        max_active_gpus: int = 0,
         task_runner: Any = None,
     ) -> TaskRecord:
         key = (task_id, task_session)
@@ -181,21 +155,21 @@ class Ledger:
             self.tasks[key] = record
         if capabilities is not None:
             record.capabilities = capabilities
-        record.config_summary = config_summary or record.config_summary
-        record.model_signature = model_signature or record.model_signature
-        record.min_active_gpus = min_active_gpus
-        record.max_active_gpus = max_active_gpus
         if task_runner is not None:
             record.task_runner = task_runner
-        record.last_probe = time.monotonic()
         return record
 
-    def register_resources(self, manifest: ResourceManifest) -> NativeReplicaRecord:
-        """Validate single-node physical identities atomically, then record GS facts."""
-        if not any(
-            record.task_session == manifest.owner_task_session
-            for record in self.tasks.values()
-        ):
+    def register_resources(self, manifest: ResourceManifest) -> None:
+        """Validate single-node physical identities atomically, then record GS GPU facts."""
+        owner = next(
+            (
+                record
+                for record in self.tasks.values()
+                if record.task_session == manifest.owner_task_session
+            ),
+            None,
+        )
+        if owner is None:
             raise ValueError(f"unknown owner task session {manifest.owner_task_session!r}")
 
         node = manifest.placement.node
@@ -217,20 +191,7 @@ class Ledger:
             for gpu_uuid, physical_id in zip(node.gpu_uuids, node.physical_gpu_ids)
         }
         self.gpus.update(new_gpus)
-
-        key = ReplicaKey(
-            task_session=manifest.owner_task_session,
-            replica_id=manifest.replica_id,
-            runtime_epoch=manifest.runtime_epoch,
-        )
-        replica = NativeReplicaRecord(
-            key=key,
-            owner_task_session=manifest.owner_task_session,
-            node=node,
-            gpu_uuids=node.gpu_uuids,
-        )
-        self.native_replicas[key] = replica
-        return replica
+        owner.initial_gpus += len(new_gpus)
 
     def set_current_user(
         self,
@@ -375,31 +336,10 @@ class Ledger:
                 valid_until=valid_until,
             )
 
-    def stale_idle_observations(self, now: float) -> Tuple[IdleObservation, ...]:
-        return tuple(
-            observation
-            for observation in self.idle_observations.values()
-            if observation.valid_until <= now
-        )
-
-    @staticmethod
-    def _command_identity(command: OperationCommand) -> tuple:
-        """Business identity; transport budget is intentionally excluded."""
-        return (
-            command.ctx,
-            command.kind,
-            command.target,
-            command.authorization,
-            command.placement,
-            command.candidate,
-            command.recall_mode,
-            command.payload_digest,
-        )
-
     def record_operation(self, command: OperationCommand) -> OperationRecord:
         existing = self.operations.get(command.ctx.operation_id)
         if existing is not None:
-            if self._command_identity(existing.command) != self._command_identity(command):
+            if command_identity(existing.command) != command_identity(command):
                 raise ValueError(f"conflicting replay for operation {command.ctx.operation_id}")
             return existing
         record = OperationRecord(

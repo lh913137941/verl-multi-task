@@ -147,7 +147,7 @@ def _candidate(replica_id="r1", source_seq=7):
 
 def _idle_report(source_seq=7, candidates=None, production_revision=3):
     if candidates is None:
-        candidates=(_candidate(source_seq=source_seq),)
+        candidates = (_candidate(source_seq=source_seq),)
     return IdleCandidateReport(
         task_session="s1",
         gs_epoch="gs-1",
@@ -159,15 +159,15 @@ def _idle_report(source_seq=7, candidates=None, production_revision=3):
     )
 
 
-def test_register_resources_records_single_node_native_and_gpus():
+def test_register_resources_records_only_authoritative_gpu_facts():
     ledger = Ledger(_protocol())
-    ledger.register_task("task-a", "s1")
-    replica = ledger.register_resources(
+    task = ledger.register_task("task-a", "s1")
+    assert ledger.register_resources(
         ResourceManifest(owner_task_session="s1", placement=_placement(), replica_id="r1")
-    )
-    assert replica.key == _target()
-    assert replica.gpu_uuids == ("u0",)
+    ) is None
+    assert task.initial_gpus == 1
     assert ledger.gpus[("gs-1", "n1", "u0")].native_owner == "s1"
+    assert not hasattr(ledger, "native_replicas")
 
 
 def test_register_resources_rejects_duplicate_or_unknown_owner():
@@ -278,10 +278,3 @@ def test_idle_report_rejects_conflict_stale_revision_and_infinite_ttl():
         ledger.upsert_idle_report(
             _idle_report(source_seq=8, production_revision=2), valid_until=100.0
         )
-
-
-def test_stale_idle_observations_are_reported_by_expiry():
-    ledger = Ledger(_protocol())
-    report = _idle_report(candidates=(_candidate("r1"), _candidate("r2")))
-    ledger.upsert_idle_report(report, valid_until=100.0)
-    assert {item.candidate.key.replica_id for item in ledger.stale_idle_observations(100.0)} == {"r1", "r2"}
