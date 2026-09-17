@@ -1,6 +1,6 @@
 """Native routing subclass plus the simplified R-view commit protocol.
 
-Dynamic service commits use full ReplicaKey identity and return CommitReceipt.
+Dynamic service commits use full ReplicaKey identity and typed RouteEntry state.
 LB also owns idle-candidate observation sequencing/reporting, as required by the
 simplified fusion contract. Native request selection remains inherited until
 dynamic routing is wired end-to-end.
@@ -14,7 +14,12 @@ import uuid
 import ray
 from verl.workers.rollout.llm_server import DEFAULT_ROUTING_CACHE_SIZE, GlobalRequestLoadBalancer
 
-from multi_task_scheduler.orchestration.contracts import IdleCandidateReport, ServiceAction
+from multi_task_scheduler.orchestration.contracts import (
+    IdleCandidateReport,
+    RouteEntry,
+    RouteState,
+    ServiceAction,
+)
 from multi_task_scheduler.orchestration.production_window import (
     ProductionWindow,
     select_idle_candidates,
@@ -46,9 +51,9 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
     ):
         self.group_scheduler = group_scheduler
         super().__init__(servers, max_cache_size=max_cache_size, full_determinism=full_determinism)
-        self.routing_epoch = 0
         self.lb_revision = 0
-        self.routes = {}
+        self.sync_epoch = 0
+        self.routes: dict[object, RouteEntry] = {}
         self.draining = {}
         self.attempts = {}
         self._commit_receipts = {}
@@ -58,6 +63,10 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
     @property
     def last_idle_report(self) -> IdleCandidateReport | None:
         return self._last_idle_report
+
+    def _next_route_epoch(self, key) -> int:
+        existing = self.routes.get(key)
+        return 1 if existing is None else existing.replica_route_epoch + 1
 
     def build_idle_candidate_report(
         self,
@@ -127,25 +136,40 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         phase_revision: int,
         server_admission_epoch: int,
     ) -> DrainTicket:
-        """Internal RO primitive: close one dynamic route and create a drain ticket."""
+        """Move one ROUTABLE entry to DRAINING and fence its old route tickets."""
         if key.task_session != ctx.task_session:
             raise ValueError("drain target does not belong to operation task_session")
-        existing = self.draining.get((ctx.identity, key))
-        if existing is not None:
-            return existing
-        self.routing_epoch += 1
+        existing_ticket = self.draining.get((ctx.identity, key))
+        if existing_ticket is not None:
+            return existing_ticket
+
+        route = self.routes.get(key)
+        if route is None:
+            raise ValueError("drain target has no RouteEntry")
+        if route.state is not RouteState.ROUTABLE:
+            raise ValueError(f"drain target route is {route.state.value}, not ROUTABLE")
+
+        route_epoch = self._next_route_epoch(key)
         self.lb_revision += 1
-        self.routes.pop(key, None)
+        self.routes[key] = RouteEntry(
+            key=key,
+            head_server=route.head_server,
+            state=RouteState.DRAINING,
+            replica_route_epoch=route_epoch,
+            sync_epoch=route.sync_epoch,
+            serving_version=route.serving_version,
+            commit_operation_id=ctx.operation_id,
+        )
         drain_id = f"drain-{uuid.uuid4().hex}"
         ticket = DrainTicket(
             header=EvidenceHeader(
                 ctx=ctx,
                 key=key,
                 phase_revision=phase_revision,
-                digest=_digest("DRAIN", ctx.identity, key, drain_id, self.routing_epoch),
+                digest=_digest("DRAIN", ctx.identity, key, drain_id, route_epoch),
             ),
             drain_id=drain_id,
-            route_epoch=self.routing_epoch,
+            route_epoch=route_epoch,
             server_admission_epoch=server_admission_epoch,
         )
         self.draining[(ctx.identity, key)] = ticket
@@ -169,14 +193,27 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         if cached is not None:
             return cached
 
-        self.routing_epoch += 1
+        existing = self.routes.get(key)
+        if existing is not None and existing.state in {
+            RouteState.ROUTABLE,
+            RouteState.DRAINING,
+            RouteState.QUARANTINED,
+        }:
+            raise ValueError(
+                f"cannot commit route from existing state {existing.state.value}"
+            )
+
+        route_epoch = self._next_route_epoch(key)
         self.lb_revision += 1
-        self.routes[key] = {
-            "head_server": prepared.head_server,
-            "version": weight.version,
-            "ce_revision": ce_commit.revision,
-            "route_epoch": self.routing_epoch,
-        }
+        self.routes[key] = RouteEntry(
+            key=key,
+            head_server=prepared.head_server,
+            state=RouteState.ROUTABLE,
+            replica_route_epoch=route_epoch,
+            sync_epoch=self.sync_epoch,
+            serving_version=weight.version,
+            commit_operation_id=ctx.operation_id,
+        )
         self.draining.pop((ctx.identity, key), None)
         digest = _digest(
             "LB",
@@ -184,7 +221,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             ctx.identity,
             key,
             self.lb_revision,
-            self.routing_epoch,
+            route_epoch,
             weight.header.digest,
             ce_commit.header.digest,
         )
@@ -201,7 +238,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             action=ServiceAction.ADD,
             revision=self.lb_revision,
             version=weight.version,
-            route_epoch=self.routing_epoch,
+            route_epoch=route_epoch,
         )
         self._commit_receipts[cache_key] = receipt
         return receipt
@@ -248,18 +285,31 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         if self._has_unsettled_attempts(key):
             raise ValueError("cannot remove route while attempts remain unsettled")
 
-        self.routing_epoch += 1
+        route = self.routes.get(key)
+        if route is None or route.state is not RouteState.DRAINING:
+            raise ValueError("LB REMOVE requires a DRAINING RouteEntry")
+        if route.replica_route_epoch != ticket.route_epoch:
+            raise ValueError("active RouteEntry epoch does not match drain ticket")
+
+        route_epoch = self._next_route_epoch(key)
         self.lb_revision += 1
-        self.routes.pop(key, None)
+        self.routes[key] = RouteEntry(
+            key=key,
+            head_server=route.head_server,
+            state=RouteState.REMOVED,
+            replica_route_epoch=route_epoch,
+            sync_epoch=route.sync_epoch,
+            serving_version=route.serving_version,
+            commit_operation_id=ctx.operation_id,
+        )
         self.draining.pop((ctx.identity, key), None)
-        self.attempts.pop(key, None)
         digest = _digest(
             "LB",
             "REMOVE",
             ctx.identity,
             key,
             self.lb_revision,
-            self.routing_epoch,
+            route_epoch,
             proof.header.digest,
             ce_commit.header.digest,
         )
@@ -276,7 +326,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             action=ServiceAction.REMOVE,
             revision=self.lb_revision,
             version=None,
-            route_epoch=self.routing_epoch,
+            route_epoch=route_epoch,
         )
         self._commit_receipts[cache_key] = receipt
         return receipt
