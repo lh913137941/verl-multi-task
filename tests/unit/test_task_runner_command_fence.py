@@ -24,6 +24,7 @@ from multi_task_scheduler.orchestration.operation_journal import (
     OperationStatus,
     Outcome,
 )
+from multi_task_scheduler.orchestration.receipts import ReleaseEvidence, ServiceEvidence
 
 SOURCE = (
     Path(__file__).resolve().parents[2]
@@ -66,6 +67,8 @@ def _isolated_task_runner():
         "OperationIdentityError": OperationIdentityError,
         "OperationStatus": OperationStatus,
         "Outcome": Outcome,
+        "ServiceEvidence": ServiceEvidence,
+        "ReleaseEvidence": ReleaseEvidence,
     }
     exec(compile(ast.fix_missing_locations(module), str(SOURCE), "exec"), scope)
     return scope["MultiTaskFullyAsyncTaskRunner"]
