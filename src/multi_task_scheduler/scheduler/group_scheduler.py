@@ -194,8 +194,9 @@ class GroupScheduler:
 
         Current lease-state authorization is evaluated only for a new operation.
         Once an operation_id has been accepted, later retries are fenced by its
-        immutable recorded command and must keep returning/querying that same
-        progress even after the lease moves to a later state.
+        immutable recorded command. When the TaskRunner is reachable, replay is
+        forwarded idempotently so GS observes the latest authoritative journal
+        progress instead of returning a stale cached result.
         """
         if not isinstance(command, OperationCommand):
             raise TypeError("submit_operation requires OperationCommand")
@@ -211,9 +212,6 @@ class GroupScheduler:
             )
         else:
             record = self.ledger.record_operation(command)
-
-        if record.final_result is not None:
-            return record.final_result
 
         controller = self.controllers.get(
             (record.command.ctx.task_id, record.command.ctx.task_session)
