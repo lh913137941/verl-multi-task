@@ -102,13 +102,10 @@ class ServerActivity:
     pending_admissions: int | None
     transfer_inflight: bool
     all_backends_observed: bool
-    engine_digest: str
 
     def __post_init__(self) -> None:
         if self.engine_seq < 0 or self.observed_age_ms < 0:
             raise ValueError("engine_seq and observed_age_ms must be nonnegative")
-        if not self.engine_digest:
-            raise ValueError("engine_digest must be nonempty")
         for value in (
             self.admitting,
             self.queued,
@@ -127,6 +124,22 @@ class ServerActivity:
             and self.running == 0
             and self.pending_admissions == 0
             and not self.transfer_inflight
+        )
+
+    @property
+    def digest(self) -> str:
+        """Stable digest of the complete aggregate engine observation."""
+        return _digest(
+            "SERVER_ACTIVITY",
+            self.key,
+            self.engine_seq,
+            self.observed_age_ms,
+            self.admitting,
+            self.queued,
+            self.running,
+            self.pending_admissions,
+            self.transfer_inflight,
+            self.all_backends_observed,
         )
 
 
@@ -225,6 +238,7 @@ def select_idle_candidates(
             continue
 
         activity = view.activity
+        engine_digest = activity.digest
         evidence_digest = _digest(
             activity.key,
             window.task_session,
@@ -242,7 +256,7 @@ def select_idle_candidates(
             view.manager_revision,
             view.lb_revision,
             activity.engine_seq,
-            activity.engine_digest,
+            engine_digest,
             reason,
             view.stable_idle_ms,
             activity.observed_age_ms,
@@ -256,7 +270,7 @@ def select_idle_candidates(
                 source_seq=source_seq,
                 manager_revision=view.manager_revision,
                 lb_revision=view.lb_revision,
-                engine_digest=activity.engine_digest,
+                engine_digest=engine_digest,
                 reason=reason,
                 stable_idle_ms=view.stable_idle_ms,
                 observed_age_ms=activity.observed_age_ms,
