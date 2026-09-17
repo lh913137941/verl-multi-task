@@ -90,7 +90,6 @@ def _view():
             pending_admissions=0,
             transfer_inflight=False,
             all_backends_observed=True,
-            engine_digest="engine-r1",
         ),
         manager_revision=2,
         lb_revision=3,
@@ -126,6 +125,8 @@ def test_lb_assigns_monotonic_source_seq_and_window_revision():
     assert second.production_revision == 5
     assert first.candidates[0].source_seq == first.source_seq
     assert second.candidates[0].source_seq == second.source_seq
+    assert first.candidates[0].engine_digest
+    assert second.candidates[0].engine_digest
     assert lb.last_idle_report is second
 
 
@@ -142,7 +143,7 @@ def test_transport_retry_resends_same_report_without_allocating_new_seq():
     scheduler = SimpleNamespace(
         report_idle_candidates=SimpleNamespace(remote=remote)
     )
-    lb = _isolated_lb()( {}, group_scheduler=scheduler)
+    lb = _isolated_lb()({}, group_scheduler=scheduler)
     report = _build(lb, _window())
 
     first = lb.report_idle_candidates(report)
