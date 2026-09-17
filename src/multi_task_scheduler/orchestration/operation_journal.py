@@ -1,12 +1,4 @@
-"""Replayable operation metadata for scale transactions.
-
-Tracks each control operation's fine-grained phase (section 3.4) and exposes
-its coarse result state (section 3.2 ``OperationResult.state``). The same
-``(operation_id, lease_epoch)`` is an idempotent replay; an older epoch is
-rejected; conflicting identity or payload digest is a CONFLICT. This provides
-the "same ID same digest returns existing status, different digest returns
-CONFLICT" contract without claiming network exactly-once.
-"""
+"""Replayable lifecycle journal and its acceptance fences."""
 
 from __future__ import annotations
 
@@ -15,186 +7,229 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 
-class OperationType(str, Enum):
-    DONATE = "DONATE"
+class OperationKind(str, Enum):
     ADD = "ADD"
+    DONATE = "DONATE"
     REMOVE = "REMOVE"
     RESTORE = "RESTORE"
 
 
-class OperationPhase(str, Enum):
-    """Fine-grained task-internal progress (section 3.4)."""
-
-    ACCEPTED = "ACCEPTED"
-    PREPARING = "PREPARING"
-    DRAINING = "DRAINING"
-    WAIT_GATE = "WAIT_GATE"
-    APPLYING = "APPLYING"
-    COMMITTED = "COMMITTED"
-    ROLLED_BACK = "ROLLED_BACK"
-    RECONCILING = "RECONCILING"
-    QUARANTINED = "QUARANTINED"
-
-
-class OperationState(str, Enum):
-    """Coarse result state reported in ``OperationResult.state`` (section 3.2)."""
-
+class OperationStatus(str, Enum):
     ACCEPTED = "ACCEPTED"
     RUNNING = "RUNNING"
-    COMMITTED = "COMMITTED"
-    REJECTED = "REJECTED"
-    ROLLED_BACK = "ROLLED_BACK"
-    RECONCILING = "RECONCILING"
-    QUARANTINED = "QUARANTINED"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    UNKNOWN = "UNKNOWN"
+
+
+class Phase(str, Enum):
+    VALIDATE = "VALIDATE"
+    CREATE = "CREATE"
+    DRAIN = "DRAIN"
+    ABORT_TARGET = "ABORT_TARGET"
+    WAIT_CONTINUATION = "WAIT_CONTINUATION"
+    WAIT_GATE = "WAIT_GATE"
+    WAKE_WEIGHTS = "WAKE_WEIGHTS"
+    LOAD_WEIGHTS = "LOAD_WEIGHTS"
+    JOIN_CE = "JOIN_CE"
+    COMMIT_SERVICE = "COMMIT_SERVICE"
+    LEAVE_CE = "LEAVE_CE"
+    COMMIT_REMOVAL = "COMMIT_REMOVAL"
+    SLEEP = "SLEEP"
+    DESTROY = "DESTROY"
+    RECONCILE = "RECONCILE"
+    DONE = "DONE"
+
+
+class Outcome(str, Enum):
+    KNOWN_NOT_APPLIED = "KNOWN_NOT_APPLIED"
+    KNOWN_APPLIED = "KNOWN_APPLIED"
+    UNKNOWN = "UNKNOWN"
 
 
 class ExpiredLeaseError(RuntimeError):
-    """A command does not match the journal's current lease epoch."""
+    """A command does not match the journal's accepted lease epoch."""
 
 
 class OperationIdentityError(RuntimeError):
-    """An operation ID is replayed with conflicting immutable or digest fields."""
+    """A replay or newly accepted operation conflicts with journal fences."""
 
 
 class IllegalOperationTransitionError(RuntimeError):
-    """An operation skips a required transaction phase."""
+    """An operation skips a required transaction phase/status edge."""
 
 
 _PHASE_ALLOWED = {
-    OperationPhase.ACCEPTED: {OperationPhase.PREPARING, OperationPhase.DRAINING},
-    OperationPhase.PREPARING: {
-        OperationPhase.WAIT_GATE,
-        OperationPhase.ROLLED_BACK,
-        OperationPhase.QUARANTINED,
+    Phase.VALIDATE: {Phase.CREATE, Phase.DRAIN, Phase.WAIT_GATE, Phase.RECONCILE, Phase.DONE},
+    Phase.CREATE: {Phase.WAIT_GATE, Phase.DESTROY, Phase.RECONCILE, Phase.DONE},
+    Phase.DRAIN: {Phase.WAIT_GATE, Phase.ABORT_TARGET, Phase.RECONCILE, Phase.DONE},
+    Phase.ABORT_TARGET: {Phase.WAIT_CONTINUATION, Phase.RECONCILE, Phase.DONE},
+    Phase.WAIT_CONTINUATION: {Phase.WAIT_GATE, Phase.RECONCILE, Phase.DONE},
+    Phase.WAIT_GATE: {
+        Phase.WAKE_WEIGHTS,
+        Phase.LOAD_WEIGHTS,
+        Phase.LEAVE_CE,
+        Phase.RECONCILE,
+        Phase.DONE,
     },
-    OperationPhase.DRAINING: {
-        OperationPhase.WAIT_GATE,
-        OperationPhase.ROLLED_BACK,
-        OperationPhase.QUARANTINED,
-    },
-    OperationPhase.WAIT_GATE: {
-        OperationPhase.APPLYING,
-        OperationPhase.ROLLED_BACK,
-        OperationPhase.QUARANTINED,
-    },
-    OperationPhase.APPLYING: {
-        OperationPhase.COMMITTED,
-        OperationPhase.ROLLED_BACK,
-        OperationPhase.RECONCILING,
-        OperationPhase.QUARANTINED,
-    },
-    OperationPhase.COMMITTED: set(),
-    OperationPhase.ROLLED_BACK: set(),
-    OperationPhase.RECONCILING: {
-        OperationPhase.COMMITTED,
-        OperationPhase.ROLLED_BACK,
-        OperationPhase.QUARANTINED,
-    },
-    OperationPhase.QUARANTINED: set(),
+    Phase.WAKE_WEIGHTS: {Phase.LOAD_WEIGHTS, Phase.RECONCILE, Phase.DONE},
+    Phase.LOAD_WEIGHTS: {Phase.JOIN_CE, Phase.RECONCILE, Phase.DONE},
+    Phase.JOIN_CE: {Phase.COMMIT_SERVICE, Phase.RECONCILE, Phase.DONE},
+    Phase.COMMIT_SERVICE: {Phase.DONE, Phase.RECONCILE},
+    Phase.LEAVE_CE: {Phase.COMMIT_REMOVAL, Phase.RECONCILE, Phase.DONE},
+    Phase.COMMIT_REMOVAL: {Phase.SLEEP, Phase.DESTROY, Phase.DONE, Phase.RECONCILE},
+    Phase.SLEEP: {Phase.DONE, Phase.RECONCILE},
+    Phase.DESTROY: {Phase.DONE, Phase.RECONCILE},
+    Phase.RECONCILE: {Phase.DONE},
+    Phase.DONE: set(),
 }
 
-_RUNNING_PHASES = {
-    OperationPhase.PREPARING,
-    OperationPhase.DRAINING,
-    OperationPhase.WAIT_GATE,
-    OperationPhase.APPLYING,
-}
-
-_PHASE_TO_STATE = {
-    OperationPhase.ACCEPTED: OperationState.ACCEPTED,
-    OperationPhase.COMMITTED: OperationState.COMMITTED,
-    OperationPhase.ROLLED_BACK: OperationState.ROLLED_BACK,
-    OperationPhase.RECONCILING: OperationState.RECONCILING,
-    OperationPhase.QUARANTINED: OperationState.QUARANTINED,
+_TERMINAL_STATUSES = {
+    OperationStatus.SUCCEEDED,
+    OperationStatus.FAILED,
+    OperationStatus.UNKNOWN,
 }
 
 
-def phase_to_state(phase: OperationPhase) -> OperationState:
-    if phase in _PHASE_TO_STATE:
-        return _PHASE_TO_STATE[phase]
-    if phase in _RUNNING_PHASES:
-        return OperationState.RUNNING
-    return OperationState.ACCEPTED
+def _default_status_for_phase(phase: Phase) -> OperationStatus:
+    if phase is Phase.VALIDATE:
+        return OperationStatus.ACCEPTED
+    if phase is Phase.RECONCILE:
+        return OperationStatus.UNKNOWN
+    if phase is Phase.DONE:
+        raise IllegalOperationTransitionError(
+            "DONE requires an explicit SUCCEEDED/FAILED/UNKNOWN status"
+        )
+    return OperationStatus.RUNNING
+
+
+def _require_command_shape(command: object) -> None:
+    """Validate the journal-facing command shape without importing contracts."""
+    try:
+        ctx = command.ctx
+        target = command.target
+        kind = command.kind
+        payload_digest = command.payload_digest
+        remaining_budget_ms = command.remaining_budget_ms
+    except AttributeError as exc:
+        raise TypeError("journal begin requires a complete OperationCommand") from exc
+    if not ctx.operation_id or not target.replica_id:
+        raise ValueError("operation_id and target replica_id must be nonempty")
+    if not isinstance(payload_digest, str) or not payload_digest:
+        raise ValueError("payload_digest must be a nonempty string")
+    if remaining_budget_ms < 0:
+        raise ValueError("remaining_budget_ms must be nonnegative")
+    OperationKind(kind)
+
+
+def _command_identity(command: object) -> tuple:
+    """Immutable business identity; transport budget is not replay identity."""
+    return (
+        command.ctx,
+        OperationKind(command.kind),
+        command.target,
+        command.authorization,
+        command.placement,
+        command.candidate,
+        command.recall_mode,
+        command.payload_digest,
+    )
 
 
 @dataclass
 class OperationRecord:
-    operation_id: str
-    lease_epoch: int
-    replica_id: str
-    operation_type: OperationType
-    phase: OperationPhase = OperationPhase.ACCEPTED
-    payload_digest: str | None = None
-    command_seq: int = 0
-    detail: dict[str, object] = field(default_factory=dict)
-    created_at: float = field(default_factory=time.monotonic)
-    updated_at: float = field(default_factory=time.monotonic)
+    command: object
+    status: OperationStatus = OperationStatus.ACCEPTED
+    phase: Phase = Phase.VALIDATE
+    phase_revision: int = 0
+    phase_results: dict[Phase, object] = field(default_factory=dict)
+    phase_timings_ms: dict[Phase, int] = field(default_factory=dict)
+    error: object | None = None
+    deadline_at: float = 0.0
+    created_at: float = 0.0
+    updated_at: float = 0.0
 
     @property
-    def state(self) -> OperationState:
-        return phase_to_state(self.phase)
+    def operation_id(self) -> str:
+        return self.command.ctx.operation_id
+
+    @property
+    def lease_epoch(self) -> int:
+        return self.command.ctx.lease_epoch
+
+    @property
+    def target(self):
+        return self.command.target
 
 
 class OperationJournal:
-    def __init__(self) -> None:
+    def __init__(self, *, clock=None) -> None:
         self._records: dict[str, OperationRecord] = {}
-        self._validation_frozen = False
+        self._clock = time.monotonic if clock is None else clock
 
-    @property
-    def validation_frozen(self) -> bool:
-        return self._validation_frozen
-
-    def set_validation_freeze(self, frozen: bool) -> None:
-        self._validation_frozen = bool(frozen)
-
-    def begin(
-        self,
-        operation_id: str,
-        lease_epoch: int,
-        replica_id: str,
-        operation_type: OperationType,
-        *,
-        payload_digest: str | None = None,
-        command_seq: int = 0,
-    ) -> OperationRecord:
-        if not operation_id or not replica_id:
-            raise ValueError("operation_id and replica_id must be nonempty")
-        if lease_epoch < 0:
-            raise ValueError("lease_epoch must be nonnegative")
-        operation_type = OperationType(operation_type)
-
+    def begin(self, command: object) -> OperationRecord:
+        """Idempotently accept one command while enforcing task/sequence fences."""
+        _require_command_shape(command)
+        operation_id = command.ctx.operation_id
         existing = self._records.get(operation_id)
         if existing is not None:
-            if lease_epoch < existing.lease_epoch:
+            if command.ctx.lease_epoch < existing.lease_epoch:
                 raise ExpiredLeaseError(
-                    f"operation {operation_id!r} epoch {lease_epoch} is older than "
+                    f"operation {operation_id!r} epoch {command.ctx.lease_epoch} is older than "
                     f"{existing.lease_epoch}"
                 )
-            if lease_epoch == existing.lease_epoch:
-                if (
-                    existing.replica_id != replica_id
-                    or existing.operation_type is not operation_type
-                    or existing.payload_digest != payload_digest
-                    or existing.command_seq != command_seq
-                ):
-                    raise OperationIdentityError(
-                        f"conflicting replay for operation {operation_id!r}"
-                    )
-                return existing
+            if command.ctx.lease_epoch > existing.lease_epoch:
+                raise OperationIdentityError(
+                    f"operation {operation_id!r} cannot be reused for another lease epoch"
+                )
+            if _command_identity(existing.command) != _command_identity(command):
+                raise OperationIdentityError(
+                    f"conflicting replay for operation {operation_id!r}"
+                )
+            return existing
+
+        active = next(
+            (
+                record
+                for record in self._records.values()
+                if record.command.ctx.task_session == command.ctx.task_session
+                and record.phase is not Phase.DONE
+            ),
+            None,
+        )
+        if active is not None:
             raise OperationIdentityError(
-                f"operation {operation_id!r} cannot be reused for a different lease epoch"
+                "another lifecycle operation is active for this task: "
+                f"{active.operation_id!r}"
             )
 
+        prior_sequences = [
+            record.command.ctx.command_seq
+            for record in self._records.values()
+            if record.target == command.target
+        ]
+        if prior_sequences and command.ctx.command_seq <= max(prior_sequences):
+            raise OperationIdentityError(
+                f"stale command_seq {command.ctx.command_seq} for {command.target!r}; "
+                f"last accepted sequence is {max(prior_sequences)}"
+            )
+
+        now = self._clock()
         record = OperationRecord(
-            operation_id=operation_id,
-            lease_epoch=lease_epoch,
-            replica_id=replica_id,
-            operation_type=operation_type,
-            payload_digest=payload_digest,
-            command_seq=command_seq,
+            command=command,
+            deadline_at=now + command.remaining_budget_ms / 1000.0,
+            created_at=now,
+            updated_at=now,
         )
         self._records[operation_id] = record
         return record
+
+    def remaining_budget_ms(self, operation_id: str) -> int:
+        """Return the first acceptance budget; retries never extend it."""
+        return max(
+            0,
+            int((self._records[operation_id].deadline_at - self._clock()) * 1000),
+        )
 
     def require(self, operation_id: str, lease_epoch: int) -> OperationRecord:
         record = self._records[operation_id]
@@ -211,19 +246,55 @@ class OperationJournal:
     def transition(
         self,
         operation_id: str,
-        new_phase: OperationPhase,
-        detail: dict[str, object] | None = None,
+        new_phase: Phase,
+        *,
+        status: OperationStatus | None = None,
+        phase_result: object | None = None,
+        elapsed_ms: int | None = None,
+        error: object | None = None,
     ) -> OperationRecord:
         record = self._records[operation_id]
-        new_phase = OperationPhase(new_phase)
-        if new_phase is not record.phase:
-            if new_phase not in _PHASE_ALLOWED[record.phase]:
+        new_phase = Phase(new_phase)
+        if new_phase is not record.phase and new_phase not in _PHASE_ALLOWED[record.phase]:
+            raise IllegalOperationTransitionError(
+                f"illegal operation transition for {operation_id}: "
+                f"{record.phase.value} -> {new_phase.value}"
+            )
+
+        new_status = (
+            _default_status_for_phase(new_phase)
+            if status is None
+            else OperationStatus(status)
+        )
+        if new_phase is Phase.DONE:
+            if new_status not in _TERMINAL_STATUSES:
                 raise IllegalOperationTransitionError(
-                    f"illegal operation transition for {operation_id}: "
-                    f"{record.phase.value} -> {new_phase.value}"
+                    "DONE requires SUCCEEDED, FAILED, or UNKNOWN"
                 )
-            record.phase = new_phase
-        if detail:
-            record.detail.update(detail)
-        record.updated_at = time.monotonic()
+        elif new_status in {OperationStatus.SUCCEEDED, OperationStatus.FAILED}:
+            raise IllegalOperationTransitionError(
+                f"terminal status {new_status.value} requires phase DONE"
+            )
+        elif new_status is OperationStatus.UNKNOWN and new_phase is not Phase.RECONCILE:
+            raise IllegalOperationTransitionError(
+                "UNKNOWN is only valid while reconciling or at DONE"
+            )
+
+        changed = new_phase is not record.phase or new_status is not record.status
+        record.phase = new_phase
+        record.status = new_status
+        if phase_result is not None:
+            record.phase_results[new_phase] = phase_result
+            changed = True
+        if elapsed_ms is not None:
+            if elapsed_ms < 0:
+                raise ValueError("elapsed_ms must be nonnegative")
+            record.phase_timings_ms[new_phase] = elapsed_ms
+            changed = True
+        if error is not None:
+            record.error = error
+            changed = True
+        if changed:
+            record.phase_revision += 1
+            record.updated_at = self._clock()
         return record

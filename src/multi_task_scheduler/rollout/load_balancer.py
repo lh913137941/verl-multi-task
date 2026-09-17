@@ -1,15 +1,45 @@
-"""Native routing subclass with a conservative orchestration R view.
+"""Native routing subclass plus the simplified R-view commit protocol.
 
-Native request selection remains inherited. The overlay owns routing eligibility,
-a monotonic route revision and attempt facts used by lifecycle operations. It
-never discards unresolved attempts in order to manufacture a successful remove.
+Dynamic service commits use full ReplicaKey identity and typed RouteEntry state.
+LB also owns idle-candidate observation sequencing/reporting, as required by the
+simplified fusion contract. Native request selection remains inherited until
+dynamic routing is wired end-to-end.
 """
 
+from __future__ import annotations
+
+import hashlib
+import uuid
+
+import ray
 from verl.workers.rollout.llm_server import DEFAULT_ROUTING_CACHE_SIZE, GlobalRequestLoadBalancer
+
+from multi_task_scheduler.orchestration.contracts import (
+    IdleCandidateReport,
+    RouteEntry,
+    RouteState,
+    ServiceAction,
+)
+from multi_task_scheduler.orchestration.production_window import (
+    ProductionWindow,
+    select_idle_candidates,
+)
+from multi_task_scheduler.orchestration.receipts import (
+    Ack,
+    CommitOwner,
+    CommitReceipt,
+    DrainTicket,
+    EvidenceHeader,
+)
+
+
+def _digest(*parts: object) -> str:
+    data = "|".join(repr(part) for part in parts).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
 
 
 class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
-    """Manager wraps this ordinary class in Ray; native routing stays inherited."""
+    """LB owns R, its attempt ledger, and idle-candidate report sequencing."""
 
     def __init__(
         self,
@@ -21,76 +51,200 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
     ):
         self.group_scheduler = group_scheduler
         super().__init__(servers, max_cache_size=max_cache_size, full_determinism=full_determinism)
-        self.routing_epoch = 0
-        self.routable_ids = set(servers)
-        self.draining_ids = set()
+        self.lb_revision = 0
+        self.sync_epoch = 0
+        self.routes: dict[object, RouteEntry] = {}
+        self.draining = {}
         self.attempts = {}
-        self.route_metadata = {
-            replica_id: {
-                "serving_version": None,
-                "ce_revision": None,
-                "lease_valid": True,
-                "committed_before": True,
-            }
-            for replica_id in servers
-        }
+        self._commit_receipts = {}
+        self._idle_source_seq = -1
+        self._last_idle_report = None
 
-    def begin_drain(self, replica_id: str) -> int:
-        """Atomically close new routing and advance the route fence."""
-        self.draining_ids.add(replica_id)
-        self.routable_ids.discard(replica_id)
-        self.routing_epoch += 1
-        return self.routing_epoch
+    @property
+    def last_idle_report(self) -> IdleCandidateReport | None:
+        return self._last_idle_report
 
-    def commit_routable(
+    def _next_route_epoch(self, key) -> int:
+        existing = self.routes.get(key)
+        return 1 if existing is None else existing.replica_route_epoch + 1
+
+    def build_idle_candidate_report(
         self,
-        replica_id: str,
+        window: ProductionWindow,
+        replicas,
         *,
-        serving_version: int | None = None,
-        ce_revision: int | None = None,
-        lease_valid: bool | None = None,
-    ) -> int:
-        """Publish a route after evidence, or cancel a not-yet-committed drain.
-
-        ADD/RESTORE must provide weight/member/lease evidence. A replica that was
-        already committed before the current drain may be reopened without new
-        evidence when the drain is safely cancelled before CE removal.
-        """
-        previous = self.route_metadata.get(replica_id)
-        cancelling_drain = (
-            replica_id in self.draining_ids
-            and previous is not None
-            and previous.get("committed_before") is True
-            and serving_version is None
-            and ce_revision is None
-            and lease_valid is None
+        gs_epoch: str,
+        lb_session: str,
+        valid_for_ms: int,
+        observations_fresh: bool,
+        min_active_gpus: int,
+        current_active_gpus: int,
+        routable_count: int,
+    ) -> IdleCandidateReport:
+        """Freeze one new complete candidate observation with an LB-owned seq."""
+        if not isinstance(window, ProductionWindow):
+            raise TypeError("idle reporting requires ProductionWindow")
+        source_seq = self._idle_source_seq + 1
+        candidates = select_idle_candidates(
+            window,
+            replicas,
+            source_seq=source_seq,
+            observations_fresh=observations_fresh,
+            min_active_gpus=min_active_gpus,
+            current_active_gpus=current_active_gpus,
+            routable_count=routable_count,
         )
-        if cancelling_drain:
-            self.routable_ids.add(replica_id)
-            self.draining_ids.discard(replica_id)
-            self.routing_epoch += 1
-            return self.routing_epoch
+        report = IdleCandidateReport(
+            task_session=window.task_session,
+            gs_epoch=gs_epoch,
+            lb_session=lb_session,
+            source_seq=source_seq,
+            production_revision=window.revision,
+            valid_for_ms=valid_for_ms,
+            candidates=candidates,
+        )
+        self._idle_source_seq = source_seq
+        self._last_idle_report = report
+        return report
 
-        if serving_version is None or ce_revision is None or lease_valid is None:
-            raise ValueError("new route commit requires serving_version, ce_revision and lease_valid")
-        if serving_version < 0 or ce_revision < 0:
-            raise ValueError("serving_version and ce_revision must be nonnegative")
-        if not lease_valid:
-            raise ValueError("cannot route a replica without a valid lease/identity fence")
+    def report_idle_candidates(self, report: IdleCandidateReport) -> Ack:
+        """Send one already-frozen report to GS; retries reuse the same object.
 
-        self.route_metadata[replica_id] = {
-            "serving_version": serving_version,
-            "ce_revision": ce_revision,
-            "lease_valid": True,
-            "committed_before": True,
-        }
-        self.routable_ids.add(replica_id)
-        self.draining_ids.discard(replica_id)
-        self.routing_epoch += 1
-        return self.routing_epoch
+        Constructing and sending are intentionally separate. If an ACK is lost,
+        callers resend the original report and therefore the same source_seq;
+        they must not construct a new report merely to retry transport.
+        """
+        if not isinstance(report, IdleCandidateReport):
+            raise TypeError("report_idle_candidates requires IdleCandidateReport")
+        if self.group_scheduler is None:
+            raise RuntimeError("GroupScheduler handle is required for idle reporting")
+        if self._last_idle_report is None or report != self._last_idle_report:
+            raise ValueError("LB may report only its latest frozen candidate set")
+        ack = ray.get(
+            self.group_scheduler.report_idle_candidates.remote(report),
+            timeout=30,
+        )
+        if not isinstance(ack, Ack):
+            raise TypeError("GroupScheduler returned a non-Ack idle-report response")
+        return ack
 
-    def _has_unsettled_attempts(self, replica_id: str) -> bool:
-        attempts = self.attempts.get(replica_id)
+    def close_for_exit(
+        self,
+        ctx,
+        key,
+        *,
+        phase_revision: int,
+        server_admission_epoch: int,
+    ) -> DrainTicket:
+        """Move one ROUTABLE entry to DRAINING and fence its old route tickets."""
+        if key.task_session != ctx.task_session:
+            raise ValueError("drain target does not belong to operation task_session")
+        existing_ticket = self.draining.get((ctx.identity, key))
+        if existing_ticket is not None:
+            return existing_ticket
+
+        route = self.routes.get(key)
+        if route is None:
+            raise ValueError("drain target has no RouteEntry")
+        if route.state is not RouteState.ROUTABLE:
+            raise ValueError(f"drain target route is {route.state.value}, not ROUTABLE")
+
+        route_epoch = self._next_route_epoch(key)
+        self.lb_revision += 1
+        self.routes[key] = RouteEntry(
+            key=key,
+            head_server=route.head_server,
+            state=RouteState.DRAINING,
+            replica_route_epoch=route_epoch,
+            sync_epoch=route.sync_epoch,
+            serving_version=route.serving_version,
+            commit_operation_id=ctx.operation_id,
+        )
+        drain_id = f"drain-{uuid.uuid4().hex}"
+        ticket = DrainTicket(
+            header=EvidenceHeader(
+                ctx=ctx,
+                key=key,
+                phase_revision=phase_revision,
+                digest=_digest("DRAIN", ctx.identity, key, drain_id, route_epoch),
+            ),
+            drain_id=drain_id,
+            route_epoch=route_epoch,
+            server_admission_epoch=server_admission_epoch,
+        )
+        self.draining[(ctx.identity, key)] = ticket
+        return ticket
+
+    def commit_routable(self, ctx, prepared, weight, ce_commit) -> CommitReceipt:
+        """Commit R=ROUTABLE after valid weight and CE ADD evidence."""
+        key = prepared.key
+        if prepared.ctx != ctx or weight.header.ctx != ctx or weight.header.key != key:
+            raise ValueError("LB ADD evidence identity mismatch")
+        if (
+            ce_commit.header.ctx != ctx
+            or ce_commit.header.key != key
+            or ce_commit.owner is not CommitOwner.CE
+            or ce_commit.action is not ServiceAction.ADD
+            or ce_commit.version != weight.version
+        ):
+            raise ValueError("LB ADD requires matching CE ADD commit")
+        cache_key = (ctx.identity, key, ServiceAction.ADD)
+        cached = self._commit_receipts.get(cache_key)
+        if cached is not None:
+            return cached
+
+        existing = self.routes.get(key)
+        if existing is not None and existing.state in {
+            RouteState.ROUTABLE,
+            RouteState.DRAINING,
+            RouteState.QUARANTINED,
+        }:
+            raise ValueError(
+                f"cannot commit route from existing state {existing.state.value}"
+            )
+
+        route_epoch = self._next_route_epoch(key)
+        self.lb_revision += 1
+        self.routes[key] = RouteEntry(
+            key=key,
+            head_server=prepared.head_server,
+            state=RouteState.ROUTABLE,
+            replica_route_epoch=route_epoch,
+            sync_epoch=self.sync_epoch,
+            serving_version=weight.version,
+            commit_operation_id=ctx.operation_id,
+        )
+        self.draining.pop((ctx.identity, key), None)
+        digest = _digest(
+            "LB",
+            "ADD",
+            ctx.identity,
+            key,
+            self.lb_revision,
+            route_epoch,
+            weight.header.digest,
+            ce_commit.header.digest,
+        )
+        receipt = CommitReceipt(
+            header=EvidenceHeader(
+                ctx=ctx,
+                key=key,
+                phase_revision=max(
+                    weight.header.phase_revision, ce_commit.header.phase_revision
+                ) + 1,
+                digest=digest,
+            ),
+            owner=CommitOwner.LB,
+            action=ServiceAction.ADD,
+            revision=self.lb_revision,
+            version=weight.version,
+            route_epoch=route_epoch,
+        )
+        self._commit_receipts[cache_key] = receipt
+        return receipt
+
+    def _has_unsettled_attempts(self, key) -> bool:
+        attempts = self.attempts.get(key)
         if attempts is None:
             return False
         if isinstance(attempts, dict):
@@ -103,17 +257,80 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             return False
         return bool(attempts)
 
-    def finish_remove(self, replica_id: str) -> bool:
-        """Commit R=REMOVED only when no unresolved attempt remains."""
-        if self._has_unsettled_attempts(replica_id):
-            return False
-        self.draining_ids.discard(replica_id)
-        self.routable_ids.discard(replica_id)
-        self.route_metadata.pop(replica_id, None)
-        self.attempts.pop(replica_id, None)
-        self.routing_epoch += 1
-        return True
+    def finish_remove(self, ctx, proof, ce_commit) -> CommitReceipt:
+        """Commit R=REMOVED only for this operation's active, settled drain."""
+        key = proof.header.key
+        if proof.header.ctx != ctx:
+            raise ValueError("LB REMOVE exit evidence belongs to another operation")
+        if (
+            ce_commit.header.ctx != ctx
+            or ce_commit.header.key != key
+            or ce_commit.owner is not CommitOwner.CE
+            or ce_commit.action is not ServiceAction.REMOVE
+        ):
+            raise ValueError("LB REMOVE requires matching CE REMOVE commit")
 
-    def query_routing_operation(self, operation_id: str) -> str:
-        """Unknown is not evidence that nothing executed."""
-        return "unknown"
+        cache_key = (ctx.identity, key, ServiceAction.REMOVE)
+        cached = self._commit_receipts.get(cache_key)
+        if cached is not None:
+            return cached
+
+        ticket = self.draining.get((ctx.identity, key))
+        if ticket is None:
+            raise ValueError("LB REMOVE requires the active drain ticket")
+        if proof.drain_id != ticket.drain_id:
+            raise ValueError("ExitEvidence drain_id does not match active drain ticket")
+        if proof.header.phase_revision < ticket.header.phase_revision:
+            raise ValueError("ExitEvidence predates the active drain ticket")
+        if self._has_unsettled_attempts(key):
+            raise ValueError("cannot remove route while attempts remain unsettled")
+
+        route = self.routes.get(key)
+        if route is None or route.state is not RouteState.DRAINING:
+            raise ValueError("LB REMOVE requires a DRAINING RouteEntry")
+        if route.replica_route_epoch != ticket.route_epoch:
+            raise ValueError("active RouteEntry epoch does not match drain ticket")
+
+        route_epoch = self._next_route_epoch(key)
+        self.lb_revision += 1
+        self.routes[key] = RouteEntry(
+            key=key,
+            head_server=route.head_server,
+            state=RouteState.REMOVED,
+            replica_route_epoch=route_epoch,
+            sync_epoch=route.sync_epoch,
+            serving_version=route.serving_version,
+            commit_operation_id=ctx.operation_id,
+        )
+        self.draining.pop((ctx.identity, key), None)
+        digest = _digest(
+            "LB",
+            "REMOVE",
+            ctx.identity,
+            key,
+            self.lb_revision,
+            route_epoch,
+            proof.header.digest,
+            ce_commit.header.digest,
+        )
+        receipt = CommitReceipt(
+            header=EvidenceHeader(
+                ctx=ctx,
+                key=key,
+                phase_revision=max(
+                    proof.header.phase_revision, ce_commit.header.phase_revision
+                ) + 1,
+                digest=digest,
+            ),
+            owner=CommitOwner.LB,
+            action=ServiceAction.REMOVE,
+            revision=self.lb_revision,
+            version=None,
+            route_epoch=route_epoch,
+        )
+        self._commit_receipts[cache_key] = receipt
+        return receipt
+
+    def query_phase(self, ctx, phase):
+        """Owner-side query must be backed by a real phase journal before use."""
+        raise NotImplementedError("LB query_phase requires owner-side journal wiring")

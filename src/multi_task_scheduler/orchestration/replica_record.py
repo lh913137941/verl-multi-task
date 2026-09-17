@@ -1,14 +1,15 @@
-"""Replica lifecycle metadata independent of distributed runtime handles.
+"""Manager-owned replica lifecycle record from simplified design §5/§6.4.
 
-The public lifecycle is intentionally small. Fine-grained bootstrap, CE, route,
-sleep and destroy steps belong in the operation journal and evidence records,
-not in a second mutable lifecycle state machine.
+The record stores lifecycle identity and revisions only. Fine-grained bootstrap,
+CE, route, sleep and destroy work belongs to the operation journal/evidence.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
+
+from .contracts import OperationError, PlacementSpec, ReplicaKey
 
 
 class ReplicaKind(str, Enum):
@@ -64,33 +65,26 @@ _ALLOWED = {
 
 @dataclass
 class ReplicaRecord:
-    replica_id: str
-    kind: ReplicaKind = ReplicaKind.BORROWED
-    state: ReplicaState | None = None
-    revision: int = 0
-    operation_id: str | None = None
+    key: ReplicaKey
+    kind: ReplicaKind
+    state: ReplicaState
+    revision: int
+    placement: PlacementSpec
     lease_id: str | None = None
-    lease_epoch: int = 0
-    runtime_epoch: int = 0
-    routing_epoch: int | None = None
+    active_operation_id: str | None = None
+    lease_epoch: int | None = None
     loaded_version: int | None = None
-    last_error: object | None = None
-    lifecycle_pins: set[str] = field(default_factory=set)
+    last_error: OperationError | None = None
 
     def __post_init__(self) -> None:
         self.kind = ReplicaKind(self.kind)
-        if not self.replica_id:
-            raise ValueError("replica_id must be nonempty")
-        if self.revision < 0 or self.lease_epoch < 0 or self.runtime_epoch < 0:
-            raise ValueError("revision and epochs must be nonnegative")
-        if self.state is None:
-            self.state = (
-                ReplicaState.ACTIVE
-                if self.kind is ReplicaKind.NATIVE
-                else ReplicaState.PREPARING
-            )
-        else:
-            self.state = ReplicaState(self.state)
+        self.state = ReplicaState(self.state)
+        if self.revision < 0:
+            raise ValueError("revision must be nonnegative")
+        if self.lease_epoch is not None and self.lease_epoch < 0:
+            raise ValueError("lease_epoch must be nonnegative")
+        if self.loaded_version is not None and self.loaded_version < 0:
+            raise ValueError("loaded_version must be nonnegative")
         self._validate_kind_state(self.state)
 
     def _validate_kind_state(self, state: ReplicaState) -> None:
@@ -99,11 +93,11 @@ class ReplicaRecord:
             ReplicaState.RESTORING,
         }:
             raise IllegalReplicaTransitionError(
-                f"borrowed replica {self.replica_id} cannot enter {state.value}"
+                f"borrowed replica {self.key.replica_id} cannot enter {state.value}"
             )
         if self.kind is ReplicaKind.NATIVE and state is ReplicaState.DESTROYED:
             raise IllegalReplicaTransitionError(
-                f"native replica {self.replica_id} must sleep, never destroy"
+                f"native replica {self.key.replica_id} must sleep, never destroy"
             )
 
     def transition_to(self, new_state: ReplicaState) -> None:
@@ -112,7 +106,7 @@ class ReplicaRecord:
             return
         if new_state not in _ALLOWED[self.state]:
             raise IllegalReplicaTransitionError(
-                f"illegal replica transition for {self.replica_id}: "
+                f"illegal replica transition for {self.key.replica_id}: "
                 f"{self.state.value} -> {new_state.value}"
             )
         self._validate_kind_state(new_state)

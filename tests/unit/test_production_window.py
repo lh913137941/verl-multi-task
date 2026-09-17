@@ -1,159 +1,154 @@
-"""Production window and idle-candidate selection (section 5.1)."""
+"""Production-window sensing uses the v3 window/activity contracts."""
 
-import pytest
 from dataclasses import replace
 
+import pytest
+
+from multi_task_scheduler.orchestration.contracts import ReplicaKey
 from multi_task_scheduler.orchestration.production_window import (
-    CandidateSet,
     ProductionWindow,
-    ReplicaObservation,
     ReplicaView,
-    advance_source_seq,
-    candidate,
+    ServerActivity,
+    WindowState,
     select_idle_candidates,
 )
 
 
-def _idle_window(epoch=3, source_seq=7):
+def _window(
+    *,
+    task_session="s1",
+    epoch=3,
+    revision=11,
+    state=WindowState.CLOSED_STALENESS,
+    eligible_pending=0,
+    held_samples=0,
+):
     return ProductionWindow(
-        production_epoch=epoch,
-        source_seq=source_seq,
-        eligible_pending=0,
-        held=0,
-        closed_by_staleness=True,
+        task_session=task_session,
+        epoch=epoch,
+        revision=revision,
+        state=state,
+        eligible_pending=eligible_pending,
+        held_samples=held_samples,
+        active_samples=2,
+        output_queue_size=1,
+        max_queue_size=8,
+        producer_exhausted=state is WindowState.EXHAUSTED,
+        policy_refresh_inflight=False,
     )
 
 
-def _quiet_active_native():
-    return ReplicaObservation(
-        replica_id="r1", is_active_native=True, in_flight=0, admitting=0, queued=0,
-        running=0, pending_admissions=0, production_epoch=3, all_backends_observed=True,
+def _activity(replica_id="r1", task_session="s1", *, engine_seq=5):
+    return ServerActivity(
+        key=ReplicaKey(task_session=task_session, replica_id=replica_id, runtime_epoch=0),
+        engine_seq=engine_seq,
+        observed_age_ms=10,
+        admitting=0,
+        queued=0,
+        running=0,
+        pending_admissions=0,
+        transfer_inflight=False,
+        all_backends_observed=True,
     )
 
 
-def test_window_idle_requires_closed_or_exhausted_and_zero_p_h():
-    assert _idle_window().idle is True
-    assert ProductionWindow(closed_by_staleness=True, eligible_pending=1).idle is False
-    assert ProductionWindow(closed_by_staleness=True, held=1).idle is False
-    assert ProductionWindow(eligible_pending=0, held=0).idle is False  # still open
-    assert ProductionWindow(exhausted_this_round=True, eligible_pending=0, held=0).idle
+def _view(replica_id="r1", task_session="s1", gpu_count=1):
+    return ReplicaView(
+        activity=_activity(replica_id, task_session),
+        manager_revision=2,
+        lb_revision=4,
+        placement_digest=f"placement-{replica_id}",
+        stable_idle_ms=500,
+        gpu_count=gpu_count,
+    )
 
 
-def test_candidate_rejects_stale_observations():
-    window = _idle_window(epoch=3)
-    obs = _quiet_active_native()
-    assert candidate(
-        window, obs, observations_fresh=False, observations_epoch=3,
-        keeps_min_active_gpus=True, leaves_routable=True,
-    ) is False
-    assert candidate(
-        window, obs, observations_fresh=True, observations_epoch=2,
-        keeps_min_active_gpus=True, leaves_routable=True,
-    ) is False
+def _select(view, *, window=None, fresh=True, minimum=0, active=2, routable=2, seq=1):
+    return select_idle_candidates(
+        window or _window(),
+        [view],
+        source_seq=seq,
+        observations_fresh=fresh,
+        min_active_gpus=minimum,
+        current_active_gpus=active,
+        routable_count=routable,
+    )
 
 
-def test_candidate_rejects_non_quiet_replica():
-    window = _idle_window()
-    obs = ReplicaObservation(replica_id="r1", in_flight=1)
-    assert candidate(
-        window, obs, observations_fresh=True, observations_epoch=3,
-        keeps_min_active_gpus=True, leaves_routable=True,
-    ) is False
+def test_window_idle_uses_explicit_state_and_known_zero_p_h():
+    assert _window().idle is True
+    assert _window().idle_reason == "CLOSED_STALENESS"
+    assert _window(state=WindowState.CLOSED_BACKPRESSURE).idle_reason == "CLOSED_BACKPRESSURE"
+    assert _window(state=WindowState.EXHAUSTED).idle_reason == "EXHAUSTED"
+    assert not _window(state=WindowState.OPEN).idle
+    assert not _window(state=WindowState.UNKNOWN).idle
+    assert not _window(eligible_pending=None).idle
+    assert not _window(held_samples=None).idle
+    assert not replace(_window(), policy_refresh_inflight=True).idle
 
 
-def test_candidate_rejects_concurrent_transfer():
-    window = _idle_window()
-    obs = ReplicaObservation(replica_id="r1", concurrent_transfer=True)
-    assert candidate(
-        window, obs, observations_fresh=True, observations_epoch=3,
-        keeps_min_active_gpus=True, leaves_routable=True,
-    ) is False
+def test_window_validates_native_fact_shape_without_reimplementing_thresholds():
+    with pytest.raises(ValueError, match="output_queue_size"):
+        replace(_window(), output_queue_size=9, max_queue_size=8)
+    with pytest.raises(ValueError, match="task_session"):
+        replace(_window(), task_session="")
 
 
-def test_candidate_requires_aggregate_constraints():
-    window = _idle_window()
-    obs = _quiet_active_native()
-    assert candidate(
-        window, obs, observations_fresh=True, observations_epoch=3,
-        keeps_min_active_gpus=False, leaves_routable=True,
-    ) is False
-    assert candidate(
-        window, obs, observations_fresh=True, observations_epoch=3,
-        keeps_min_active_gpus=True, leaves_routable=False,
-    ) is False
+@pytest.mark.parametrize(
+    ("view", "fresh"),
+    [
+        (_view(), False),
+        (_view(task_session="other"), True),
+        (replace(_view(), activity=replace(_activity(), queued=None)), True),
+        (replace(_view(), activity=replace(_activity(), transfer_inflight=True)), True),
+        (replace(_view(), sync_healthy=False), True),
+        (replace(_view(), attempts_settled=False), True),
+    ],
+)
+def test_selector_rejects_stale_unknown_or_conflicting_owner_facts(view, fresh):
+    assert _select(view, fresh=fresh) == ()
 
 
-def test_select_idle_candidates_respects_min_active_and_routable():
-    window = _idle_window()
-    replicas = [
-        ReplicaView(_quiet_active_native(), gpus=4),
-        ReplicaView(ReplicaObservation(replica_id="r2", in_flight=5), gpus=4),
-        ReplicaView(replace(_quiet_active_native(), replica_id="r3"), gpus=4),
-    ]
+def test_selector_emits_full_idle_candidate_with_lb_source_seq():
     result = select_idle_candidates(
-        window,
-        replicas,
+        _window(),
+        [_view("r1", gpu_count=4), _view("r2", gpu_count=4)],
+        source_seq=7,
         observations_fresh=True,
-        min_active_gpus=8,
-        current_active_gpus=12,
+        min_active_gpus=4,
+        current_active_gpus=8,
         routable_count=3,
     )
-    assert result.candidate_ids == ("r1", "r3")
-    assert isinstance(result, CandidateSet)
-    assert result.source_seq == window.source_seq
-    assert result.production_epoch == window.production_epoch
+    assert tuple(item.key.replica_id for item in result) == ("r1", "r2")
+    first = result[0]
+    assert first.key.task_session == "s1"
+    assert first.production_epoch == 3
+    assert first.source_seq == 7
+    assert first.manager_revision == 2
+    assert first.lb_revision == 4
+    assert first.engine_digest == _activity("r1").digest
+    assert first.reason == "CLOSED_STALENESS"
+    assert first.stable_idle_ms == 500
+    assert first.observed_age_ms == 10
+    assert first.gpu_count == 4
+    assert first.placement_digest == "placement-r1"
+    assert first.evidence_digest
 
 
-def test_select_idle_candidates_empty_when_removal_drops_below_min():
-    window = _idle_window()
-    replicas = [
-        ReplicaView(ReplicaObservation(replica_id="r1"), gpus=4),
-        ReplicaView(ReplicaObservation(replica_id="r2"), gpus=4),
-    ]
-    # Removing either leaves 4 < min_active_gpus=8, so no candidate.
-    result = select_idle_candidates(
-        window,
-        replicas,
-        observations_fresh=True,
-        min_active_gpus=8,
-        current_active_gpus=8,
-        routable_count=2,
-    )
-    assert result.candidate_ids == ()
+def test_engine_digest_changes_when_server_observation_changes():
+    assert _activity(engine_seq=5).digest != _activity(engine_seq=6).digest
 
 
-def test_select_idle_candidates_empty_when_only_one_routable():
-    window = _idle_window()
-    replicas = [ReplicaView(ReplicaObservation(replica_id="r1"), gpus=4)]
-    result = select_idle_candidates(
-        window,
-        replicas,
-        observations_fresh=True,
-        min_active_gpus=0,
-        current_active_gpus=4,
-        routable_count=1,
-    )
-    assert result.candidate_ids == ()
+def test_selector_respects_capacity_and_routable_lower_bounds():
+    assert _select(_view(gpu_count=4), minimum=8, active=8) == ()
+    assert _select(_view(), active=1, routable=1, seq=2) == ()
 
 
-def test_advance_source_seq_invalidates_candidates():
-    window = _idle_window(source_seq=7)
-    advanced = advance_source_seq(window)
-    assert advanced.source_seq == 8
-    assert advanced.production_epoch == window.production_epoch
-
-
-def test_missing_production_counts_and_backend_observations_never_mean_idle():
-    assert not ProductionWindow(closed_by_staleness=True).idle
-    assert not ReplicaObservation(replica_id="r1").quiet
-    assert not replace(_quiet_active_native(), all_backends_observed=False).quiet
-    assert not replace(_quiet_active_native(), pending_admissions=1).quiet
-    assert not replace(_idle_window(), policy_refresh_inflight=True).idle
-
-
-def test_selector_does_not_relabel_an_old_engine_observation_with_current_epoch():
-    result = select_idle_candidates(
-        _idle_window(epoch=4), [ReplicaView(_quiet_active_native(), gpus=1)],
-        observations_fresh=True, min_active_gpus=1, current_active_gpus=2, routable_count=2,
-    )
-    assert result.candidate_ids == ()
+def test_source_seq_is_external_to_production_window():
+    window = _window(epoch=4, revision=12)
+    first = _select(_view(), window=window, seq=10)[0]
+    second = _select(_view(), window=window, seq=11)[0]
+    assert window.epoch == 4 and window.revision == 12
+    assert first.source_seq == 10
+    assert second.source_seq == 11
+    assert first.evidence_digest != second.evidence_digest

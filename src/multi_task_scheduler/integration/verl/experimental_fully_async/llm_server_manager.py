@@ -1,10 +1,7 @@
-"""Select rollout subclasses and add the runtime lifecycle overlay (M view).
+"""Select rollout subclasses and own the Manager lifecycle view (M).
 
-The native ``_initialize_llm_servers`` / ``get_client`` / ``get_replicas``
-stay inherited. The M view records each replica's lifecycle independently of
-the donor runtime handles; ``materialize_hidden`` / ``sleep_runtime`` /
-``destroy_runtime`` are GPU primitives and stay explicit failures until a
-native backend is verified, never faked (section 4.2 / AGENTS.md).
+Native server creation/routing stays inherited. Real create/sleep/destroy GPU
+primitives remain explicit failures until their backend is verified.
 """
 
 import ray
@@ -18,19 +15,16 @@ from multi_task_scheduler.rollout.replica import MultiTaskvLLMReplica
 
 
 class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
-    """Ordinary object owned by Rollouter; native replica lists remain authoritative."""
+    """Ordinary object owned by Rollouter; Manager is the M-view owner."""
 
     def __init__(self, config, worker_group=None, rollout_resource_pool=None, *, group_scheduler=None):
         self.group_scheduler = group_scheduler
-        # LLMServerManager explicitly preserves a preselected replica class.
         self.rollout_replica_class = MultiTaskvLLMReplica
         super().__init__(config, worker_group, rollout_resource_pool)
         self._load_balancer_cls = MultiTaskGlobalRequestLoadBalancer
         self._lifecycle = {}
 
     async def _init_global_load_balancer(self) -> None:
-        # Native code forwards full_determinism only to its exact default class.
-        # Our subclass keeps native routing, so it must receive the same flag.
         self.global_load_balancer = ray.remote(self._load_balancer_cls).remote(
             servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
             max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
@@ -38,31 +32,26 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             group_scheduler=self.group_scheduler,
         )
 
-    # -- runtime lifecycle overlay (M view, section 4.2) ------------------- #
-
     def record_lifecycle(self, record: ReplicaRecord) -> ReplicaRecord:
-        """Store a replica's lifecycle record without touching the runtime."""
-        self._lifecycle[record.replica_id] = record
+        """Store one Manager lifecycle record by full runtime identity."""
+        self._lifecycle[record.key] = record
         return record
 
-    def inspect_runtime(self, ctx, replica_id: str):
-        """Read-only lifecycle lookup; never a GPU/runtime handle."""
-        return self._lifecycle.get(replica_id)
+    def inspect_runtime(self, ctx, key):
+        """Read-only lifecycle lookup by ReplicaKey; never returns a donor handle."""
+        return self._lifecycle.get(key)
 
-    def materialize_hidden(self, ctx, placement, model_config):
-        """Create a hidden runtime on a lease's GPUs; never published here."""
+    def materialize_hidden(self, ctx, key, placement):
         raise NotImplementedError(
-            "hidden materialization requires verified native backend"
+            "RuntimeBackend.create_hidden requires verified native backend"
         )
 
-    def sleep_runtime(self, ctx, replica_id: str):
-        """Real sleep after routing drain + CE exclusion (donor path)."""
+    def sleep_runtime(self, ctx, key, proof):
         raise NotImplementedError(
-            "real sleep requires verified native backend"
+            "RuntimeBackend.sleep requires verified native backend"
         )
 
-    def destroy_runtime(self, ctx, replica_id: str, purpose: str = "recall"):
-        """Borrowed reclaim / failed cleanup; native only for explicit exit."""
+    def destroy_runtime(self, ctx, key, proof):
         raise NotImplementedError(
-            "runtime destroy requires verified native backend"
+            "RuntimeBackend.destroy requires verified native backend"
         )

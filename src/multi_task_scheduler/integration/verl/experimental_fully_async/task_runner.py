@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 
 """TaskRunner binding for the single experimental Fully Async profile."""
 
@@ -17,7 +17,17 @@ from verl.experimental.separation.utils import create_resource_pool_manager
 from verl.trainer.ppo.utils import Role
 
 from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
-from multi_task_scheduler.orchestration.operation_journal import OperationJournal
+from multi_task_scheduler.orchestration.contracts import (
+    OperationCommand,
+    OperationResult,
+    QueryResult,
+)
+from multi_task_scheduler.orchestration.operation_journal import (
+    OperationJournal,
+    OperationStatus,
+    Outcome,
+)
+from multi_task_scheduler.orchestration.receipts import ReleaseEvidence, ServiceEvidence
 from multi_task_scheduler.scheduler.discovery import get_or_create_group_scheduler
 
 from .rollouter import MultiTaskFullyAsyncRollouter
@@ -28,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 @ray.remote(num_cpus=1)
 class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunner)):
-    """Own GS/Trainer/Rollouter handles and the one authoritative operation journal."""
+    """Own GS/Trainer/Rollouter handles and the authoritative operation journal."""
 
     def __init__(self):
         super().__init__()
@@ -39,43 +49,79 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             self._operation_journal = OperationJournal()
         return self._operation_journal
 
-    def submit_operation(self, command):
-        """Canonical GS -> TaskRunner control entry.
+    @staticmethod
+    def _result_from_record(record) -> OperationResult:
+        """Project the journal's latest lifecycle proofs into the public result."""
+        service = None
+        release = None
+        for phase_result in record.phase_results.values():
+            if isinstance(phase_result, ServiceEvidence):
+                if (
+                    service is None
+                    or phase_result.header.phase_revision
+                    >= service.header.phase_revision
+                ):
+                    service = phase_result
+            elif isinstance(phase_result, ReleaseEvidence):
+                if (
+                    release is None
+                    or phase_result.header.phase_revision
+                    >= release.header.phase_revision
+                ):
+                    release = phase_result
 
-        This pass records and fences the operation idempotently. Real ADD /
-        DONATE / REMOVE / RESTORE execution remains unavailable until the
-        verified native runtime backend is wired; recording ACCEPTED intent must
-        not be confused with a completed lifecycle operation.
-        """
-        return self._ensure_journal().begin(
-            command.operation_id,
-            command.lease_epoch,
-            command.replica_id,
-            command.kind,
-            payload_digest=command.payload_digest,
-            command_seq=command.command_seq,
+        return OperationResult(
+            ctx=record.command.ctx,
+            target=record.command.target,
+            status=record.status,
+            phase=record.phase,
+            phase_revision=record.phase_revision,
+            service=service,
+            release=release,
+            error=record.error,
         )
 
-    def begin_operation(self, command):
-        """Compatibility alias for the superseded entry name."""
-        return self.submit_operation(command)
+    @staticmethod
+    def _query_outcome(record) -> Outcome:
+        if record.status is OperationStatus.ACCEPTED:
+            return Outcome.KNOWN_NOT_APPLIED
+        if record.status is OperationStatus.SUCCEEDED:
+            return Outcome.KNOWN_APPLIED
+        if record.status is OperationStatus.FAILED:
+            error_outcome = getattr(record.error, "outcome", None)
+            return Outcome.UNKNOWN if error_outcome is None else Outcome(error_outcome)
+        return Outcome.UNKNOWN
 
-    def query_operation(self, operation_id: str, task_session: str | None = None):
-        """Read the operation journal without waiting for G or GPU work."""
-        # task_session is accepted for the public contract; this Actor already
-        # represents one concrete task session, so session validation belongs to
-        # the GS/controller attachment boundary.
-        return self._ensure_journal().query(operation_id)
+    def submit_operation(self, command: OperationCommand) -> OperationResult:
+        """Validate/idempotently accept one complete lifecycle command.
 
-    def probe_task(self):
-        """Return only facts this binding can currently prove."""
-        trainer = self.components.get("trainer") if hasattr(self, "components") else None
-        rollouter = self.components.get("rollouter") if hasattr(self, "components") else None
-        return {
-            "trainer_attached": trainer is not None,
-            "rollouter_attached": rollouter is not None,
-            "operation_count": len(self._ensure_journal()._records),
-        }
+        OperationJournal is the single authority for replay identity, one-active-
+        operation-per-task serialization and command_seq fencing. ACCEPTED proves
+        only journal acceptance; runtime side effects remain owned by the native
+        lifecycle implementation.
+        """
+        if not isinstance(command, OperationCommand):
+            raise TypeError("submit_operation requires OperationCommand")
+        return self._result_from_record(self._ensure_journal().begin(command))
+
+    def query_operation(
+        self, task_session: str, operation_id: str
+    ) -> QueryResult[OperationResult]:
+        """Read the authoritative operation record without waiting for G/GPU work."""
+        record = self._ensure_journal().query(operation_id)
+        if record is None or record.command.ctx.task_session != task_session:
+            return QueryResult(found=False, value=None, outcome=Outcome.UNKNOWN)
+        return QueryResult(
+            found=True,
+            value=self._result_from_record(record),
+            outcome=self._query_outcome(record),
+        )
+
+    def probe_task(self, task_session: str):
+        """The full TaskSnapshot needs real M/E/R/C owner observations."""
+        raise NotImplementedError(
+            "probe_task requires M/E/R/C + production/sync snapshot wiring"
+        )
 
     def run(self, config):
         """Attach this Actor to GS, then execute verl's original run method."""
@@ -83,13 +129,23 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         context = ray.get_runtime_context()
         task_id = context.get_actor_id()
         try:
-            ray.get(self.group_scheduler.attach_task.remote(task_id, context.current_actor), timeout=30)
+            ray.get(
+                self.group_scheduler.attach_task.remote(task_id, context.current_actor),
+                timeout=30,
+            )
             return super().run(config)
         finally:
             try:
-                ray.get(self.group_scheduler.detach_task.remote(task_id), timeout=30)
+                ray.get(
+                    self.group_scheduler.detach_task.remote(task_id),
+                    timeout=30,
+                )
             except Exception:
-                logger.warning("Could not detach TaskRunner %s from GroupScheduler", task_id, exc_info=True)
+                logger.warning(
+                    "Could not detach TaskRunner %s from GroupScheduler",
+                    task_id,
+                    exc_info=True,
+                )
 
     def _create_rollouter(self, config) -> None:
         print("[ASYNC MAIN] Starting create rollouter...")
@@ -101,7 +157,11 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             group_scheduler=self.group_scheduler,
         )
         if "hybrid_worker_group" in self.components:
-            ray.get(rollouter.set_hybrid_worker_group.remote(self.components["hybrid_worker_group"]))
+            ray.get(
+                rollouter.set_hybrid_worker_group.remote(
+                    self.components["hybrid_worker_group"]
+                )
+            )
             print("[ASYNC MAIN] Hybrid worker group injected into rollouter")
         ray.get(rollouter.init_workers.remote())
         ray.get(rollouter.set_max_required_samples.remote())
@@ -119,7 +179,9 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             config=config,
             tokenizer=self.components["tokenizer"],
             role_worker_mapping=trainer_role_mapping,
-            resource_pool_manager=create_resource_pool_manager(config, roles=list(trainer_role_mapping.keys())),
+            resource_pool_manager=create_resource_pool_manager(
+                config, roles=list(trainer_role_mapping.keys())
+            ),
             ray_worker_group_cls=self.components["ray_worker_group_cls"],
             device_name=config.trainer.device,
         )

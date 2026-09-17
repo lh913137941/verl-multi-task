@@ -1,29 +1,29 @@
-"""GS global data model and ledger (section 3.3), pure Python.
+"""GS global ledger aligned with simplified design §6 and §8.
 
-The ledger records *intent* (what GS decided) and *observed* (what tasks
-reported) separately, and never lets a desired state overwrite actual GPU
-occupancy. ``native_owner`` comes from registration and is immutable while a
-lease is active; ``current_user`` changes only through GS authorization plus a
-verified receipt, never from a task's claim.
-
-No Ray, verl, torch, or vLLM import here: the Actor passes opaque handles in
-and reads summaries out.
+The ledger stores GS intent separately from task-observed results. Replays are
+accepted only for the same immutable business operation; result merging is
+fenced by the exact OperationContext and ReplicaKey before revision ordering.
 """
 
 from __future__ import annotations
 
-import time
-import math
 import copy
+import math
+import time
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Tuple
+from typing import Any, Tuple
 
 from multi_task_scheduler.orchestration.contracts import (
-    NodeBlock,
+    IdleCandidate,
+    IdleCandidateReport,
+    NodePlacement,
+    OperationCommand,
     OperationResult,
     PlacementSpec,
+    ReplicaKey,
     RuntimeCapabilities,
 )
+from multi_task_scheduler.orchestration.operation_journal import Phase
 
 
 @dataclass
@@ -43,18 +43,17 @@ class TaskRecord:
 
 @dataclass
 class NativeReplicaRecord:
+    key: ReplicaKey
     owner_task_session: str
-    replica_id: str
-    node_blocks: Tuple[NodeBlock, ...]
+    node: NodePlacement
     gpu_uuids: Tuple[str, ...]
-    runtime_epoch: int = 0
     status: str = "ACTIVE"
     revision: int = 0
 
 
 @dataclass
 class GpuRecord:
-    cluster_epoch: int
+    cluster_epoch: str
     node_id: str
     gpu_uuid: str
     physical_id: int
@@ -66,7 +65,7 @@ class GpuRecord:
     reserved_residual: int = 0
 
     @property
-    def key(self) -> Tuple[int, str, str]:
+    def key(self) -> Tuple[str, str, str]:
         return (self.cluster_epoch, self.node_id, self.gpu_uuid)
 
 
@@ -74,88 +73,94 @@ class GpuRecord:
 class LeaseRecord:
     lease_id: str
     donor_session: str
-    gpu_keys: Tuple[Tuple[str, str], ...] = ()  # (node_id, gpu_uuid)
+    gpu_keys: Tuple[Tuple[str, str], ...] = ()
     borrower_session: str | None = None
     lease_epoch: int = 0
     state: str = "PLANNED"
     operation_ids: Tuple[str, ...] = ()
     last_operation_id: str | None = None
+    last_release_digest: str | None = None
     deadline: float | None = None
     placement: PlacementSpec | None = None
     model_constraints: str = ""
 
+    def __post_init__(self) -> None:
+        if not self.lease_id or not self.donor_session:
+            raise ValueError("lease_id and donor_session must be nonempty")
+        if self.lease_epoch < 0:
+            raise ValueError("lease_epoch must be nonnegative")
+        if self.borrower_session is not None and not self.borrower_session:
+            raise ValueError("borrower_session must be nonempty when present")
+        if self.last_release_digest is not None and not self.last_release_digest:
+            raise ValueError("last_release_digest must be nonempty when present")
+
 
 @dataclass(frozen=True)
 class IdleObservation:
-    source_session: str
-    replica_id: str
+    candidate: IdleCandidate
     source_seq: int
-    production_epoch: int
-    observed_age: float
     valid_until: float
-    reason: str = ""
 
     @property
-    def key(self) -> Tuple[str, str]:
-        return (self.source_session, self.replica_id)
+    def key(self) -> ReplicaKey:
+        return self.candidate.key
 
 
 @dataclass
 class OperationRecord:
     operation_id: str
-    command: Any
-    payload_digest: str
-    command_seq: int
+    command: OperationCommand
     accepted_at: float = field(default_factory=time.monotonic)
-    phase: str = "ACCEPTED"
+    phase: Phase = Phase.VALIDATE
     final_result: OperationResult | None = None
+
+    @property
+    def deadline_at(self) -> float:
+        """Deadline fixed by the first accepted command; retries never reset it."""
+        return self.accepted_at + self.command.remaining_budget_ms / 1000.0
 
 
 @dataclass
 class ProtocolInstance:
-    protocol_version: str
+    protocol_version: int
     runtime_kind: str
-    gs_epoch: int
+    gs_epoch: str
     sharing_namespace: str
     recovery_state: str = "RECOVERY_ONLY"
+
+    def __post_init__(self) -> None:
+        if type(self.protocol_version) is not int or self.protocol_version < 0:
+            raise ValueError("protocol_version must be a nonnegative integer")
+        if not self.gs_epoch:
+            raise ValueError("gs_epoch must be a nonempty string")
 
 
 @dataclass(frozen=True)
 class ResourceManifest:
-    """Registration payload: placement + per-replica native ownership."""
-
     owner_task_session: str
     placement: PlacementSpec
     replica_id: str
     runtime_epoch: int = 0
 
-
-@dataclass(frozen=True)
-class IdleReport:
-    """LB -> GS idle-candidate report (section 4.4)."""
-
-    source_session: str
-    source_seq: int
-    production_epoch: int
-    candidate_ids: Tuple[str, ...] = ()
-    candidate_reasons: Mapping[str, str] = field(default_factory=dict)
-    valid_for_ms: int = 1000
+    def __post_init__(self) -> None:
+        if not self.owner_task_session or not self.replica_id:
+            raise ValueError("resource manifest identities must be nonempty")
+        if self.runtime_epoch < 0:
+            raise ValueError("runtime_epoch must be nonnegative")
 
 
 class Ledger:
-    """Intent + observed storage with the section 3.3 update rules."""
+    """Intent + observed storage with owner/fencing rules from the simplified design."""
 
     def __init__(self, protocol: ProtocolInstance) -> None:
         self.protocol = protocol
         self.tasks: dict[Tuple[str, str], TaskRecord] = {}
-        self.native_replicas: dict[Tuple[str, str], NativeReplicaRecord] = {}
-        self.gpus: dict[Tuple[int, str, str], GpuRecord] = {}
+        self.native_replicas: dict[ReplicaKey, NativeReplicaRecord] = {}
+        self.gpus: dict[Tuple[str, str, str], GpuRecord] = {}
         self.leases: dict[str, LeaseRecord] = {}
-        self.idle_observations: dict[Tuple[str, str], IdleObservation] = {}
+        self.idle_observations: dict[ReplicaKey, IdleObservation] = {}
         self.operations: dict[str, OperationRecord] = {}
-        self._idle_reports: dict[str, IdleReport] = {}
-
-    # -- tasks ----------------------------------------------------------- #
+        self._idle_reports: dict[Tuple[str, str], IdleCandidateReport] = {}
 
     def register_task(
         self,
@@ -185,70 +190,152 @@ class Ledger:
         record.last_probe = time.monotonic()
         return record
 
-    # -- resources -------------------------------------------------------- #
-
     def register_resources(self, manifest: ResourceManifest) -> NativeReplicaRecord:
-        """Validate GPU uniqueness and capability match, then record natives."""
-        if not any(record.task_session == manifest.owner_task_session for record in self.tasks.values()):
+        """Validate single-node physical identities atomically, then record GS facts."""
+        if not any(
+            record.task_session == manifest.owner_task_session
+            for record in self.tasks.values()
+        ):
             raise ValueError(f"unknown owner task session {manifest.owner_task_session!r}")
 
-        seen: set[Tuple[int, str, str]] = set()
-        for block in manifest.placement.node_blocks:
-            for gpu in block.gpus:
-                gkey = (self.protocol.gs_epoch, block.node_id, gpu.gpu_uuid)
-                if gkey in self.gpus or gkey in seen:
-                    raise ValueError(f"GPU already registered: {gkey}")
-                seen.add(gkey)
+        node = manifest.placement.node
+        seen: set[Tuple[str, str, str]] = set()
+        for gpu_uuid in node.gpu_uuids:
+            gkey = (self.protocol.gs_epoch, node.node_id, gpu_uuid)
+            if gkey in self.gpus or gkey in seen:
+                raise ValueError(f"GPU already registered: {gkey}")
+            seen.add(gkey)
 
-        for block in manifest.placement.node_blocks:
-            for gpu in block.gpus:
-                gkey = (self.protocol.gs_epoch, block.node_id, gpu.gpu_uuid)
-                self.gpus[gkey] = GpuRecord(
-                    cluster_epoch=self.protocol.gs_epoch,
-                    node_id=block.node_id,
-                    gpu_uuid=gpu.gpu_uuid,
-                    physical_id=gpu.physical_id,
-                    native_owner=manifest.owner_task_session,
-                )
+        new_gpus = {
+            (self.protocol.gs_epoch, node.node_id, gpu_uuid): GpuRecord(
+                cluster_epoch=self.protocol.gs_epoch,
+                node_id=node.node_id,
+                gpu_uuid=gpu_uuid,
+                physical_id=physical_id,
+                native_owner=manifest.owner_task_session,
+            )
+            for gpu_uuid, physical_id in zip(node.gpu_uuids, node.physical_gpu_ids)
+        }
+        self.gpus.update(new_gpus)
 
-        replica_key = (manifest.owner_task_session, manifest.replica_id)
-        replica = NativeReplicaRecord(
-            owner_task_session=manifest.owner_task_session,
+        key = ReplicaKey(
+            task_session=manifest.owner_task_session,
             replica_id=manifest.replica_id,
-            node_blocks=manifest.placement.node_blocks,
-            gpu_uuids=manifest.placement.gpu_uuids,
             runtime_epoch=manifest.runtime_epoch,
         )
-        self.native_replicas[replica_key] = replica
+        replica = NativeReplicaRecord(
+            key=key,
+            owner_task_session=manifest.owner_task_session,
+            node=node,
+            gpu_uuids=node.gpu_uuids,
+        )
+        self.native_replicas[key] = replica
         return replica
-
-    # -- GPU authorization (GS-only) ------------------------------------- #
 
     def set_current_user(
         self,
-        gpu_key: Tuple[int, str, str],
+        gpu_key: Tuple[str, str, str],
         task_session: str,
         lease_id: str,
         lease_epoch: int,
     ) -> None:
         gpu = self.gpus[gpu_key]
         if gpu.current_user is not None and gpu.current_user != task_session:
-            raise ValueError(
-                f"GPU {gpu_key} is already authorized to {gpu.current_user}"
-            )
+            raise ValueError(f"GPU {gpu_key} is already authorized to {gpu.current_user}")
         gpu.current_user = task_session
         gpu.lease_id = lease_id
         gpu.lease_epoch = lease_epoch
         gpu.state = "LENT"
 
-    def clear_current_user(self, gpu_key: Tuple[int, str, str]) -> None:
+    def clear_current_user(self, gpu_key: Tuple[str, str, str]) -> None:
         gpu = self.gpus[gpu_key]
         gpu.current_user = None
         gpu.lease_id = None
         gpu.lease_epoch = 0
         gpu.state = "FREE"
 
-    # -- leases ----------------------------------------------------------- #
+    def _lease_gpu_records(
+        self, lease: LeaseRecord
+    ) -> Tuple[Tuple[Tuple[str, str, str], GpuRecord], ...]:
+        """Resolve a lease placement to registered GS GPU records.
+
+        ``current_user is None`` means the registered native owner retains the
+        implicit authorization. A borrower authorization is always explicit and
+        carries the matching lease identity on every GPU record.
+        """
+        if lease.placement is None:
+            raise ValueError("lease placement is required for GPU authorization")
+        node = lease.placement.node
+        records = []
+        for gpu_uuid in node.gpu_uuids:
+            gpu_key = (self.protocol.gs_epoch, node.node_id, gpu_uuid)
+            gpu = self.gpus.get(gpu_key)
+            if gpu is None:
+                raise ValueError(f"lease references unregistered GPU {gpu_key}")
+            if gpu.native_owner != lease.donor_session:
+                raise ValueError(
+                    f"GPU {gpu_key} native owner {gpu.native_owner!r} "
+                    f"does not match donor {lease.donor_session!r}"
+                )
+            records.append((gpu_key, gpu))
+        return tuple(records)
+
+    def validate_borrower_gpu_authorization(
+        self, lease: LeaseRecord
+    ) -> Tuple[Tuple[str, str, str], ...]:
+        """Preflight donor->borrower authorization without mutating GS state."""
+        if lease.borrower_session is None:
+            raise ValueError("borrower_session is required for borrower authorization")
+        records = self._lease_gpu_records(lease)
+        for gpu_key, gpu in records:
+            if gpu.current_user is not None:
+                raise ValueError(f"GPU {gpu_key} already has current_user {gpu.current_user!r}")
+            if gpu.lease_id is not None or gpu.state != "FREE":
+                raise ValueError(f"GPU {gpu_key} is not free for borrower authorization")
+        return tuple(gpu_key for gpu_key, _ in records)
+
+    def authorize_borrower_gpus(
+        self,
+        lease: LeaseRecord,
+        gpu_keys: Tuple[Tuple[str, str, str], ...],
+    ) -> None:
+        """Commit a previously validated donor->borrower authorization."""
+        if lease.borrower_session is None:
+            raise ValueError("borrower_session is required for borrower authorization")
+        for gpu_key in gpu_keys:
+            self.set_current_user(
+                gpu_key,
+                lease.borrower_session,
+                lease.lease_id,
+                lease.lease_epoch,
+            )
+
+    def validate_native_gpu_restoration(
+        self, lease: LeaseRecord
+    ) -> Tuple[Tuple[str, str, str], ...]:
+        """Preflight borrower->native authorization without mutating GS state."""
+        if lease.borrower_session is None:
+            raise ValueError("borrower_session is required for native restoration")
+        records = self._lease_gpu_records(lease)
+        for gpu_key, gpu in records:
+            if gpu.current_user != lease.borrower_session:
+                raise ValueError(
+                    f"GPU {gpu_key} is not authorized to borrower {lease.borrower_session!r}"
+                )
+            if gpu.lease_id != lease.lease_id or gpu.lease_epoch != lease.lease_epoch:
+                raise ValueError(f"GPU {gpu_key} borrower authorization belongs to another lease")
+            if gpu.state != "LENT":
+                raise ValueError(f"GPU {gpu_key} is not in LENT state")
+        return tuple(gpu_key for gpu_key, _ in records)
+
+    def restore_native_gpus(
+        self,
+        lease: LeaseRecord,
+        gpu_keys: Tuple[Tuple[str, str, str], ...],
+    ) -> None:
+        """Commit a previously validated borrower->native authorization."""
+        for gpu_key in gpu_keys:
+            self.clear_current_user(gpu_key)
 
     def open_lease(self, lease: LeaseRecord) -> None:
         if lease.lease_id in self.leases:
@@ -258,62 +345,73 @@ class Ledger:
     def get_lease(self, lease_id: str) -> LeaseRecord:
         return self.leases[lease_id]
 
-    # -- idle observations ------------------------------------------------ #
-
-    def upsert_idle_observation(self, report: IdleReport, valid_until: float) -> None:
+    def upsert_idle_report(self, report: IdleCandidateReport, valid_until: float) -> None:
+        if report.gs_epoch != self.protocol.gs_epoch:
+            raise ValueError("stale idle report gs_epoch")
         if not math.isfinite(valid_until):
-            raise ValueError("Idle observations require a finite expiry")
-        if type(report.source_seq) is not int or report.source_seq < 0:
-            raise ValueError("source_seq must be a nonnegative integer")
-        previous = self._idle_reports.get(report.source_session)
+            raise ValueError("idle observations require a finite expiry")
+        report_key = (report.task_session, report.lb_session)
+        previous = self._idle_reports.get(report_key)
         if previous is not None:
             if report.source_seq < previous.source_seq:
                 return
             if report.source_seq == previous.source_seq:
                 if report != previous:
                     raise ValueError("conflicting idle report replay")
-                return  # A repeated observation never renews its TTL.
-            if report.production_epoch < previous.production_epoch:
-                raise ValueError("stale production epoch")
-        # Reports replace the whole set, including an empty withdrawal.
+                return
+            if report.production_revision < previous.production_revision:
+                raise ValueError("stale production revision")
+
         self.idle_observations = {
-            key: value for key, value in self.idle_observations.items()
-            if key[0] != report.source_session
+            key: value
+            for key, value in self.idle_observations.items()
+            if key.task_session != report.task_session
         }
-        self._idle_reports[report.source_session] = copy.deepcopy(report)
-        for replica_id in report.candidate_ids:
-            obs = IdleObservation(
-                source_session=report.source_session,
-                replica_id=replica_id,
+        self._idle_reports[report_key] = copy.deepcopy(report)
+        for candidate in report.candidates:
+            self.idle_observations[candidate.key] = IdleObservation(
+                candidate=candidate,
                 source_seq=report.source_seq,
-                production_epoch=report.production_epoch,
-                observed_age=0.0,
                 valid_until=valid_until,
-                reason=report.candidate_reasons.get(replica_id, ""),
             )
-            self.idle_observations[obs.key] = obs
 
     def stale_idle_observations(self, now: float) -> Tuple[IdleObservation, ...]:
-        return tuple(o for o in self.idle_observations.values() if o.valid_until <= now)
+        return tuple(
+            observation
+            for observation in self.idle_observations.values()
+            if observation.valid_until <= now
+        )
 
-    # -- operations ------------------------------------------------------- #
+    @staticmethod
+    def _command_identity(command: OperationCommand) -> tuple:
+        """Business identity; transport budget is intentionally excluded."""
+        return (
+            command.ctx,
+            command.kind,
+            command.target,
+            command.authorization,
+            command.placement,
+            command.candidate,
+            command.recall_mode,
+            command.payload_digest,
+        )
 
-    def record_operation(self, command: Any) -> OperationRecord:
-        existing = self.operations.get(command.operation_id)
+    def record_operation(self, command: OperationCommand) -> OperationRecord:
+        existing = self.operations.get(command.ctx.operation_id)
         if existing is not None:
-            if existing.payload_digest != command.payload_digest:
-                raise ValueError(
-                    f"conflicting payload digest for {command.operation_id}"
-                )
+            if self._command_identity(existing.command) != self._command_identity(command):
+                raise ValueError(f"conflicting replay for operation {command.ctx.operation_id}")
             return existing
         record = OperationRecord(
-            operation_id=command.operation_id,
+            operation_id=command.ctx.operation_id,
             command=command,
-            payload_digest=command.payload_digest,
-            command_seq=command.command_seq,
         )
-        self.operations[command.operation_id] = record
+        self.operations[command.ctx.operation_id] = record
         return record
+
+    @staticmethod
+    def _result_matches_command(command: OperationCommand, result: OperationResult) -> bool:
+        return result.ctx == command.ctx and result.target == command.target
 
     def merge_operation_result(
         self, operation_id: str, result: OperationResult
@@ -321,11 +419,19 @@ class Ledger:
         record = self.operations.get(operation_id)
         if record is None:
             raise ValueError(f"unknown operation {operation_id!r}")
-        # Lower phase_revision / older identity fields are history, never overwrite.
+        if result.ctx.operation_id != operation_id:
+            raise ValueError("operation result id does not match merge target")
+        if not self._result_matches_command(record.command, result):
+            raise ValueError(f"stale or mismatched operation result for {operation_id!r}")
+
         if record.final_result is not None:
             if result.phase_revision < record.final_result.phase_revision:
                 return record
             if result.phase_revision == record.final_result.phase_revision:
+                if result != record.final_result:
+                    raise ValueError(
+                        f"conflicting result replay at revision {result.phase_revision}"
+                    )
                 return record
         record.final_result = result
         record.phase = result.phase

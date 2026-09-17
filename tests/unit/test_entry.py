@@ -35,7 +35,7 @@ def verl_root():
 
 
 def _main_with_scoped_imports(verl_root, events, resolve, *, import_error=None):
-    tree = ast.parse((verl_root / MAIN).read_text())
+    tree = ast.parse((verl_root / MAIN).read_text(encoding="utf-8"))
     main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
     main.decorator_list = []
     native_actor = object()
@@ -226,22 +226,22 @@ def test_native_hydra_config_and_example_reach_the_real_plugin_resolver(verl_roo
 def test_native_class_implementations_are_unchanged_from_upstream_baseline(verl_root, relative):
     committed = subprocess.run(
         ["git", "-C", str(verl_root), "show", f"{UPSTREAM_BASELINE}:{relative}"],
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True, text=True, encoding="utf-8",
     ).stdout
 
     def classes(source):
         return [ast.dump(node, include_attributes=False) for node in ast.parse(source).body
                 if isinstance(node, ast.ClassDef)]
 
-    assert classes((verl_root / relative).read_text()) == classes(committed)
+    assert classes((verl_root / relative).read_text(encoding="utf-8")) == classes(committed)
 
 
 def test_native_primary_adds_only_disabled_plugin_defaults(verl_root):
     committed = subprocess.run(
         ["git", "-C", str(verl_root), "show", f"{UPSTREAM_BASELINE}:{CONFIG}"],
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True, text=True, encoding="utf-8",
     ).stdout
     original = yaml.safe_load(committed)
-    current = yaml.safe_load((verl_root / CONFIG).read_text())
+    current = yaml.safe_load((verl_root / CONFIG).read_text(encoding="utf-8"))
     assert current.pop("multitask") == {"enabled": False, "runtime": {"profile": None}}
     assert current == original
