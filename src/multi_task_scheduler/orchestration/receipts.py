@@ -14,6 +14,7 @@ from .contracts import (
     CleanupInventory,
     OperationContext,
     OperationError,
+    PreparedReplica,
     ProcessIdentity,
     RecallMode,
     ReleaseKind,
@@ -312,7 +313,7 @@ class NeverPublishedProof:
 
 CleanupPermit: TypeAlias = ServiceEvidence | NeverPublishedProof
 PhaseResult: TypeAlias = (
-    object  # PreparedReplica is declared in contracts; kept structural to avoid a cycle.
+    PreparedReplica
     | DrainTicket
     | WeightEvidence
     | ExitEvidence
