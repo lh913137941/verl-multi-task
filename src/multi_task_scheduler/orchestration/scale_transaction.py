@@ -1,17 +1,8 @@
-"""Transaction ordering for the DONATE -> ADD -> REMOVE -> RESTORE loop.
+"""Transaction ordering for the simplified orchestration contract.
 
-``ScaleTransaction`` encodes the section 5 sequence diagrams and the section 6
-gate rules: drain/observe outside the gate, then acquire the replica-sync gate
-and perform the CE-membership and routing commits, then release the gate and
-only afterwards run the physical sleep/destroy. It talks to four protocol
-adapters, so the core stays free of Ray/verl/torch/vLLM and can be driven by
-in-memory fakes in unit tests.
-
-The four adapters are:
-- ``CheckpointProtocol``  -> Checkpoint Engine Manager (effective replica set E)
-- ``RoutingProtocol``     -> request load balancer (routable set, attempts)
-- ``ReplicaProtocol``     -> LLMServerManager (materialize / sleep / destroy)
-- ``ServingProtocol``     -> individual Server (wake weights / KV / abort)
+Long-running prepare/drain work stays outside G. Membership and service commits
+run under the task-local replica sync gate. Physical sleep/destroy happens only
+after service removal evidence exists and after G has been released.
 """
 
 from __future__ import annotations
@@ -24,23 +15,25 @@ from .contracts import (
     PlacementSpec,
     PreparedReplica,
     PublishedWeightSnapshot,
+    RecallMode,
     ReleaseReceipt,
     TransferReceipt,
 )
 from .receipts import (
     AbortReceipt,
     DrainReceipt,
+    ExitEvidence,
     ReadyReceipt,
     RemovedReceipt,
     RestoredReceipt,
     ServingReadiness,
     WeightReadiness,
 )
-from .replica_sync_gate import GateFencedError, GateKind, GateLease, ReplicaSyncGate
+from .replica_sync_gate import GateKind, GateLease, ReplicaSyncGate
 
 
 class DrainTimeoutError(RuntimeError):
-    """The target did not drain (I/A/Q/R zero) before its budget expired."""
+    """The target did not reach a safe exit point before its budget expired."""
 
 
 class TransferIncompleteError(RuntimeError):
@@ -51,127 +44,108 @@ class FenceRejectedError(RuntimeError):
     """A RESTORE fence was not satisfied (borrower not released)."""
 
 
-class CheckpointProtocol(ABC):
-    """Checkpoint Engine membership adapter (section 4.1 CE Manager owner)."""
+class MissingPublishedSnapshotError(RuntimeError):
+    """ADD/RESTORE cannot proceed without immutable current Vpub contents."""
 
+
+class ServiceNotDetachedError(RuntimeError):
+    """Physical release was requested before service removal was committed."""
+
+
+class CheckpointProtocol(ABC):
     @abstractmethod
     async def bootstrap_target(
         self, ctx: OperationContext, prepared: PreparedReplica, snapshot: PublishedWeightSnapshot
     ) -> TransferReceipt:
-        """Build a verified sender -> target receiver group and load weights."""
+        """Load the exact pinned snapshot into one hidden target."""
 
     @abstractmethod
-    async def add_effective_replica(
-        self, ctx: OperationContext, prepared: PreparedReplica
-    ) -> int:
-        """Return the new effective-membership revision. Requires G."""
+    async def add_effective_replica(self, ctx: OperationContext, prepared: PreparedReplica) -> int:
+        """Commit E membership and return its monotonically increasing revision."""
 
     @abstractmethod
-    async def remove_effective_replica(
-        self, ctx: OperationContext, replica_id: str
-    ) -> int:
-        """Return the new effective-membership revision. Requires G."""
+    async def remove_effective_replica(self, ctx: OperationContext, replica_id: str) -> int:
+        """Remove one member from E and return its monotonic revision."""
 
     @abstractmethod
     async def run_native_sync(
         self, ctx: OperationContext, new_serving_version: int, manifest_digest: str
     ) -> PublishedWeightSnapshot:
-        """Transfer weights to E, load + CUDA-sync, reset staleness once."""
+        """Transfer native weights to E and return the newly published snapshot."""
 
 
 class RoutingProtocol(ABC):
-    """Request load balancer adapter (section 4.1 LB owner)."""
+    @abstractmethod
+    async def begin_drain(self, ctx: OperationContext, replica_id: str) -> DrainReceipt:
+        """Close new routing and return the routing fence used for drain checks."""
 
     @abstractmethod
-    async def begin_drain(
-        self, ctx: OperationContext, replica_id: str
-    ) -> DrainReceipt:
-        """Atomically advance routing_epoch and drop the target from routable."""
-
-    @abstractmethod
-    async def wait_drained(
-        self, ctx: OperationContext, replica_id: str, routing_epoch: int
-    ) -> bool:
-        """True once in-flight/admitting/queued/running counts are all zero."""
+    async def wait_drained(self, ctx: OperationContext, replica_id: str, routing_epoch: int) -> bool:
+        """Observe all old attempts as settled for the target."""
 
     @abstractmethod
     async def commit_routable(
         self, ctx: OperationContext, head_server: Any, receipt: TransferReceipt
     ) -> int:
-        """Return the routing epoch after publishing the target as routable."""
+        """Publish R only after weight and CE evidence have been checked."""
 
     @abstractmethod
     async def finish_remove(self, ctx: OperationContext, replica_id: str) -> bool:
-        """True when the target's attempts are drained and it may be deleted."""
+        """Commit R=REMOVED only after attempts are settled and E is removed."""
 
     @abstractmethod
-    async def query_routing_operation(
-        self, ctx: OperationContext, operation_id: str
-    ) -> str:
-        """Return the routing phase for reconciliation after a lost receipt."""
+    async def query_routing_operation(self, ctx: OperationContext, operation_id: str) -> str:
+        """Return the owner-side routing phase for reconciliation."""
 
 
 class ReplicaProtocol(ABC):
-    """Runtime manager adapter (section 4.2 Manager owner)."""
-
     @abstractmethod
     async def materialize_hidden(
-        self,
-        ctx: OperationContext,
-        placement: PlacementSpec,
-        model_config: object,
+        self, ctx: OperationContext, placement: PlacementSpec, model_config: object
     ) -> PreparedReplica:
-        """Create a hidden runtime; on success only HIDDEN, never published."""
+        """Create a hidden runtime; success never implies routability."""
 
     @abstractmethod
-    async def sleep_runtime(
-        self, ctx: OperationContext, replica_id: str
-    ) -> ReleaseReceipt:
-        """Real sleep after routing drain + CE exclusion; keep native anchors."""
+    async def sleep_runtime(self, ctx: OperationContext, replica_id: str) -> ReleaseReceipt:
+        """Sleep a native runtime after complete service detachment."""
 
     @abstractmethod
     async def destroy_runtime(
         self, ctx: OperationContext, replica_id: str, purpose: str
     ) -> ReleaseReceipt:
-        """Borrowed reclaim / failed cleanup; native only for explicit exit."""
+        """Destroy a borrowed runtime after complete service detachment."""
 
     @abstractmethod
     async def inspect_runtime(self, ctx: OperationContext, replica_id: str) -> object:
-        """Read-only node/GPU/process/engine status."""
+        """Read-only runtime facts for reconciliation."""
 
 
 class ServingProtocol(ABC):
-    """Individual server adapter (section 4.2 Server owner)."""
-
     @abstractmethod
-    async def wake_weights(
-        self, ctx: OperationContext, replica_id: str
-    ) -> WeightReadiness:
-        """Restore weights only; generation stays disabled."""
+    async def wake_weights(self, ctx: OperationContext, replica_id: str) -> WeightReadiness:
+        """Wake only the weight-receive path; generation remains closed."""
 
     @abstractmethod
     async def wake_kv_and_validate(
         self, ctx: OperationContext, receipt: TransferReceipt
     ) -> ServingReadiness:
-        """Restore KV, clear stale prefix/MM cache, validate engine; not routed."""
+        """Restore serving state after the exact pinned snapshot was loaded."""
 
     @abstractmethod
-    async def abort_target(
-        self, ctx: OperationContext, replica_id: str
-    ) -> AbortReceipt:
-        """Force-reclaim a borrowed target; never a whole cluster rebalance."""
+    async def abort_target(self, ctx: OperationContext, replica_id: str) -> AbortReceipt:
+        """Force path primitive. A verified continuation protocol is still required."""
 
 
-class ServingVersionStore(ABC):
-    """Holder for the Trainer's published serving version (Vpub)."""
+class PublishedSnapshotStore(ABC):
+    """Trainer-side holder for the current immutable Vpub snapshot."""
 
     @abstractmethod
-    def current(self) -> int:
-        """Return the currently published serving version."""
+    def current_snapshot(self) -> PublishedWeightSnapshot | None:
+        """Return the exact currently published snapshot, or None if unavailable."""
 
     @abstractmethod
-    def publish(self, version: int) -> None:
-        """Advance Vpub under the gate after a successful native sync."""
+    def publish(self, snapshot: PublishedWeightSnapshot) -> None:
+        """Publish the exact snapshot after verified native synchronization."""
 
 
 class ScaleTransaction:
@@ -182,7 +156,7 @@ class ScaleTransaction:
         routing: RoutingProtocol,
         replica: ReplicaProtocol,
         serving: ServingProtocol,
-        versions: ServingVersionStore | None = None,
+        snapshots: PublishedSnapshotStore | None = None,
         *,
         gate_timeout: float | None = None,
     ) -> None:
@@ -191,45 +165,32 @@ class ScaleTransaction:
         self._routing = routing
         self._replica = replica
         self._serving = serving
-        self._versions = versions
+        self._snapshots = snapshots
         self._gate_timeout = gate_timeout
 
-    async def _acquire(
-        self, ctx: OperationContext, kind: GateKind
-    ) -> GateLease:
-        return await self._gate.acquire(
-            ctx.operation_id, kind, timeout=self._gate_timeout
-        )
+    async def _acquire(self, ctx: OperationContext, kind: GateKind) -> GateLease:
+        return await self._gate.acquire(ctx.operation_id, kind, timeout=self._gate_timeout)
 
-    async def _pin_snapshot(
-        self, ctx: OperationContext, receiver_ids: tuple[str, ...]
-    ) -> PublishedWeightSnapshot:
-        version = self._versions.current() if self._versions is not None else 0
-        return PublishedWeightSnapshot(
-            serving_version=version,
-            manifest_digest="",  # filled by CE backend during native transfer
-            receiver_ids=receiver_ids,
-        )
+    def _pin_snapshot(self) -> PublishedWeightSnapshot:
+        snapshot = self._snapshots.current_snapshot() if self._snapshots is not None else None
+        if snapshot is None:
+            raise MissingPublishedSnapshotError("no immutable published snapshot is available")
+        return snapshot
 
     # -- ADD -------------------------------------------------------------- #
 
-    async def add_and_publish(
-        self, ctx: OperationContext, prepared: PreparedReplica
-    ) -> ReadyReceipt:
-        """Bootstrap a hidden target and publish it, holding G throughout.
-
-        ADD does not advance the parameter version and does not reset staleness
-        (section 5.3).
-        """
+    async def add_and_publish(self, ctx: OperationContext, prepared: PreparedReplica) -> ReadyReceipt:
+        """Install current Vpub, join E, then open R while G is held."""
         lease = await self._acquire(ctx, GateKind.ADD)
         try:
-            snapshot = await self._pin_snapshot(ctx, prepared.receiver_ids)
+            snapshot = self._pin_snapshot()
             transfer = await self._checkpoint.bootstrap_target(ctx, prepared, snapshot)
             if not transfer.all_receivers_complete:
                 raise TransferIncompleteError(
-                    f"ADD bootstrap incomplete for {prepared.replica_id}: "
-                    f"{transfer.receiver_states}"
+                    f"ADD bootstrap incomplete for {prepared.replica_id}: {transfer.receiver_states}"
                 )
+            if transfer.target_version != snapshot.version or transfer.manifest_digest != snapshot.manifest_digest:
+                raise TransferIncompleteError("ADD bootstrap receipt does not match the pinned snapshot")
             ce_revision = await self._checkpoint.add_effective_replica(ctx, prepared)
             routing_epoch = await self._routing.commit_routable(
                 ctx, prepared.head_server_descriptor, transfer
@@ -239,60 +200,91 @@ class ScaleTransaction:
                 operation_id=ctx.operation_id,
                 routing_epoch=routing_epoch,
                 ce_revision=ce_revision,
-                serving_version=snapshot.serving_version,
+                serving_version=snapshot.version,
             )
-        except GateFencedError:
-            raise
         finally:
             await lease.release()
 
-    # -- shared drain + CE exclusion -------------------------------------- #
+    # -- unified exit ----------------------------------------------------- #
 
-    async def _remove_and_commit(
-        self, ctx: OperationContext, replica_id: str, drain: DrainReceipt
-    ) -> RemovedReceipt:
+    async def prepare_exit(
+        self,
+        ctx: OperationContext,
+        replica_id: str,
+        recall_mode: RecallMode = RecallMode.NATURAL,
+    ) -> ExitEvidence:
+        """Close admission and establish exit evidence without holding G."""
+        recall_mode = RecallMode(recall_mode)
+        if recall_mode is RecallMode.FORCE_VERIFIED:
+            # A target abort alone is insufficient: the design also requires
+            # verified continuation on a surviving target. Until that native
+            # protocol exists, reject before changing routing state.
+            raise NotImplementedError("FORCE_VERIFIED requires verified continuation support")
+
+        drain = await self._routing.begin_drain(ctx, replica_id)
+        drained = await self._routing.wait_drained(ctx, replica_id, drain.routing_epoch)
+        if not drained:
+            raise DrainTimeoutError(f"natural drain timeout: {replica_id}")
+        return ExitEvidence(
+            replica_id=replica_id,
+            routing_epoch=drain.routing_epoch,
+            operation_id=ctx.operation_id,
+            recall_mode=RecallMode.NATURAL,
+            attempts_drained=True,
+            continuation_confirmed=True,
+        )
+
+    async def remove_and_commit(self, ctx: OperationContext, proof: ExitEvidence) -> RemovedReceipt:
+        """Revalidate exit, remove E, then commit R/C/M while G is held."""
+        if proof.operation_id != ctx.operation_id or not proof.safe_to_leave_service:
+            raise DrainTimeoutError(f"stale or unsafe exit evidence for {proof.replica_id}")
         lease = await self._acquire(ctx, GateKind.REMOVE)
         try:
-            # Re-verify the drain under the gate; a new attempt invalidates it.
-            if not await self._routing.wait_drained(
-                ctx, replica_id, drain.routing_epoch
-            ):
-                raise DrainTimeoutError(f"target re-drained: {replica_id}")
-            ce_revision = await self._checkpoint.remove_effective_replica(
-                ctx, replica_id
-            )
-            lb_excluded = await self._routing.finish_remove(ctx, replica_id)
+            if not await self._routing.wait_drained(ctx, proof.replica_id, proof.routing_epoch):
+                raise DrainTimeoutError(f"exit evidence became stale: {proof.replica_id}")
+            ce_revision = await self._checkpoint.remove_effective_replica(ctx, proof.replica_id)
+            lb_excluded = await self._routing.finish_remove(ctx, proof.replica_id)
+            if not lb_excluded:
+                raise DrainTimeoutError(f"routing owner refused remove: {proof.replica_id}")
             return RemovedReceipt(
-                replica_id=replica_id,
+                replica_id=proof.replica_id,
                 operation_id=ctx.operation_id,
                 ce_revision=ce_revision,
-                lb_excluded=lb_excluded,
+                lb_excluded=True,
                 capacity_released=True,
             )
         finally:
             await lease.release()
 
-    async def donate(
-        self, ctx: OperationContext, replica_id: str
-    ) -> tuple[RemovedReceipt, ReleaseReceipt]:
-        """DONATE: drain -> CE exclude -> real sleep (section 5.2)."""
-        drain = await self._routing.begin_drain(ctx, replica_id)
-        if not await self._routing.wait_drained(ctx, replica_id, drain.routing_epoch):
-            raise DrainTimeoutError(f"donor drain timeout: {replica_id}")
-        removed = await self._remove_and_commit(ctx, replica_id, drain)
-        release = await self._replica.sleep_runtime(ctx, replica_id)
-        return removed, release
+    async def finalize_release(
+        self,
+        ctx: OperationContext,
+        service: RemovedReceipt,
+        *,
+        native: bool,
+        purpose: str = "recall",
+    ) -> ReleaseReceipt:
+        """Physically release only after service detachment evidence exists."""
+        if service.operation_id != ctx.operation_id or not service.service_detached:
+            raise ServiceNotDetachedError("physical release requires matching service-removal evidence")
+        if native:
+            return await self._replica.sleep_runtime(ctx, service.replica_id)
+        return await self._replica.destroy_runtime(ctx, service.replica_id, purpose)
+
+    # Thin compatibility wrappers for callers that still use the older API.
+    async def donate(self, ctx: OperationContext, replica_id: str) -> tuple[RemovedReceipt, ReleaseReceipt]:
+        proof = await self.prepare_exit(ctx, replica_id, RecallMode.NATURAL)
+        service = await self.remove_and_commit(ctx, proof)
+        release = await self.finalize_release(ctx, service, native=True, purpose="donate")
+        return service, release
 
     async def remove(
         self, ctx: OperationContext, replica_id: str, purpose: str = "recall"
     ) -> tuple[RemovedReceipt, ReleaseReceipt]:
-        """REMOVE: drain -> CE exclude -> destroy (section 5.4)."""
-        drain = await self._routing.begin_drain(ctx, replica_id)
-        if not await self._routing.wait_drained(ctx, replica_id, drain.routing_epoch):
-            raise DrainTimeoutError(f"borrower drain timeout: {replica_id}")
-        removed = await self._remove_and_commit(ctx, replica_id, drain)
-        release = await self._replica.destroy_runtime(ctx, replica_id, purpose)
-        return removed, release
+        proof = await self.prepare_exit(ctx, replica_id, RecallMode.NATURAL)
+        service = await self.remove_and_commit(ctx, proof)
+        release = await self.finalize_release(ctx, service, native=False, purpose=purpose)
+        return service, release
 
     # -- RESTORE ---------------------------------------------------------- #
 
@@ -302,22 +294,20 @@ class ScaleTransaction:
         prepared: PreparedReplica,
         fence_satisfied: bool,
     ) -> RestoredReceipt:
-        """RESTORE: wake weights -> (G) bootstrap -> validate -> publish (5.5)."""
         if not fence_satisfied:
             raise FenceRejectedError(
-                f"RESTORE fence not satisfied for {prepared.replica_id} "
-                f"(borrower not released)"
+                f"RESTORE fence not satisfied for {prepared.replica_id} (borrower not released)"
             )
         await self._serving.wake_weights(ctx, prepared.replica_id)
 
         lease = await self._acquire(ctx, GateKind.RESTORE)
         try:
-            snapshot = await self._pin_snapshot(ctx, prepared.receiver_ids)
+            snapshot = self._pin_snapshot()
             transfer = await self._checkpoint.bootstrap_target(ctx, prepared, snapshot)
             if not transfer.all_receivers_complete:
-                raise TransferIncompleteError(
-                    f"RESTORE bootstrap incomplete for {prepared.replica_id}"
-                )
+                raise TransferIncompleteError(f"RESTORE bootstrap incomplete for {prepared.replica_id}")
+            if transfer.target_version != snapshot.version or transfer.manifest_digest != snapshot.manifest_digest:
+                raise TransferIncompleteError("RESTORE bootstrap receipt does not match the pinned snapshot")
             await self._serving.wake_kv_and_validate(ctx, transfer)
             ce_revision = await self._checkpoint.add_effective_replica(ctx, prepared)
             routing_epoch = await self._routing.commit_routable(
@@ -328,7 +318,7 @@ class ScaleTransaction:
                 operation_id=ctx.operation_id,
                 routing_epoch=routing_epoch,
                 ce_revision=ce_revision,
-                serving_version=snapshot.serving_version,
+                serving_version=snapshot.version,
             )
         finally:
             await lease.release()
@@ -338,14 +328,18 @@ class ScaleTransaction:
     async def native_weight_sync(
         self, ctx: OperationContext, new_serving_version: int, manifest_digest: str
     ) -> PublishedWeightSnapshot:
-        """Full native weight update under G: transfer, reset, publish (6)."""
+        """Publish the exact snapshot returned by verified native synchronization."""
+        if not manifest_digest:
+            raise ValueError("native sync requires a nonempty manifest digest")
         lease = await self._acquire(ctx, GateKind.NATIVE_SYNC)
         try:
             snapshot = await self._checkpoint.run_native_sync(
                 ctx, new_serving_version, manifest_digest
             )
-            if self._versions is not None:
-                self._versions.publish(new_serving_version)
+            if snapshot.version != new_serving_version or snapshot.manifest_digest != manifest_digest:
+                raise TransferIncompleteError("native sync returned a mismatched published snapshot")
+            if self._snapshots is not None:
+                self._snapshots.publish(snapshot)
             return snapshot
         finally:
             await lease.release()
