@@ -16,8 +16,10 @@ from multi_task_scheduler.orchestration.contracts import (
     LeaseAuthorization,
     NodePlacement,
     OperationCommand,
+    OperationContext,
     OperationResult,
     PlacementSpec,
+    QueryResult,
     ReplicaKey,
 )
 from multi_task_scheduler.orchestration.operation_journal import (
@@ -35,16 +37,31 @@ pytestmark = pytest.mark.ray_integration
 
 @ray.remote(num_cpus=0)
 class TaskRunnerProbe:
+    def __init__(self):
+        self.operations = {}
+
     def identity(self):
         return ray.get_runtime_context().get_actor_id()
 
     def submit_operation(self, command):
-        return OperationResult(
+        result = OperationResult(
             ctx=command.ctx,
             target=command.target,
             status=OperationStatus.ACCEPTED,
             phase=Phase.VALIDATE,
             phase_revision=0,
+        )
+        self.operations[command.ctx.operation_id] = result
+        return result
+
+    def query_operation(self, task_session, operation_id):
+        result = self.operations.get(operation_id)
+        if result is None or result.ctx.task_session != task_session:
+            return QueryResult(found=False, value=None, outcome=Outcome.UNKNOWN)
+        return QueryResult(
+            found=True,
+            value=result,
+            outcome=Outcome.KNOWN_NOT_APPLIED,
         )
 
     def probe_task(self, task_session):
@@ -104,10 +121,7 @@ def _placement():
 
 
 def _command(protocol_version, gs_epoch, *, operation_id="op-1", digest="d1"):
-    ctx = __import__(
-        "multi_task_scheduler.orchestration.contracts",
-        fromlist=["OperationContext"],
-    ).OperationContext(
+    ctx = OperationContext(
         protocol_version=protocol_version,
         gs_epoch=gs_epoch,
         task_id="task-a",
@@ -248,14 +262,15 @@ def test_gs_control_interfaces_use_current_typed_contract(isolated_ray):
         query = ray.get(scheduler.query_operation.remote("s1", "op-1"))
         assert query.found is True
         assert query.value.status is OperationStatus.ACCEPTED
-        assert query.outcome is Outcome.UNKNOWN
+        assert query.outcome is Outcome.KNOWN_NOT_APPLIED
 
         idle_ack = ray.get(scheduler.report_idle_candidates.remote(_idle_report(gs_epoch)))
         assert idle_ack.accepted is True
         assert idle_ack.revision == 1
 
         assert ray.get(scheduler.probe_task.remote("task-a", "s1")) == {
-            "task_session": "s1", "probe": "ok"
+            "task_session": "s1",
+            "probe": "ok",
         }
 
         opened = ray.get(
