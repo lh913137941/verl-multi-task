@@ -23,6 +23,7 @@ from multi_task_scheduler.orchestration.contracts import (
     QueryResult,
 )
 from multi_task_scheduler.orchestration.operation_journal import (
+    OperationIdentityError,
     OperationJournal,
     OperationStatus,
     Outcome,
@@ -48,8 +49,18 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             self._operation_journal = OperationJournal()
         return self._operation_journal
 
+    def _ensure_command_fences(self) -> dict:
+        if not hasattr(self, "_last_command_seq_by_target"):
+            self._last_command_seq_by_target = {}
+        return self._last_command_seq_by_target
+
     def submit_operation(self, command: OperationCommand) -> OperationResult:
         """Validate/idempotently accept one complete lifecycle command.
+
+        Same-operation retries return the existing journal record even if a later
+        command for the same ReplicaKey has since been accepted. A distinct
+        operation_id must carry a strictly higher command_seq so a delayed old
+        command cannot reopen an earlier lifecycle action.
 
         Real lifecycle execution is still unavailable until the native runtime
         backends are wired. ACCEPTED therefore proves only journal acceptance;
@@ -57,7 +68,25 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         """
         if not isinstance(command, OperationCommand):
             raise TypeError("submit_operation requires OperationCommand")
-        record = self._ensure_journal().begin(command)
+
+        journal = self._ensure_journal()
+        existing = journal.query(command.ctx.operation_id)
+        if existing is not None:
+            record = journal.begin(command)
+        else:
+            fences = self._ensure_command_fences()
+            last_command_seq = fences.get(command.target)
+            if (
+                last_command_seq is not None
+                and command.ctx.command_seq <= last_command_seq
+            ):
+                raise OperationIdentityError(
+                    f"stale command_seq {command.ctx.command_seq} for {command.target!r}; "
+                    f"last accepted sequence is {last_command_seq}"
+                )
+            record = journal.begin(command)
+            fences[command.target] = command.ctx.command_seq
+
         return OperationResult(
             ctx=record.command.ctx,
             target=record.command.target,
