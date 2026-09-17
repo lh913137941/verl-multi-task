@@ -2,7 +2,9 @@
 
 The journal stores the accepted full OperationCommand as the immutable source
 of identity. ``status`` and ``phase`` are independent facts: DONE never implies
-success by itself, and RECONCILE represents unresolved side effects.
+success by itself, and RECONCILE represents unresolved side effects. The first
+accepted transport budget also freezes the operation deadline; retries cannot
+extend the total lifecycle timeout.
 """
 
 from __future__ import annotations
@@ -115,17 +117,20 @@ def _require_command_shape(command: object) -> None:
         target = command.target
         kind = command.kind
         payload_digest = command.payload_digest
+        remaining_budget_ms = command.remaining_budget_ms
     except AttributeError as exc:
         raise TypeError("journal begin requires a complete OperationCommand") from exc
     if not ctx.operation_id or not target.replica_id:
         raise ValueError("operation_id and target replica_id must be nonempty")
     if not isinstance(payload_digest, str) or not payload_digest:
         raise ValueError("payload_digest must be a nonempty string")
+    if remaining_budget_ms < 0:
+        raise ValueError("remaining_budget_ms must be nonnegative")
     OperationKind(kind)
 
 
 def _command_identity(command: object) -> tuple:
-    """Immutable business identity; remaining transport budget may shrink on retry."""
+    """Immutable business identity; transport budget is not part of replay identity."""
     return (
         command.ctx,
         OperationKind(command.kind),
@@ -165,8 +170,10 @@ class OperationRecord:
 
 
 class OperationJournal:
-    def __init__(self) -> None:
+    def __init__(self, *, clock=None) -> None:
         self._records: dict[str, OperationRecord] = {}
+        self._deadlines: dict[str, float] = {}
+        self._clock = time.monotonic if clock is None else clock
         self._validation_frozen = False
 
     @property
@@ -199,7 +206,15 @@ class OperationJournal:
 
         record = OperationRecord(command=command)
         self._records[operation_id] = record
+        self._deadlines[operation_id] = (
+            self._clock() + command.remaining_budget_ms / 1000.0
+        )
         return record
+
+    def remaining_budget_ms(self, operation_id: str) -> int:
+        """Return remaining budget from the first acceptance deadline, never a retry."""
+        deadline = self._deadlines[operation_id]
+        return max(0, int((deadline - self._clock()) * 1000))
 
     def require(self, operation_id: str, lease_epoch: int) -> OperationRecord:
         record = self._records[operation_id]
