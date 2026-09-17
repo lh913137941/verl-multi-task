@@ -3,7 +3,6 @@
 import ast
 import hashlib
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,11 +12,13 @@ from multi_task_scheduler.orchestration.contracts import (
     OperationContext,
     PreparedReplica,
     ReceiverRef,
+    RecallMode,
     ReplicaKey,
     RouteEntry,
     RouteState,
     ServiceAction,
 )
+from multi_task_scheduler.orchestration.effective_replica import EffectiveReplicaEntry
 from multi_task_scheduler.orchestration.receipts import (
     CommitOwner,
     CommitReceipt,
@@ -26,22 +27,12 @@ from multi_task_scheduler.orchestration.receipts import (
     ExitEvidence,
     WeightEvidence,
 )
-from multi_task_scheduler.orchestration.contracts import RecallMode
 
 SOURCE = Path(__file__).resolve().parents[2] / "src/multi_task_scheduler"
 
 
 def _digest(*parts):
     return hashlib.sha256("|".join(repr(p) for p in parts).encode()).hexdigest()
-
-
-@dataclass(frozen=True)
-class _EffectiveReplicaEntry:
-    key: ReplicaKey
-    receivers: tuple[ReceiverRef, ...]
-    loaded_version: int
-    model_signature: str
-    membership_operation_id: str
 
 
 def _isolated_class(relative, name, parent, **globals_for_test):
@@ -140,7 +131,7 @@ def _ce_class():
         CommitOwner=CommitOwner,
         CommitReceipt=CommitReceipt,
         EvidenceHeader=EvidenceHeader,
-        EffectiveReplicaEntry=_EffectiveReplicaEntry,
+        EffectiveReplicaEntry=EffectiveReplicaEntry,
         _digest=_digest,
     )
 
@@ -203,6 +194,7 @@ def test_ce_membership_revision_is_monotonic_idempotent_and_typed():
     assert first.revision == 1
 
     entry = manager.effective_replicas[prepared.key]
+    assert isinstance(entry, EffectiveReplicaEntry)
     assert entry.key == prepared.key
     assert entry.receivers == prepared.receivers
     assert entry.loaded_version == installed.version
@@ -218,6 +210,22 @@ def test_ce_membership_revision_is_monotonic_idempotent_and_typed():
     assert removed.revision == 2
     assert manager.effective_revision == 2
     assert manager.effective_replicas == {}
+
+
+def test_ce_remove_refuses_while_parameter_transfer_is_in_flight():
+    manager = _ce_class()()
+    context = _ctx()
+    prepared = _prepared(context)
+    manager.add_effective(context, prepared, _weight(context))
+    manager._active_transfers().add(prepared.key)
+
+    with pytest.raises(ValueError, match="transfer is in flight"):
+        manager.remove_effective(context, prepared.key, _exit(context))
+
+    assert prepared.key in manager.effective_replicas
+    manager._active_transfers().remove(prepared.key)
+    receipt = manager.remove_effective(context, prepared.key, _exit(context))
+    assert receipt.action is ServiceAction.REMOVE
 
 
 def test_ce_rejects_model_signature_mismatch_inside_effective_set():
