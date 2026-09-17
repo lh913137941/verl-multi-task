@@ -10,12 +10,11 @@ import asyncio
 import logging
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import Mock
 
 import pytest
 
 from multi_task_scheduler.orchestration.contracts import (
-    IdleCandidateReport,
     LeaseAuthorization,
     NodePlacement,
     OperationCommand,
@@ -35,9 +34,7 @@ from multi_task_scheduler.orchestration.operation_journal import (
 )
 from multi_task_scheduler.orchestration.production_window import (
     ProductionWindow,
-    ReplicaObservation,
-    ReplicaView,
-    select_idle_candidates,
+    WindowState,
 )
 from multi_task_scheduler.orchestration.receipts import ReleaseEvidence, ServiceEvidence
 from multi_task_scheduler.orchestration.replica_sync_gate import (
@@ -116,6 +113,22 @@ def _command():
         payload_digest="payload-1",
         remaining_budget_ms=1000,
         placement=placement,
+    )
+
+
+def _window(revision=9):
+    return ProductionWindow(
+        task_session="s1",
+        epoch=3,
+        revision=revision,
+        state=WindowState.EXHAUSTED,
+        eligible_pending=0,
+        held_samples=0,
+        active_samples=1,
+        output_queue_size=0,
+        max_queue_size=8,
+        producer_exhausted=True,
+        policy_refresh_inflight=False,
     )
 
 
@@ -217,7 +230,7 @@ def test_manager_forwards_native_load_balancer_configuration():
     )
 
 
-def test_rollouter_builds_canonical_idle_candidate_report():
+def test_rollouter_owns_production_window_but_not_idle_reporting():
     class Parent:
         def __init__(self, *args, **kwargs):
             pass
@@ -230,56 +243,18 @@ def test_rollouter_builds_canonical_idle_candidate_report():
         FullyAsyncAgentLoopManager=SimpleNamespace(),
         FullyAsyncLLMServerClient=object(),
         ProductionWindow=ProductionWindow,
-        IdleCandidateReport=IdleCandidateReport,
-        select_idle_candidates=select_idle_candidates,
     )
     rollouter = rollouter_class(object(), object(), None, "cuda")
-    window = ProductionWindow(
-        production_epoch=3,
-        source_seq=7,
-        production_revision=9,
-        eligible_pending=0,
-        held=0,
-        exhausted_this_round=True,
-    )
+    assert rollouter.production_window is None
+
+    window = _window()
     rollouter.set_production_window(window)
-    view = ReplicaView(
-        observation=ReplicaObservation(
-            key=ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0),
-            engine_seq=4,
-            observed_age_ms=5,
-            engine_digest="engine-1",
-            in_flight=0,
-            admitting=0,
-            queued=0,
-            running=0,
-            pending_admissions=0,
-            production_epoch=3,
-            all_backends_observed=True,
-        ),
-        manager_revision=2,
-        lb_revision=3,
-        placement_digest="placement-r1",
-        stable_idle_ms=500,
-        gpu_count=1,
-    )
-    report = rollouter.report_idle_candidates(
-        window,
-        [view],
-        task_session="s1",
-        gs_epoch="gs-1",
-        lb_session="lb-1",
-        valid_for_ms=1000,
-        observations_fresh=True,
-        min_active_gpus=1,
-        current_active_gpus=2,
-        routable_count=2,
-    )
-    assert isinstance(report, IdleCandidateReport)
-    assert report.source_seq == 7
-    assert report.production_revision == 9
-    assert tuple(candidate.key.replica_id for candidate in report.candidates) == ("r1",)
+    assert rollouter.production_window is window
+    assert not hasattr(rollouter, "report_idle_candidates")
     assert not hasattr(rollouter, "begin_drain")
+
+    with pytest.raises(ValueError, match="revision"):
+        rollouter.set_production_window(_window(revision=8))
 
 
 def test_rollouter_lifecycle_runtime_actions_stay_explicitly_unimplemented():
@@ -295,8 +270,6 @@ def test_rollouter_lifecycle_runtime_actions_stay_explicitly_unimplemented():
         FullyAsyncAgentLoopManager=SimpleNamespace(),
         FullyAsyncLLMServerClient=object(),
         ProductionWindow=ProductionWindow,
-        IdleCandidateReport=IdleCandidateReport,
-        select_idle_candidates=select_idle_candidates,
     )
     rollouter = rollouter_class(object(), object(), None, "cuda")
     for method, args in (
