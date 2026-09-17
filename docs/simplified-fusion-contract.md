@@ -35,7 +35,7 @@ Canonical operation types are:
 `OperationStatus`, `Phase`, and `Outcome` are separate facts. `DONE` does not
 imply success. Unknown side effects must remain UNKNOWN and be reconciled.
 
-## 3. Identity and placement
+## 3. Identity, replay budget, and placement
 
 `ReplicaKey(task_session, replica_id, runtime_epoch)` is the runtime identity.
 Rebuild changes `runtime_epoch`; sleep/wake does not.
@@ -46,9 +46,10 @@ operation_id, lease identity/epoch, command sequence and expected revision.
 `OperationCommand` contains the complete nested context, target,
 `LeaseAuthorization`, payload digest, remaining budget, and operation-specific
 placement/candidate/recall data. `operation_id` replay is valid only when the
-immutable business identity is identical. A retry may reduce only its remaining
-transport budget; it may not change lease epoch, command sequence, payload,
-target, authorization, candidate, or operation kind.
+immutable business identity is identical. `remaining_budget_ms` is transport
+budget and is deliberately excluded from that business identity. The first
+accepted operation owns the operation deadline; a same-ID retry returns existing
+progress and must not create a new deadline or reset the total time budget.
 
 First-release `PlacementSpec` is single-node (`NodePlacement`) with `dp=1`,
 `pp=1`, and `world_size == tp`.
@@ -151,10 +152,17 @@ separately from deduplication.
 
 ## 11. Release and authorization
 
-GS may transfer GPU authorization only after a successful operation carries the
-required `ReleaseEvidence`. Native sleep may retain verified native processes;
-borrowed destroy must not retain borrower-owned or unknown processes. A string
-state or service-detached proof cannot substitute for physical release evidence.
+GS may transfer GPU authorization only after a `SUCCEEDED` operation carries a
+matching `ServiceEvidence(REMOVE)` and `ReleaseEvidence`. The release evidence
+must match the operation/lease/runtime identity and reference the service-removal
+proof through `permit_digest`.
+
+After GS confirms that release, its digest becomes the next authorization
+fence: ADD/RESTORE `LeaseAuthorization.prior_release_digest` must match the
+last release digest already confirmed for that lease. Native sleep may retain
+verified native processes; borrowed destroy must not retain borrower-owned or
+unknown processes. A string state, success status alone, or service-detached
+proof cannot substitute for physical release evidence.
 
 ## 12. Document corrections incorporated here
 
