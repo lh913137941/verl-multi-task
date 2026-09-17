@@ -27,6 +27,7 @@ from multi_task_scheduler.orchestration.operation_journal import (
     OperationJournal,
     OperationStatus,
     Outcome,
+    Phase,
 )
 from multi_task_scheduler.orchestration.receipts import ReleaseEvidence, ServiceEvidence
 from multi_task_scheduler.scheduler.discovery import get_or_create_group_scheduler
@@ -54,6 +55,22 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         if not hasattr(self, "_last_command_seq_by_target"):
             self._last_command_seq_by_target = {}
         return self._last_command_seq_by_target
+
+    def _active_operation_record(self):
+        """Return the one unfinished lifecycle operation owned by this task.
+
+        The first-release contract permits one lifecycle operation per task. A
+        terminal journal record is cleared lazily here so the next distinct
+        operation can be accepted without a second mutable concurrency ledger.
+        """
+        operation_id = getattr(self, "_active_operation_id", None)
+        if operation_id is None:
+            return None
+        record = self._ensure_journal().query(operation_id)
+        if record is None or record.phase is Phase.DONE:
+            self._active_operation_id = None
+            return None
+        return record
 
     @staticmethod
     def _result_from_record(record) -> OperationResult:
@@ -101,10 +118,11 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
     def submit_operation(self, command: OperationCommand) -> OperationResult:
         """Validate/idempotently accept one complete lifecycle command.
 
-        Same-operation retries return the existing journal record even if a later
-        command for the same ReplicaKey has since been accepted. A distinct
-        operation_id must carry a strictly higher command_seq so a delayed old
-        command cannot reopen an earlier lifecycle action.
+        Same-operation retries always return the existing journal record. A new
+        operation_id is rejected while another lifecycle operation for this task
+        is unfinished. Once that operation reaches DONE, the next distinct
+        operation must also carry a strictly higher command_seq for its target,
+        so delayed old commands cannot reopen an earlier lifecycle action.
 
         Real lifecycle execution is still unavailable until the native runtime
         backends are wired. ACCEPTED therefore proves only journal acceptance;
@@ -118,6 +136,13 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         if existing is not None:
             record = journal.begin(command)
         else:
+            active = self._active_operation_record()
+            if active is not None:
+                raise OperationIdentityError(
+                    "another lifecycle operation is active for this task: "
+                    f"{active.operation_id!r}"
+                )
+
             fences = self._ensure_command_fences()
             last_command_seq = fences.get(command.target)
             if (
@@ -130,6 +155,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                 )
             record = journal.begin(command)
             fences[command.target] = command.ctx.command_seq
+            self._active_operation_id = command.ctx.operation_id
 
         return self._result_from_record(record)
 
