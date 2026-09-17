@@ -1,17 +1,33 @@
-"""Regression tests for owner revisions and evidence-preserving routing commits.
-
-The native VERL parents are replaced with inert test parents; these tests cover
-only the orchestration overlay bodies and do not claim Ray/GPU integration.
-"""
+"""Owner revision and CommitReceipt regression tests for CE and LB overlays."""
 
 import ast
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from multi_task_scheduler.orchestration.contracts import (
+    OperationContext,
+    PreparedReplica,
+    ReceiverRef,
+    ReplicaKey,
+    ServiceAction,
+)
+from multi_task_scheduler.orchestration.receipts import (
+    CommitOwner,
+    CommitReceipt,
+    EvidenceHeader,
+    ExitEvidence,
+    WeightEvidence,
+)
+from multi_task_scheduler.orchestration.contracts import RecallMode
 
 SOURCE = Path(__file__).resolve().parents[2] / "src/multi_task_scheduler"
+
+
+def _digest(*parts):
+    return hashlib.sha256("|".join(repr(p) for p in parts).encode()).hexdigest()
 
 
 def _isolated_class(relative, name, parent, **globals_for_test):
@@ -21,7 +37,10 @@ def _isolated_class(relative, name, parent, **globals_for_test):
     node.bases = [ast.Name(id="TestParent", ctx=ast.Load())]
     node.decorator_list = []
     module = ast.Module(
-        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), node],
+        body=[
+            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+            node,
+        ],
         type_ignores=[],
     )
     scope = {"TestParent": parent, **globals_for_test}
@@ -29,86 +48,169 @@ def _isolated_class(relative, name, parent, **globals_for_test):
     return scope[name]
 
 
-def test_ce_membership_revision_is_monotonic_and_idempotent():
+def _ctx(operation_id="op-1"):
+    return OperationContext(
+        protocol_version=1,
+        gs_epoch="gs-1",
+        task_id="task-a",
+        task_session="s1",
+        operation_id=operation_id,
+        lease_id="l1",
+        lease_epoch=0,
+        command_seq=0,
+    )
+
+
+def _key(replica_id="r1"):
+    return ReplicaKey(task_session="s1", replica_id=replica_id, runtime_epoch=0)
+
+
+def _prepared(context=None, replica_id="r1"):
+    context = context or _ctx()
+    return PreparedReplica(
+        key=_key(replica_id),
+        ctx=context,
+        placement_digest="placement-1",
+        model_signature="sig",
+        receivers=(ReceiverRef("w0", "n1", "u0", 0, object()),),
+        head_server=object(),
+        manager_revision=1,
+    )
+
+
+def _weight(context=None, replica_id="r1"):
+    context = context or _ctx()
+    return WeightEvidence(
+        header=EvidenceHeader(context, _key(replica_id), 1, f"weight-{replica_id}"),
+        transfer_id=f"transfer-{replica_id}",
+        snapshot_id="snapshot-1",
+        manifest_digest="manifest-1",
+        version=7,
+        receiver_versions={"w0": 7},
+        device_complete=True,
+        temporary_topology_clean=True,
+    )
+
+
+def _exit(context=None, replica_id="r1"):
+    context = context or _ctx()
+    return ExitEvidence(
+        header=EvidenceHeader(context, _key(replica_id), 2, f"exit-{replica_id}"),
+        drain_id=f"drain-{replica_id}",
+        recall_mode=RecallMode.NATURAL,
+        inflight=0,
+        admitting=0,
+        queued=0,
+        running=0,
+        pending_admissions=0,
+        closed_admission=True,
+        all_backends_confirmed=True,
+        lb_revision=1,
+        observed_age_ms=5,
+        engine_digest="engine-1",
+        continuations=(),
+        unresolved_count=0,
+    )
+
+
+def _ce_class():
     class Parent:
         def __init__(self, *args, **kwargs):
             pass
 
-    cls = _isolated_class(
+    return _isolated_class(
         "checkpoint/checkpoint_engine_manager.py",
         "MultiTaskCheckpointEngineManager",
         Parent,
+        ServiceAction=ServiceAction,
+        CommitOwner=CommitOwner,
+        CommitReceipt=CommitReceipt,
+        EvidenceHeader=EvidenceHeader,
+        _digest=_digest,
     )
-    manager = cls()
-    r1 = SimpleNamespace(replica_id="r1")
-    r2 = SimpleNamespace(replica_id="r2")
-
-    assert manager.add_effective_replica(None, r1) == 1
-    assert manager.add_effective_replica(None, r1) == 1
-    assert manager.add_effective_replica(None, r2) == 2
-    assert manager.remove_effective_replica(None, "r1") == 3
-    assert manager.remove_effective_replica(None, "missing") == 3
-    assert manager.effective_revision == 3
-    assert set(manager.effective_replicas) == {"r2"}
 
 
-def test_lb_does_not_remove_replica_with_unsettled_attempts():
+def _lb_class():
     class Parent:
         def __init__(self, *args, **kwargs):
             pass
 
-    cls = _isolated_class(
+    return _isolated_class(
         "rollout/load_balancer.py",
         "MultiTaskGlobalRequestLoadBalancer",
         Parent,
         DEFAULT_ROUTING_CACHE_SIZE=128,
+        ServiceAction=ServiceAction,
+        CommitOwner=CommitOwner,
+        CommitReceipt=CommitReceipt,
+        EvidenceHeader=EvidenceHeader,
+        DrainTicket=object,
+        _digest=_digest,
     )
-    lb = cls({"r1": object()})
-    lb.begin_drain("r1")
-    lb.attempts["r1"] = {"a1": SimpleNamespace(state="RUNNING")}
-    assert lb.finish_remove("r1") is False
-    assert "r1" in lb.draining_ids
-
-    lb.attempts["r1"]["a1"] = SimpleNamespace(state="RELEASED")
-    assert lb.finish_remove("r1") is True
-    assert "r1" not in lb.draining_ids
-    assert "r1" not in lb.routable_ids
 
 
-def test_lb_new_route_requires_weight_member_and_lease_evidence():
-    class Parent:
-        def __init__(self, *args, **kwargs):
-            pass
+def test_ce_membership_revision_is_monotonic_idempotent_and_typed():
+    manager = _ce_class()()
+    context = _ctx()
+    prepared = _prepared(context)
+    installed = _weight(context)
 
-    cls = _isolated_class(
-        "rollout/load_balancer.py",
-        "MultiTaskGlobalRequestLoadBalancer",
-        Parent,
-        DEFAULT_ROUTING_CACHE_SIZE=128,
+    first = manager.add_effective(context, prepared, installed)
+    replay = manager.add_effective(context, prepared, installed)
+    assert first is replay
+    assert first.owner is CommitOwner.CE
+    assert first.action is ServiceAction.ADD
+    assert first.revision == 1
+
+    removed = manager.remove_effective(context, prepared.key, _exit(context))
+    replay_removed = manager.remove_effective(context, prepared.key, _exit(context))
+    assert removed is replay_removed
+    assert removed.action is ServiceAction.REMOVE
+    assert removed.revision == 2
+    assert manager.effective_revision == 2
+    assert manager.effective_replicas == {}
+
+
+def test_lb_add_requires_matching_ce_commit_and_returns_typed_receipt():
+    lb = _lb_class()({})
+    context = _ctx()
+    prepared = _prepared(context)
+    installed = _weight(context)
+    ce = CommitReceipt(
+        header=EvidenceHeader(context, prepared.key, 2, "ce-add"),
+        owner=CommitOwner.CE,
+        action=ServiceAction.ADD,
+        revision=1,
+        version=7,
+        route_epoch=None,
     )
-    lb = cls({})
-    with pytest.raises(ValueError, match="requires serving_version"):
-        lb.commit_routable("borrowed-r1")
-    epoch = lb.commit_routable(
-        "borrowed-r1", serving_version=7, ce_revision=4, lease_valid=True
+    receipt = lb.commit_routable(context, prepared, installed, ce)
+    assert receipt.owner is CommitOwner.LB
+    assert receipt.action is ServiceAction.ADD
+    assert receipt.version == 7
+    assert receipt.route_epoch == 1
+    assert lb.commit_routable(context, prepared, installed, ce) is receipt
+
+
+def test_lb_remove_rejects_unsettled_attempts_then_commits_remove():
+    lb = _lb_class()({})
+    context = _ctx()
+    proof = _exit(context)
+    ce = CommitReceipt(
+        header=EvidenceHeader(context, proof.header.key, 3, "ce-remove"),
+        owner=CommitOwner.CE,
+        action=ServiceAction.REMOVE,
+        revision=2,
+        version=None,
+        route_epoch=None,
     )
-    assert epoch == 1
-    assert "borrowed-r1" in lb.routable_ids
+    lb.attempts[proof.header.key] = {"a1": SimpleNamespace(state="RUNNING")}
+    with pytest.raises(ValueError, match="attempts remain unsettled"):
+        lb.finish_remove(context, proof, ce)
 
-
-def test_lb_can_cancel_drain_for_previously_committed_route_without_new_add_evidence():
-    class Parent:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    cls = _isolated_class(
-        "rollout/load_balancer.py",
-        "MultiTaskGlobalRequestLoadBalancer",
-        Parent,
-        DEFAULT_ROUTING_CACHE_SIZE=128,
-    )
-    lb = cls({"native-r1": object()})
-    assert lb.begin_drain("native-r1") == 1
-    assert lb.commit_routable("native-r1") == 2
-    assert "native-r1" in lb.routable_ids
-    assert "native-r1" not in lb.draining_ids
+    lb.attempts[proof.header.key]["a1"] = SimpleNamespace(state="RELEASED")
+    receipt = lb.finish_remove(context, proof, ce)
+    assert receipt.owner is CommitOwner.LB
+    assert receipt.action is ServiceAction.REMOVE
+    assert receipt.version is None
+    assert receipt.route_epoch == 1
