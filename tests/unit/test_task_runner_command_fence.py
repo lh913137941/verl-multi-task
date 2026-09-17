@@ -1,4 +1,4 @@
-"""TaskRunner command-sequence fencing for delayed lifecycle commands."""
+"""TaskRunner lifecycle serialization and command-sequence fencing."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from multi_task_scheduler.orchestration.operation_journal import (
     OperationKind,
     OperationStatus,
     Outcome,
+    Phase,
 )
 from multi_task_scheduler.orchestration.receipts import ReleaseEvidence, ServiceEvidence
 
@@ -67,6 +68,7 @@ def _isolated_task_runner():
         "OperationIdentityError": OperationIdentityError,
         "OperationStatus": OperationStatus,
         "Outcome": Outcome,
+        "Phase": Phase,
         "ServiceEvidence": ServiceEvidence,
         "ReleaseEvidence": ReleaseEvidence,
     }
@@ -123,13 +125,48 @@ def _command(operation_id: str, command_seq: int) -> OperationCommand:
     )
 
 
-def test_distinct_operations_require_strictly_increasing_command_seq():
+def _finish(runner, operation_id: str) -> None:
+    runner._ensure_journal().transition(
+        operation_id,
+        Phase.DONE,
+        status=OperationStatus.SUCCEEDED,
+    )
+
+
+def test_task_accepts_only_one_unfinished_lifecycle_operation():
     runner = _isolated_task_runner()()
 
     first_command = _command("op-1", 5)
     first = runner.submit_operation(first_command)
     assert first.status is OperationStatus.ACCEPTED
     assert runner.submit_operation(first_command) == first
+
+    with pytest.raises(OperationIdentityError, match="another lifecycle operation is active"):
+        runner.submit_operation(_command("op-2", 6))
+
+    _finish(runner, "op-1")
+    second = runner.submit_operation(_command("op-2", 6))
+    assert second.status is OperationStatus.ACCEPTED
+
+    with pytest.raises(OperationIdentityError, match="another lifecycle operation is active"):
+        runner.submit_operation(_command("op-3", 7))
+
+    # Replaying a previously accepted operation is a read/idempotent replay, not
+    # a second lifecycle execution, so it remains legal while op-2 is active.
+    replayed_first = runner.submit_operation(first_command)
+    assert replayed_first.phase is Phase.DONE
+    assert replayed_first.status is OperationStatus.SUCCEEDED
+
+    _finish(runner, "op-2")
+    third = runner.submit_operation(_command("op-3", 7))
+    assert third.status is OperationStatus.ACCEPTED
+
+
+def test_distinct_operations_still_require_strictly_increasing_command_seq():
+    runner = _isolated_task_runner()()
+
+    runner.submit_operation(_command("op-1", 5))
+    _finish(runner, "op-1")
 
     with pytest.raises(OperationIdentityError, match="stale command_seq"):
         runner.submit_operation(_command("op-old", 4))
@@ -138,7 +175,3 @@ def test_distinct_operations_require_strictly_increasing_command_seq():
 
     newer = runner.submit_operation(_command("op-2", 6))
     assert newer.status is OperationStatus.ACCEPTED
-
-    # A retry of the already accepted older operation remains a query/replay of
-    # that same operation; it must not be rejected merely because op-2 exists.
-    assert runner.submit_operation(first_command) == first
