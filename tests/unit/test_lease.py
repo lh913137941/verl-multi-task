@@ -3,8 +3,10 @@
 import pytest
 
 from multi_task_scheduler.orchestration.contracts import (
+    NodePlacement,
     OperationContext,
     OperationResult,
+    PlacementSpec,
     ReleaseKind,
     ReplicaKey,
     ServiceAction,
@@ -28,6 +30,23 @@ from multi_task_scheduler.scheduler.lease import (
 from multi_task_scheduler.scheduler.ledger import LeaseRecord
 
 
+def _placement():
+    return PlacementSpec(
+        node=NodePlacement(
+            node_id="n1",
+            gpu_uuids=("u0",),
+            physical_gpu_ids=(0,),
+            global_ranks=(0,),
+            local_ranks=(0,),
+        ),
+        tp=1,
+        dp=1,
+        pp=1,
+        model_signature="sig",
+        placement_digest="placement-u0",
+    )
+
+
 def _machine(*, state=LeaseState.PLANNED, release_digest=None):
     machine = LeaseStateMachine()
     machine.register(
@@ -37,6 +56,7 @@ def _machine(*, state=LeaseState.PLANNED, release_digest=None):
             borrower_session="borrower",
             state=state.value,
             last_release_digest=release_digest,
+            placement=_placement(),
         )
     )
     return machine
