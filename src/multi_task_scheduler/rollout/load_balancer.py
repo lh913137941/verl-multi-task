@@ -1,15 +1,33 @@
-"""Native routing subclass with a conservative orchestration R view.
+"""Native routing subclass plus the simplified R-view commit protocol.
 
-Native request selection remains inherited. The overlay owns routing eligibility,
-a monotonic route revision and attempt facts used by lifecycle operations. It
-never discards unresolved attempts in order to manufacture a successful remove.
+Dynamic service commits use full ReplicaKey identity and return CommitReceipt.
+No bool/int compatibility result is exposed. Native request selection remains
+inherited until dynamic routing is wired end-to-end.
 """
+
+from __future__ import annotations
+
+import hashlib
+import uuid
 
 from verl.workers.rollout.llm_server import DEFAULT_ROUTING_CACHE_SIZE, GlobalRequestLoadBalancer
 
+from multi_task_scheduler.orchestration.contracts import ServiceAction
+from multi_task_scheduler.orchestration.receipts import (
+    CommitOwner,
+    CommitReceipt,
+    DrainTicket,
+    EvidenceHeader,
+)
+
+
+def _digest(*parts: object) -> str:
+    data = "|".join(repr(part) for part in parts).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
 
 class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
-    """Manager wraps this ordinary class in Ray; native routing stays inherited."""
+    """LB owns R and its attempt ledger; native selection stays inherited."""
 
     def __init__(
         self,
@@ -22,75 +40,101 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         self.group_scheduler = group_scheduler
         super().__init__(servers, max_cache_size=max_cache_size, full_determinism=full_determinism)
         self.routing_epoch = 0
-        self.routable_ids = set(servers)
-        self.draining_ids = set()
+        self.lb_revision = 0
+        self.routes = {}
+        self.draining = {}
         self.attempts = {}
-        self.route_metadata = {
-            replica_id: {
-                "serving_version": None,
-                "ce_revision": None,
-                "lease_valid": True,
-                "committed_before": True,
-            }
-            for replica_id in servers
-        }
+        self._commit_receipts = {}
 
-    def begin_drain(self, replica_id: str) -> int:
-        """Atomically close new routing and advance the route fence."""
-        self.draining_ids.add(replica_id)
-        self.routable_ids.discard(replica_id)
-        self.routing_epoch += 1
-        return self.routing_epoch
-
-    def commit_routable(
+    def close_for_exit(
         self,
-        replica_id: str,
+        ctx,
+        key,
         *,
-        serving_version: int | None = None,
-        ce_revision: int | None = None,
-        lease_valid: bool | None = None,
-    ) -> int:
-        """Publish a route after evidence, or cancel a not-yet-committed drain.
-
-        ADD/RESTORE must provide weight/member/lease evidence. A replica that was
-        already committed before the current drain may be reopened without new
-        evidence when the drain is safely cancelled before CE removal.
-        """
-        previous = self.route_metadata.get(replica_id)
-        cancelling_drain = (
-            replica_id in self.draining_ids
-            and previous is not None
-            and previous.get("committed_before") is True
-            and serving_version is None
-            and ce_revision is None
-            and lease_valid is None
-        )
-        if cancelling_drain:
-            self.routable_ids.add(replica_id)
-            self.draining_ids.discard(replica_id)
-            self.routing_epoch += 1
-            return self.routing_epoch
-
-        if serving_version is None or ce_revision is None or lease_valid is None:
-            raise ValueError("new route commit requires serving_version, ce_revision and lease_valid")
-        if serving_version < 0 or ce_revision < 0:
-            raise ValueError("serving_version and ce_revision must be nonnegative")
-        if not lease_valid:
-            raise ValueError("cannot route a replica without a valid lease/identity fence")
-
-        self.route_metadata[replica_id] = {
-            "serving_version": serving_version,
-            "ce_revision": ce_revision,
-            "lease_valid": True,
-            "committed_before": True,
-        }
-        self.routable_ids.add(replica_id)
-        self.draining_ids.discard(replica_id)
+        phase_revision: int,
+        server_admission_epoch: int,
+    ) -> DrainTicket:
+        """Internal RO primitive: close one dynamic route and create a drain ticket."""
+        if key.task_session != ctx.task_session:
+            raise ValueError("drain target does not belong to operation task_session")
+        existing = self.draining.get((ctx.identity, key))
+        if existing is not None:
+            return existing
         self.routing_epoch += 1
-        return self.routing_epoch
+        self.lb_revision += 1
+        self.routes.pop(key, None)
+        drain_id = f"drain-{uuid.uuid4().hex}"
+        ticket = DrainTicket(
+            header=EvidenceHeader(
+                ctx=ctx,
+                key=key,
+                phase_revision=phase_revision,
+                digest=_digest("DRAIN", ctx.identity, key, drain_id, self.routing_epoch),
+            ),
+            drain_id=drain_id,
+            route_epoch=self.routing_epoch,
+            server_admission_epoch=server_admission_epoch,
+        )
+        self.draining[(ctx.identity, key)] = ticket
+        return ticket
 
-    def _has_unsettled_attempts(self, replica_id: str) -> bool:
-        attempts = self.attempts.get(replica_id)
+    def commit_routable(self, ctx, prepared, weight, ce_commit) -> CommitReceipt:
+        """Commit R=ROUTABLE after valid weight and CE ADD evidence."""
+        key = prepared.key
+        if prepared.ctx != ctx or weight.header.ctx != ctx or weight.header.key != key:
+            raise ValueError("LB ADD evidence identity mismatch")
+        if (
+            ce_commit.header.ctx != ctx
+            or ce_commit.header.key != key
+            or ce_commit.owner is not CommitOwner.CE
+            or ce_commit.action is not ServiceAction.ADD
+            or ce_commit.version != weight.version
+        ):
+            raise ValueError("LB ADD requires matching CE ADD commit")
+        cache_key = (ctx.identity, key, ServiceAction.ADD)
+        cached = self._commit_receipts.get(cache_key)
+        if cached is not None:
+            return cached
+
+        self.routing_epoch += 1
+        self.lb_revision += 1
+        self.routes[key] = {
+            "head_server": prepared.head_server,
+            "version": weight.version,
+            "ce_revision": ce_commit.revision,
+            "route_epoch": self.routing_epoch,
+        }
+        self.draining.pop((ctx.identity, key), None)
+        digest = _digest(
+            "LB",
+            "ADD",
+            ctx.identity,
+            key,
+            self.lb_revision,
+            self.routing_epoch,
+            weight.header.digest,
+            ce_commit.header.digest,
+        )
+        receipt = CommitReceipt(
+            header=EvidenceHeader(
+                ctx=ctx,
+                key=key,
+                phase_revision=max(
+                    weight.header.phase_revision, ce_commit.header.phase_revision
+                ) + 1,
+                digest=digest,
+            ),
+            owner=CommitOwner.LB,
+            action=ServiceAction.ADD,
+            revision=self.lb_revision,
+            version=weight.version,
+            route_epoch=self.routing_epoch,
+        )
+        self._commit_receipts[cache_key] = receipt
+        return receipt
+
+    def _has_unsettled_attempts(self, key) -> bool:
+        attempts = self.attempts.get(key)
         if attempts is None:
             return False
         if isinstance(attempts, dict):
@@ -103,17 +147,58 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             return False
         return bool(attempts)
 
-    def finish_remove(self, replica_id: str) -> bool:
-        """Commit R=REMOVED only when no unresolved attempt remains."""
-        if self._has_unsettled_attempts(replica_id):
-            return False
-        self.draining_ids.discard(replica_id)
-        self.routable_ids.discard(replica_id)
-        self.route_metadata.pop(replica_id, None)
-        self.attempts.pop(replica_id, None)
-        self.routing_epoch += 1
-        return True
+    def finish_remove(self, ctx, proof, ce_commit) -> CommitReceipt:
+        """Commit R=REMOVED only after ExitEvidence and CE REMOVE are verified."""
+        key = proof.header.key
+        if proof.header.ctx != ctx:
+            raise ValueError("LB REMOVE exit evidence belongs to another operation")
+        if (
+            ce_commit.header.ctx != ctx
+            or ce_commit.header.key != key
+            or ce_commit.owner is not CommitOwner.CE
+            or ce_commit.action is not ServiceAction.REMOVE
+        ):
+            raise ValueError("LB REMOVE requires matching CE REMOVE commit")
+        if self._has_unsettled_attempts(key):
+            raise ValueError("cannot remove route while attempts remain unsettled")
+        cache_key = (ctx.identity, key, ServiceAction.REMOVE)
+        cached = self._commit_receipts.get(cache_key)
+        if cached is not None:
+            return cached
 
-    def query_routing_operation(self, operation_id: str) -> str:
-        """Unknown is not evidence that nothing executed."""
-        return "unknown"
+        self.routing_epoch += 1
+        self.lb_revision += 1
+        self.routes.pop(key, None)
+        self.draining.pop((ctx.identity, key), None)
+        self.attempts.pop(key, None)
+        digest = _digest(
+            "LB",
+            "REMOVE",
+            ctx.identity,
+            key,
+            self.lb_revision,
+            self.routing_epoch,
+            proof.header.digest,
+            ce_commit.header.digest,
+        )
+        receipt = CommitReceipt(
+            header=EvidenceHeader(
+                ctx=ctx,
+                key=key,
+                phase_revision=max(
+                    proof.header.phase_revision, ce_commit.header.phase_revision
+                ) + 1,
+                digest=digest,
+            ),
+            owner=CommitOwner.LB,
+            action=ServiceAction.REMOVE,
+            revision=self.lb_revision,
+            version=None,
+            route_epoch=self.routing_epoch,
+        )
+        self._commit_receipts[cache_key] = receipt
+        return receipt
+
+    def query_phase(self, ctx, phase):
+        """Owner-side query must be backed by a real phase journal before use."""
+        raise NotImplementedError("LB query_phase requires owner-side journal wiring")
