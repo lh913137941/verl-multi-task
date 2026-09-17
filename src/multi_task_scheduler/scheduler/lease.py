@@ -3,7 +3,8 @@
 A lease edge that changes who may use the GPUs is evidence-driven. A bare
 SUCCEEDED status is never sufficient: release edges require a matching
 ServiceEvidence(REMOVE) + ReleaseEvidence chain, and service-activation edges
-require a matching ServiceEvidence(ADD).
+require a matching ServiceEvidence(ADD). Lease authorizations are additionally
+fenced by a monotonic authorization_seq while preserving same-operation replay.
 """
 
 from __future__ import annotations
@@ -86,13 +87,56 @@ _POST_RELEASE_AUTHORIZATION_EDGES = {
 class LeaseStateMachine:
     def __init__(self) -> None:
         self._leases: dict[str, LeaseRecord] = {}
+        self._last_authorization_seq: dict[str, int] = {}
+        self._authorization_by_operation: dict[tuple[str, str], int] = {}
 
     def register(self, lease: LeaseRecord) -> None:
         lease.state = LeaseState(lease.state).value
         self._leases[lease.lease_id] = lease
+        self._last_authorization_seq.setdefault(lease.lease_id, -1)
 
     def get(self, lease_id: str) -> LeaseRecord:
         return self._leases[lease_id]
+
+    def validate_authorization(
+        self,
+        lease_id: str,
+        operation_id: str,
+        authorization_seq: int,
+    ) -> None:
+        """Validate a GS authorization without consuming a new sequence yet."""
+        if lease_id not in self._leases:
+            raise ValueError(f"unknown lease {lease_id!r}")
+        if not operation_id:
+            raise ValueError("operation_id must be nonempty")
+        if authorization_seq < 0:
+            raise ValueError("authorization_seq must be nonnegative")
+
+        key = (lease_id, operation_id)
+        existing = self._authorization_by_operation.get(key)
+        if existing is not None:
+            if existing != authorization_seq:
+                raise ValueError("conflicting authorization_seq for operation replay")
+            return
+
+        last = self._last_authorization_seq.get(lease_id, -1)
+        if authorization_seq <= last:
+            raise ValueError(
+                f"stale authorization_seq {authorization_seq}; last accepted sequence is {last}"
+            )
+
+    def record_authorization(
+        self,
+        lease_id: str,
+        operation_id: str,
+        authorization_seq: int,
+    ) -> None:
+        """Consume a new authorization sequence after GS records the operation intent."""
+        self.validate_authorization(lease_id, operation_id, authorization_seq)
+        key = (lease_id, operation_id)
+        if key not in self._authorization_by_operation:
+            self._authorization_by_operation[key] = authorization_seq
+            self._last_authorization_seq[lease_id] = authorization_seq
 
     @staticmethod
     def _expected_session(lease: LeaseRecord, role: str) -> str:
