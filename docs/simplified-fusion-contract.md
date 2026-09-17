@@ -51,6 +51,14 @@ budget and is deliberately excluded from that business identity. The first
 accepted operation owns the operation deadline; a same-ID retry returns existing
 progress and must not create a new deadline or reset the total time budget.
 
+The first release permits **one unfinished lifecycle operation per task**.
+Same-operation replay is always allowed because it does not create a second
+execution. A different `operation_id` is accepted only after the current
+operation reaches `DONE`; it must then also pass the monotonic `command_seq`
+fence. Native parameter synchronization is serialized with lifecycle critical
+commit sections by the task-local gate G rather than by starting a second
+lifecycle operation.
+
 First-release `PlacementSpec` is single-node (`NodePlacement`) with `dp=1`,
 `pp=1`, and `world_size == tp`.
 
