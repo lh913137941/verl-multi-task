@@ -122,7 +122,7 @@ def _require_command_shape(command: object) -> None:
     OperationKind(kind)
 
 
-def _command_identity(command: object) -> tuple:
+def command_identity(command: object) -> tuple:
     """Immutable business identity; transport budget is not replay identity."""
     return (
         command.ctx,
@@ -134,6 +134,23 @@ def _command_identity(command: object) -> tuple:
         command.recall_mode,
         command.payload_digest,
     )
+
+
+def operation_outcome(status: OperationStatus, error: object | None = None) -> Outcome:
+    """Map an observed operation result to its side-effect outcome.
+
+    This helper applies only when a journal/result fact is available. Callers
+    that lack an authoritative result may still conservatively return UNKNOWN.
+    """
+    status = OperationStatus(status)
+    if status is OperationStatus.ACCEPTED:
+        return Outcome.KNOWN_NOT_APPLIED
+    if status is OperationStatus.SUCCEEDED:
+        return Outcome.KNOWN_APPLIED
+    if status is OperationStatus.FAILED:
+        error_outcome = getattr(error, "outcome", None)
+        return Outcome.UNKNOWN if error_outcome is None else Outcome(error_outcome)
+    return Outcome.UNKNOWN
 
 
 @dataclass
@@ -182,7 +199,7 @@ class OperationJournal:
                 raise OperationIdentityError(
                     f"operation {operation_id!r} cannot be reused for another lease epoch"
                 )
-            if _command_identity(existing.command) != _command_identity(command):
+            if command_identity(existing.command) != command_identity(command):
                 raise OperationIdentityError(
                     f"conflicting replay for operation {operation_id!r}"
                 )
