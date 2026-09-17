@@ -1,8 +1,8 @@
-"""Cross-process/cross-component data contracts for multi-task orchestration.
+"""Cross-component value contracts aligned with simplified design §6.
 
-These value objects carry identity, evidence and authority.  Runtime handles stay
-inside one task and GPU identifiers are stable physical identities, never local
-``cuda:N`` aliases.
+The canonical public names in this module follow the simplified fusion design.
+A few aliases are kept only to avoid an immediate import break for callers that
+have not migrated yet; repository code should use the canonical names.
 """
 
 from __future__ import annotations
@@ -11,12 +11,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Mapping, Sequence, Tuple
 
-from .operation_journal import OperationType
+from .operation_journal import OperationKind, OperationStatus, Phase
 
 
 class ReleaseKind(str, Enum):
-    DONOR_SLEEP = "DONOR_SLEEP"
-    BORROWER_RELEASE = "BORROWER_RELEASE"
+    DONOR_SLEEP_RELEASED = "DONOR_SLEEP_RELEASED"
+    BORROWER_RUNTIME_DESTROYED = "BORROWER_RUNTIME_DESTROYED"
 
 
 class TransferKind(str, Enum):
@@ -31,8 +31,8 @@ class RecallMode(str, Enum):
 
 @dataclass(frozen=True)
 class OperationContext:
-    protocol_version: str
-    gs_epoch: int
+    protocol_version: int
+    gs_epoch: str
     task_id: str
     task_session: str
     operation_id: str
@@ -41,8 +41,21 @@ class OperationContext:
     command_seq: int
     expected_revision: int = 0
 
+    def __post_init__(self) -> None:
+        if type(self.protocol_version) is not int or self.protocol_version < 0:
+            raise ValueError("protocol_version must be a nonnegative integer")
+        if not isinstance(self.gs_epoch, str) or not self.gs_epoch:
+            raise ValueError("gs_epoch must be a nonempty string")
+        for name in ("task_id", "task_session", "operation_id", "lease_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be a nonempty string")
+        if self.lease_epoch < 0 or self.command_seq < 0 or self.expected_revision < 0:
+            raise ValueError("lease_epoch, command_seq and expected_revision must be nonnegative")
+
     @property
     def identity(self) -> tuple:
+        """Immutable command identity used for replay/result fencing."""
         return (
             self.protocol_version,
             self.gs_epoch,
@@ -51,11 +64,15 @@ class OperationContext:
             self.operation_id,
             self.lease_id,
             self.lease_epoch,
+            self.command_seq,
+            self.expected_revision,
         )
 
 
 @dataclass(frozen=True)
 class GpuPlacement:
+    """Compatibility leaf used only when adapting older node-block callers."""
+
     gpu_uuid: str
     physical_id: int
     global_rank: int
@@ -63,31 +80,92 @@ class GpuPlacement:
 
 
 @dataclass(frozen=True)
-class NodeBlock:
+class NodePlacement:
+    """Single-node GPU/rank placement used by first-release orchestration."""
+
     node_id: str
-    gpus: Tuple[GpuPlacement, ...]
+    gpu_uuids: Tuple[str, ...]
+    physical_gpu_ids: Tuple[int, ...]
+    global_ranks: Tuple[int, ...]
+    local_ranks: Tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not self.node_id:
+            raise ValueError("node_id must be nonempty")
+        size = len(self.gpu_uuids)
+        if size == 0:
+            raise ValueError("NodePlacement requires at least one GPU")
+        if not (
+            len(self.physical_gpu_ids)
+            == len(self.global_ranks)
+            == len(self.local_ranks)
+            == size
+        ):
+            raise ValueError("NodePlacement GPU/rank arrays must have the same length")
+        if any(not value for value in self.gpu_uuids):
+            raise ValueError("gpu_uuids must be nonempty strings")
+        if len(set(self.gpu_uuids)) != size:
+            raise ValueError("gpu_uuids must be unique within one placement")
+
+    @property
+    def gpus(self) -> Tuple[GpuPlacement, ...]:
+        """Read-only compatibility projection; not the canonical wire shape."""
+        return tuple(
+            GpuPlacement(uuid, physical, global_rank, local_rank)
+            for uuid, physical, global_rank, local_rank in zip(
+                self.gpu_uuids,
+                self.physical_gpu_ids,
+                self.global_ranks,
+                self.local_ranks,
+            )
+        )
+
+
+# Compatibility import name.  The shape is now exactly NodePlacement; callers
+# must no longer construct a list of node blocks for first-release placement.
+NodeBlock = NodePlacement
 
 
 @dataclass(frozen=True)
 class PlacementSpec:
-    node_blocks: Tuple[NodeBlock, ...]
+    node: NodePlacement
+    model_signature: str
+    placement_digest: str
     tp: int = 1
     dp: int = 1
     pp: int = 1
-    model_signature: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.node, NodePlacement):
+            raise TypeError("PlacementSpec.node must be a NodePlacement")
+        if any(type(v) is not int or v <= 0 for v in (self.tp, self.dp, self.pp)):
+            raise ValueError("tp/dp/pp must be positive integers")
+        if not self.model_signature:
+            raise ValueError("model_signature must be nonempty")
+        if not self.placement_digest:
+            raise ValueError("placement_digest must be nonempty")
+        if self.dp != 1 or self.pp != 1:
+            raise ValueError("first-release PlacementSpec requires dp=1 and pp=1")
+        if self.world_size != self.tp:
+            raise ValueError("first-release PlacementSpec requires world_size == tp")
 
     @property
     def world_size(self) -> int:
-        return sum(len(block.gpus) for block in self.node_blocks)
+        return len(self.node.gpu_uuids)
 
     @property
     def gpu_uuids(self) -> Tuple[str, ...]:
-        return tuple(gpu.gpu_uuid for block in self.node_blocks for gpu in block.gpus)
+        return self.node.gpu_uuids
+
+    @property
+    def node_blocks(self) -> Tuple[NodePlacement, ...]:
+        """Compatibility read-only view; canonical shape is the single ``node``."""
+        return (self.node,)
 
 
 @dataclass(frozen=True)
 class PreparedReplica:
-    """A hidden runtime that has passed placement checks but is not routable."""
+    """A hidden runtime that passed placement checks but is not routable."""
 
     replica_id: str
     runtime_epoch: int
@@ -131,8 +209,13 @@ class TransferReceipt:
 
 
 @dataclass(frozen=True)
-class ReleaseReceipt:
-    """Evidence that a runtime no longer consumes the leased device resources."""
+class ReleaseEvidence:
+    """Verified physical-release evidence used by the current runtime adapter.
+
+    The full device/process detail remains a backend responsibility.  This core
+    value refuses to call a release complete without per-GPU observations and
+    all routing/CE/transfer/process fences being satisfied.
+    """
 
     replica_id: str
     runtime_epoch: int
@@ -143,7 +226,10 @@ class ReleaseReceipt:
     process_cleared_or_slept: bool
     per_gpu_hbm_free: Mapping[str, int] = field(default_factory=dict)
     reserved_residual: Mapping[str, int] = field(default_factory=dict)
-    release_kind: ReleaseKind = ReleaseKind.BORROWER_RELEASE
+    release_kind: ReleaseKind = ReleaseKind.BORROWER_RUNTIME_DESTROYED
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "release_kind", ReleaseKind(self.release_kind))
 
     @property
     def complete(self) -> bool:
@@ -153,7 +239,12 @@ class ReleaseReceipt:
             and self.no_inflight_transfer
             and self.process_cleared_or_slept
             and bool(self.per_gpu_hbm_free)
+            and all(value >= 0 for value in self.per_gpu_hbm_free.values())
         )
+
+
+# Compatibility alias only; canonical design name is ReleaseEvidence.
+ReleaseReceipt = ReleaseEvidence
 
 
 @dataclass(frozen=True)
@@ -172,14 +263,16 @@ class RuntimeCapabilities:
 
 
 @dataclass(frozen=True)
-class Command:
-    protocol_version: str
-    gs_epoch: int
+class OperationCommand:
+    """Current flat transport form of the public operation command."""
+
+    protocol_version: int
+    gs_epoch: str
     target_task_id: str
     target_task_session: str
     operation_id: str
     payload_digest: str
-    kind: OperationType
+    kind: OperationKind
     lease_id: str
     lease_epoch: int
     command_seq: int
@@ -188,32 +281,80 @@ class Command:
     expected_revision: int = 0
     placement: PlacementSpec | None = None
     candidate_epoch: int | None = None
-    recall_mode: str | None = None
+    recall_mode: RecallMode | None = None
     remaining_budget_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kind", OperationKind(self.kind))
+        if self.recall_mode is not None:
+            object.__setattr__(self, "recall_mode", RecallMode(self.recall_mode))
+        if self.kind is not OperationKind.REMOVE and self.recall_mode is RecallMode.FORCE_VERIFIED:
+            raise ValueError("FORCE_VERIFIED is valid only for REMOVE")
+        if self.lease_epoch < 0 or self.command_seq < 0 or self.expected_revision < 0:
+            raise ValueError("lease_epoch, command_seq and expected_revision must be nonnegative")
+        if self.remaining_budget_ms is not None and self.remaining_budget_ms < 0:
+            raise ValueError("remaining_budget_ms must be nonnegative")
+
+    @property
+    def context(self) -> OperationContext:
+        return OperationContext(
+            protocol_version=self.protocol_version,
+            gs_epoch=self.gs_epoch,
+            task_id=self.target_task_id,
+            task_session=self.target_task_session,
+            operation_id=self.operation_id,
+            lease_id=self.lease_id,
+            lease_epoch=self.lease_epoch,
+            command_seq=self.command_seq,
+            expected_revision=self.expected_revision,
+        )
+
+
+# Compatibility import name used by existing binding code.
+Command = OperationCommand
 
 
 @dataclass(frozen=True)
 class OperationResult:
     identity_fields: OperationContext
-    phase: str
+    phase: Phase
     phase_revision: int
-    state: str
-    actual_replica_state: str
+    state: OperationStatus
+    actual_replica_state: str | None
     routing_epoch: int | None = None
     ce_revision: int | None = None
     serving_version: int | None = None
-    release_receipt: ReleaseReceipt | None = None
-    error: str | None = None
+    release_receipt: ReleaseEvidence | None = None
+    error: object | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "phase", Phase(self.phase))
+        object.__setattr__(self, "state", OperationStatus(self.state))
+        if self.phase_revision < 0:
+            raise ValueError("phase_revision must be nonnegative")
+        if self.phase is Phase.DONE and self.state not in {
+            OperationStatus.SUCCEEDED,
+            OperationStatus.FAILED,
+            OperationStatus.UNKNOWN,
+        }:
+            raise ValueError("DONE requires a terminal operation status")
+
+    @property
+    def status(self) -> OperationStatus:
+        return self.state
+
+    @property
+    def replica_state(self) -> str | None:
+        return self.actual_replica_state
+
+    @property
+    def release(self) -> ReleaseEvidence | None:
+        return self.release_receipt
 
 
 @dataclass(frozen=True)
 class PublishedWeightSnapshot:
-    """Immutable reference to the exact published weight contents.
-
-    A version number is metadata only.  ADD/RESTORE must pin a real published
-    snapshot with a stable identity and non-empty manifest digest before any
-    target bootstrap starts.
-    """
+    """Immutable reference to the exact published weight contents."""
 
     snapshot_id: str
     manifest_digest: str
