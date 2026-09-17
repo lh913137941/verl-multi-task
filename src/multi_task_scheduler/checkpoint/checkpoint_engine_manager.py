@@ -1,17 +1,23 @@
 """Checkpoint Engine owner for the simplified E view.
 
-E membership is keyed by ReplicaKey and every committed mutation returns an
-idempotent CommitReceipt. Target-only bootstrap remains unavailable until the
-native transfer backend can return real WeightEvidence.
+E membership is keyed by ReplicaKey and stores only the receiver projection
+needed for normal parameter synchronization. Every committed mutation returns
+an idempotent CommitReceipt. Target-only bootstrap remains unavailable until
+the native transfer backend can return real WeightEvidence.
 """
 
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 
 from verl.checkpoint_engine.base import CheckpointEngineManager
 
-from multi_task_scheduler.orchestration.contracts import ServiceAction
+from multi_task_scheduler.orchestration.contracts import (
+    ReceiverRef,
+    ReplicaKey,
+    ServiceAction,
+)
 from multi_task_scheduler.orchestration.receipts import (
     CommitOwner,
     CommitReceipt,
@@ -22,6 +28,27 @@ from multi_task_scheduler.orchestration.receipts import (
 def _digest(*parts: object) -> str:
     data = "|".join(repr(part) for part in parts).encode("utf-8")
     return hashlib.sha256(data).hexdigest()
+
+
+@dataclass(frozen=True)
+class EffectiveReplicaEntry:
+    """CE-only projection of one effective parameter receiver membership."""
+
+    key: ReplicaKey
+    receivers: tuple[ReceiverRef, ...]
+    loaded_version: int
+    model_signature: str
+    membership_operation_id: str
+
+    def __post_init__(self) -> None:
+        if not self.receivers:
+            raise ValueError("EffectiveReplicaEntry requires receivers")
+        if self.loaded_version < 0:
+            raise ValueError("loaded_version must be nonnegative")
+        if not self.model_signature or not self.membership_operation_id:
+            raise ValueError(
+                "model_signature and membership_operation_id must be nonempty"
+            )
 
 
 class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
@@ -59,21 +86,42 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         expected_receivers = {receiver.receiver_id for receiver in prepared.receivers}
         if set(weight.receiver_versions) != expected_receivers:
             raise ValueError("WeightEvidence does not cover prepared receivers")
+        if any(version != weight.version for version in weight.receiver_versions.values()):
+            raise ValueError("WeightEvidence receiver versions must match loaded version")
+
         cache_key = (ctx.identity, prepared.key, ServiceAction.ADD)
         cached = self._commit_cache().get(cache_key)
         if cached is not None:
             return cached
 
         members = self._effective_replicas()
+        known_signatures = {entry.model_signature for entry in members.values()}
+        if known_signatures and prepared.model_signature not in known_signatures:
+            raise ValueError("prepared target model signature conflicts with effective CE set")
+
+        entry = EffectiveReplicaEntry(
+            key=prepared.key,
+            receivers=prepared.receivers,
+            loaded_version=weight.version,
+            model_signature=prepared.model_signature,
+            membership_operation_id=ctx.operation_id,
+        )
         existing = members.get(prepared.key)
-        if existing is not None and existing != prepared:
+        if existing is not None and existing != entry:
             raise ValueError("ReplicaKey already has conflicting CE membership")
         if existing is None:
-            members[prepared.key] = prepared
+            members[prepared.key] = entry
             self._effective_replica_revision = self._ensure_effective_revision() + 1
 
         revision = self._ensure_effective_revision()
-        digest = _digest("CE", "ADD", ctx.identity, prepared.key, revision, weight.version)
+        digest = _digest(
+            "CE",
+            "ADD",
+            ctx.identity,
+            prepared.key,
+            revision,
+            weight.header.digest,
+        )
         receipt = CommitReceipt(
             header=EvidenceHeader(
                 ctx=ctx,
