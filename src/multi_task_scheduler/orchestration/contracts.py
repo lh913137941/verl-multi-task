@@ -8,13 +8,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Generic, TYPE_CHECKING, Tuple, TypeVar
+from typing import Generic, Literal, TYPE_CHECKING, Tuple, TypeVar
 
 from .operation_journal import OperationKind, OperationStatus, Outcome, Phase
 
 if TYPE_CHECKING:
+    from .production_window import ProductionWindow
     from .receipts import ReleaseEvidence, ServiceEvidence
-    from .replica_record import ReplicaState
+    from .replica_record import ReplicaRecord, ReplicaState
 
 _T = TypeVar("_T")
 
@@ -32,6 +33,19 @@ class ReleaseKind(str, Enum):
 class ServiceAction(str, Enum):
     ADD = "ADD"
     REMOVE = "REMOVE"
+
+
+class RouteState(str, Enum):
+    HIDDEN = "HIDDEN"
+    ROUTABLE = "ROUTABLE"
+    DRAINING = "DRAINING"
+    REMOVED = "REMOVED"
+    QUARANTINED = "QUARANTINED"
+
+
+class SyncHealth(str, Enum):
+    HEALTHY = "HEALTHY"
+    BLOCKED = "BLOCKED"
 
 
 @dataclass(frozen=True)
@@ -221,6 +235,61 @@ class IdleCandidateReport:
             raise ValueError("valid_for_ms must be positive")
         if any(candidate.key.task_session != self.task_session for candidate in self.candidates):
             raise ValueError("candidate task_session must match report task_session")
+
+
+@dataclass(frozen=True)
+class RouteEntry:
+    key: ReplicaKey
+    head_server: object
+    state: RouteState
+    replica_route_epoch: int
+    sync_epoch: int
+    serving_version: int
+    commit_operation_id: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "state", RouteState(self.state))
+        if self.head_server is None:
+            raise ValueError("RouteEntry head_server must be present")
+        if self.replica_route_epoch < 0 or self.sync_epoch < 0 or self.serving_version < 0:
+            raise ValueError("route/sync epochs and serving_version must be nonnegative")
+        if not self.commit_operation_id:
+            raise ValueError("commit_operation_id must be nonempty")
+
+
+@dataclass(frozen=True)
+class CapacityRecord:
+    active_ids: frozenset[ReplicaKey]
+    revision: int
+    per_replica_limit: int
+    last_commit_operation_id: str
+
+    def __post_init__(self) -> None:
+        if self.revision < 0:
+            raise ValueError("capacity revision must be nonnegative")
+        if self.per_replica_limit <= 0:
+            raise ValueError("per_replica_limit must be positive")
+        if not self.last_commit_operation_id:
+            raise ValueError("last_commit_operation_id must be nonempty")
+
+    @property
+    def max_concurrent_samples(self) -> int:
+        return len(self.active_ids) * self.per_replica_limit
+
+
+@dataclass(frozen=True)
+class SyncSnapshot:
+    version: int
+    ce_revision: int
+    health: SyncHealth
+    owner_operation_id: str | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "health", SyncHealth(self.health))
+        if self.version < 0 or self.ce_revision < 0:
+            raise ValueError("sync version and ce_revision must be nonnegative")
+        if self.owner_operation_id is not None and not self.owner_operation_id:
+            raise ValueError("owner_operation_id must be nonempty when present")
 
 
 @dataclass(frozen=True)
@@ -435,6 +504,36 @@ class QueryResult(Generic[_T]):
         object.__setattr__(self, "outcome", Outcome(self.outcome))
         if self.found != (self.value is not None):
             raise ValueError("found must match whether value is present")
+
+
+@dataclass(frozen=True)
+class TaskSnapshot:
+    task_session: str
+    production: ProductionWindow
+    replica_records: Tuple[ReplicaRecord, ...]
+    ce_revision: int
+    lb_revision: int
+    capacity: CapacityRecord
+    sync_health: SyncHealth
+    current_operation_id: str | None
+    consistency: Literal["STABLE", "IN_PROGRESS", "UNKNOWN"]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "sync_health", SyncHealth(self.sync_health))
+        if not self.task_session:
+            raise ValueError("task_session must be nonempty")
+        if self.ce_revision < 0 or self.lb_revision < 0:
+            raise ValueError("CE/LB revisions must be nonnegative")
+        if getattr(self.production, "task_session", None) != self.task_session:
+            raise ValueError("production window must belong to TaskSnapshot task_session")
+        if any(record.key.task_session != self.task_session for record in self.replica_records):
+            raise ValueError("all replica records must belong to TaskSnapshot task_session")
+        if any(key.task_session != self.task_session for key in self.capacity.active_ids):
+            raise ValueError("all capacity active_ids must belong to TaskSnapshot task_session")
+        if self.current_operation_id is not None and not self.current_operation_id:
+            raise ValueError("current_operation_id must be nonempty when present")
+        if self.consistency not in {"STABLE", "IN_PROGRESS", "UNKNOWN"}:
+            raise ValueError("invalid TaskSnapshot consistency")
 
 
 @dataclass(frozen=True)
