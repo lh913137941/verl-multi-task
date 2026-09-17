@@ -31,6 +31,7 @@ from multi_task_scheduler.orchestration.operation_journal import (
     OperationStatus,
     Outcome,
     Phase,
+    operation_outcome,
 )
 from multi_task_scheduler.orchestration.production_window import (
     ProductionWindow,
@@ -149,6 +150,7 @@ def test_task_runner_submit_and_query_use_only_current_contract():
         OperationStatus=OperationStatus,
         Outcome=Outcome,
         Phase=Phase,
+        operation_outcome=operation_outcome,
         ServiceEvidence=ServiceEvidence,
         ReleaseEvidence=ReleaseEvidence,
     )
