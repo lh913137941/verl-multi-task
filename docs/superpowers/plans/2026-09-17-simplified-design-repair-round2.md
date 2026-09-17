@@ -9,6 +9,7 @@
 - [x] OperationContext 改为 `protocol_version: int`、`gs_epoch: str`，GS 启动生成新的 epoch 字符串。
 - [x] CompletionKey 改为 `(task_session, logical_sample_id)`，移除 turn/attempt 维度；首次提交保存并重放 CompletionEvidence。
 - [x] Ledger / OperationJournal 的 operation replay 校验覆盖完整业务身份、lease、command_seq、target 与摘要；`remaining_budget_ms` 不参与业务摘要，同号重试不能新建另一场操作或重置原受理操作的总时限。
+- [x] TaskRunner 严格执行“每任务一场生命周期操作”：同 operation_id 可幂等重放；不同 operation_id 必须等当前工单进入 DONE 后才能受理，并继续受严格递增 command_seq 保护。
 - [x] Ledger 合并 OperationResult 前核验完整 OperationContext 与 ReplicaKey；迟到旧 session/lease/seq 结果不能靠更高 revision 覆盖。
 - [x] PlacementSpec 首版收敛为单个 `NodePlacement` + `placement_digest`；删除旧多节点 `NodeBlock` wire shape，不保留兼容投影。
 - [x] ReleaseKind 对齐为 `DONOR_SLEEP_RELEASED / BORROWER_RUNTIME_DESTROYED`，公共证明统一使用 `ReleaseEvidence`；删除旧 `ReleaseReceipt` alias。
@@ -19,6 +20,7 @@
 - [x] GS 查询优先读取 TaskRunner 权威 operation journal，控制器不可达时只保守返回本地已知事实，不用健康状态猜执行结果。
 - [x] FORCE_VERIFIED continuation 必须显式证明 `old_terminal.device_finished=True`；缺字段不能默认通过。
 - [x] GS lease 授权闭环：释放边核验完整 `OperationResult + ServiceEvidence(REMOVE) + ReleaseEvidence`，要求逐 GPU 释放证明完整覆盖 lease placement，并把确认过的 release digest 绑定到后续 ADD/RESTORE authorization。
+- [x] GS GPU 使用权账本与 lease handoff 同步：donor 释放后整组 GPU 才显式授权 borrower；borrower 真实释放后整组清回 native 隐式使用权；placement、native owner、lease id/epoch 任一不匹配都拒绝且不做部分更新。
 - [x] 修正第一轮计划错误勾选，并更新相关 docstring 编号/语义。
 - [x] CPU Ray GS 集成测试迁移到新 protocol/epoch/placement/status 合同（仍需真实执行环境验证）。
 
