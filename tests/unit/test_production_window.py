@@ -54,7 +54,6 @@ def _activity(replica_id="r1", task_session="s1"):
         pending_admissions=0,
         transfer_inflight=False,
         all_backends_observed=True,
-        engine_digest=f"engine-{replica_id}",
     )
 
 
@@ -154,13 +153,15 @@ def test_selector_emits_full_idle_candidate_with_lb_source_seq():
         routable_count=3,
     )
     assert tuple(item.key.replica_id for item in result) == ("r1", "r2")
-    first = result[0]
+    first, second = result
     assert first.key.task_session == "s1"
     assert first.production_epoch == 3
     assert first.source_seq == 7
     assert first.manager_revision == 2
     assert first.lb_revision == 4
-    assert first.engine_digest == "engine-r1"
+    assert first.engine_digest
+    assert second.engine_digest
+    assert first.engine_digest != second.engine_digest
     assert first.reason == "CLOSED_STALENESS"
     assert first.stable_idle_ms == 500
     assert first.observed_age_ms == 10
