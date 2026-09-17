@@ -28,6 +28,7 @@ from multi_task_scheduler.orchestration.operation_journal import (
     OperationStatus,
     Outcome,
 )
+from multi_task_scheduler.orchestration.receipts import ReleaseEvidence, ServiceEvidence
 from multi_task_scheduler.scheduler.discovery import get_or_create_group_scheduler
 
 from .rollouter import MultiTaskFullyAsyncRollouter
@@ -53,6 +54,49 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         if not hasattr(self, "_last_command_seq_by_target"):
             self._last_command_seq_by_target = {}
         return self._last_command_seq_by_target
+
+    @staticmethod
+    def _result_from_record(record) -> OperationResult:
+        """Project the journal's latest lifecycle proofs into the public result."""
+        service = None
+        release = None
+        for phase_result in record.phase_results.values():
+            if isinstance(phase_result, ServiceEvidence):
+                if (
+                    service is None
+                    or phase_result.header.phase_revision
+                    >= service.header.phase_revision
+                ):
+                    service = phase_result
+            elif isinstance(phase_result, ReleaseEvidence):
+                if (
+                    release is None
+                    or phase_result.header.phase_revision
+                    >= release.header.phase_revision
+                ):
+                    release = phase_result
+
+        return OperationResult(
+            ctx=record.command.ctx,
+            target=record.command.target,
+            status=record.status,
+            phase=record.phase,
+            phase_revision=record.phase_revision,
+            service=service,
+            release=release,
+            error=record.error,
+        )
+
+    @staticmethod
+    def _query_outcome(record) -> Outcome:
+        if record.status is OperationStatus.ACCEPTED:
+            return Outcome.KNOWN_NOT_APPLIED
+        if record.status is OperationStatus.SUCCEEDED:
+            return Outcome.KNOWN_APPLIED
+        if record.status is OperationStatus.FAILED:
+            error_outcome = getattr(record.error, "outcome", None)
+            return Outcome.UNKNOWN if error_outcome is None else Outcome(error_outcome)
+        return Outcome.UNKNOWN
 
     def submit_operation(self, command: OperationCommand) -> OperationResult:
         """Validate/idempotently accept one complete lifecycle command.
@@ -87,14 +131,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             record = journal.begin(command)
             fences[command.target] = command.ctx.command_seq
 
-        return OperationResult(
-            ctx=record.command.ctx,
-            target=record.command.target,
-            status=record.status,
-            phase=record.phase,
-            phase_revision=record.phase_revision,
-            error=record.error,
-        )
+        return self._result_from_record(record)
 
     def query_operation(
         self, task_session: str, operation_id: str
@@ -103,21 +140,11 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         record = self._ensure_journal().query(operation_id)
         if record is None or record.command.ctx.task_session != task_session:
             return QueryResult(found=False, value=None, outcome=Outcome.UNKNOWN)
-        result = OperationResult(
-            ctx=record.command.ctx,
-            target=record.command.target,
-            status=record.status,
-            phase=record.phase,
-            phase_revision=record.phase_revision,
-            error=record.error,
+        return QueryResult(
+            found=True,
+            value=self._result_from_record(record),
+            outcome=self._query_outcome(record),
         )
-        if record.status is OperationStatus.ACCEPTED:
-            outcome = Outcome.KNOWN_NOT_APPLIED
-        elif record.status in {OperationStatus.SUCCEEDED, OperationStatus.FAILED}:
-            outcome = Outcome.KNOWN_APPLIED
-        else:
-            outcome = Outcome.UNKNOWN
-        return QueryResult(found=True, value=result, outcome=outcome)
 
     def probe_task(self, task_session: str):
         """The full TaskSnapshot needs real M/E/R/C owner observations."""
