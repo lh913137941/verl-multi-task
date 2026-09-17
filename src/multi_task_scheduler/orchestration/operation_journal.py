@@ -1,11 +1,4 @@
-"""Replayable operation journal aligned with simplified design §6.3.
-
-The journal stores the accepted full OperationCommand as the immutable source
-of identity. ``status`` and ``phase`` are independent facts: DONE never implies
-success by itself, and RECONCILE represents unresolved side effects. The first
-accepted transport budget also freezes the operation deadline; retries cannot
-extend the total lifecycle timeout.
-"""
+"""Replayable lifecycle journal and its acceptance fences."""
 
 from __future__ import annotations
 
@@ -59,7 +52,7 @@ class ExpiredLeaseError(RuntimeError):
 
 
 class OperationIdentityError(RuntimeError):
-    """An operation ID was replayed with conflicting immutable business identity."""
+    """A replay or newly accepted operation conflicts with journal fences."""
 
 
 class IllegalOperationTransitionError(RuntimeError):
@@ -111,7 +104,7 @@ def _default_status_for_phase(phase: Phase) -> OperationStatus:
 
 
 def _require_command_shape(command: object) -> None:
-    """Avoid importing contracts.py here because it imports these enums."""
+    """Validate the journal-facing command shape without importing contracts."""
     try:
         ctx = command.ctx
         target = command.target
@@ -130,7 +123,7 @@ def _require_command_shape(command: object) -> None:
 
 
 def _command_identity(command: object) -> tuple:
-    """Immutable business identity; transport budget is not part of replay identity."""
+    """Immutable business identity; transport budget is not replay identity."""
     return (
         command.ctx,
         OperationKind(command.kind),
@@ -152,9 +145,9 @@ class OperationRecord:
     phase_results: dict[Phase, object] = field(default_factory=dict)
     phase_timings_ms: dict[Phase, int] = field(default_factory=dict)
     error: object | None = None
-    detail: dict[str, object] = field(default_factory=dict)
-    created_at: float = field(default_factory=time.monotonic)
-    updated_at: float = field(default_factory=time.monotonic)
+    deadline_at: float = 0.0
+    created_at: float = 0.0
+    updated_at: float = 0.0
 
     @property
     def operation_id(self) -> str:
@@ -172,19 +165,10 @@ class OperationRecord:
 class OperationJournal:
     def __init__(self, *, clock=None) -> None:
         self._records: dict[str, OperationRecord] = {}
-        self._deadlines: dict[str, float] = {}
         self._clock = time.monotonic if clock is None else clock
-        self._validation_frozen = False
-
-    @property
-    def validation_frozen(self) -> bool:
-        return self._validation_frozen
-
-    def set_validation_freeze(self, frozen: bool) -> None:
-        self._validation_frozen = bool(frozen)
 
     def begin(self, command: object) -> OperationRecord:
-        """Accept one full command idempotently without executing side effects."""
+        """Idempotently accept one command while enforcing task/sequence fences."""
         _require_command_shape(command)
         operation_id = command.ctx.operation_id
         existing = self._records.get(operation_id)
@@ -204,17 +188,48 @@ class OperationJournal:
                 )
             return existing
 
-        record = OperationRecord(command=command)
-        self._records[operation_id] = record
-        self._deadlines[operation_id] = (
-            self._clock() + command.remaining_budget_ms / 1000.0
+        active = next(
+            (
+                record
+                for record in self._records.values()
+                if record.command.ctx.task_session == command.ctx.task_session
+                and record.phase is not Phase.DONE
+            ),
+            None,
         )
+        if active is not None:
+            raise OperationIdentityError(
+                "another lifecycle operation is active for this task: "
+                f"{active.operation_id!r}"
+            )
+
+        prior_sequences = [
+            record.command.ctx.command_seq
+            for record in self._records.values()
+            if record.target == command.target
+        ]
+        if prior_sequences and command.ctx.command_seq <= max(prior_sequences):
+            raise OperationIdentityError(
+                f"stale command_seq {command.ctx.command_seq} for {command.target!r}; "
+                f"last accepted sequence is {max(prior_sequences)}"
+            )
+
+        now = self._clock()
+        record = OperationRecord(
+            command=command,
+            deadline_at=now + command.remaining_budget_ms / 1000.0,
+            created_at=now,
+            updated_at=now,
+        )
+        self._records[operation_id] = record
         return record
 
     def remaining_budget_ms(self, operation_id: str) -> int:
-        """Return remaining budget from the first acceptance deadline, never a retry."""
-        deadline = self._deadlines[operation_id]
-        return max(0, int((deadline - self._clock()) * 1000))
+        """Return the first acceptance budget; retries never extend it."""
+        return max(
+            0,
+            int((self._records[operation_id].deadline_at - self._clock()) * 1000),
+        )
 
     def require(self, operation_id: str, lease_epoch: int) -> OperationRecord:
         record = self._records[operation_id]
@@ -237,7 +252,6 @@ class OperationJournal:
         phase_result: object | None = None,
         elapsed_ms: int | None = None,
         error: object | None = None,
-        detail: dict[str, object] | None = None,
     ) -> OperationRecord:
         record = self._records[operation_id]
         new_phase = Phase(new_phase)
@@ -280,10 +294,7 @@ class OperationJournal:
         if error is not None:
             record.error = error
             changed = True
-        if detail:
-            record.detail.update(detail)
-            changed = True
         if changed:
             record.phase_revision += 1
-            record.updated_at = time.monotonic()
+            record.updated_at = self._clock()
         return record
