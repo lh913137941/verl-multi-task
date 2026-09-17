@@ -10,7 +10,6 @@ from multi_task_scheduler.orchestration.production_window import (
     ReplicaView,
     ServerActivity,
     WindowState,
-    candidate,
     select_idle_candidates,
 )
 
@@ -41,11 +40,7 @@ def _window(
 
 def _activity(replica_id="r1", task_session="s1", *, engine_seq=5):
     return ServerActivity(
-        key=ReplicaKey(
-            task_session=task_session,
-            replica_id=replica_id,
-            runtime_epoch=0,
-        ),
+        key=ReplicaKey(task_session=task_session, replica_id=replica_id, runtime_epoch=0),
         engine_seq=engine_seq,
         observed_age_ms=10,
         admitting=0,
@@ -68,12 +63,23 @@ def _view(replica_id="r1", task_session="s1", gpu_count=1):
     )
 
 
+def _select(view, *, window=None, fresh=True, minimum=0, active=2, routable=2, seq=1):
+    return select_idle_candidates(
+        window or _window(),
+        [view],
+        source_seq=seq,
+        observations_fresh=fresh,
+        min_active_gpus=minimum,
+        current_active_gpus=active,
+        routable_count=routable,
+    )
+
+
 def test_window_idle_uses_explicit_state_and_known_zero_p_h():
     assert _window().idle is True
     assert _window().idle_reason == "CLOSED_STALENESS"
     assert _window(state=WindowState.CLOSED_BACKPRESSURE).idle_reason == "CLOSED_BACKPRESSURE"
     assert _window(state=WindowState.EXHAUSTED).idle_reason == "EXHAUSTED"
-
     assert not _window(state=WindowState.OPEN).idle
     assert not _window(state=WindowState.UNKNOWN).idle
     assert not _window(eligible_pending=None).idle
@@ -88,58 +94,19 @@ def test_window_validates_native_fact_shape_without_reimplementing_thresholds():
         replace(_window(), task_session="")
 
 
-def test_candidate_rejects_stale_unknown_or_conflicting_owner_facts():
-    window = _window()
-    assert not candidate(
-        window,
-        _view(),
-        observations_fresh=False,
-        keeps_min_active_gpus=True,
-        leaves_routable=True,
-    )
-    assert not candidate(
-        window,
-        _view(task_session="other"),
-        observations_fresh=True,
-        keeps_min_active_gpus=True,
-        leaves_routable=True,
-    )
-
-    unknown = replace(_activity(), queued=None)
-    assert not candidate(
-        window,
-        replace(_view(), activity=unknown),
-        observations_fresh=True,
-        keeps_min_active_gpus=True,
-        leaves_routable=True,
-    )
-
-    transferring = replace(_activity(), transfer_inflight=True)
-    assert not candidate(
-        window,
-        replace(_view(), activity=transferring),
-        observations_fresh=True,
-        keeps_min_active_gpus=True,
-        leaves_routable=True,
-    )
-
-    blocked_sync = replace(_view(), sync_healthy=False)
-    assert not candidate(
-        window,
-        blocked_sync,
-        observations_fresh=True,
-        keeps_min_active_gpus=True,
-        leaves_routable=True,
-    )
-
-    unsettled = replace(_view(), attempts_settled=False)
-    assert not candidate(
-        window,
-        unsettled,
-        observations_fresh=True,
-        keeps_min_active_gpus=True,
-        leaves_routable=True,
-    )
+@pytest.mark.parametrize(
+    ("view", "fresh"),
+    [
+        (_view(), False),
+        (_view(task_session="other"), True),
+        (replace(_view(), activity=replace(_activity(), queued=None)), True),
+        (replace(_view(), activity=replace(_activity(), transfer_inflight=True)), True),
+        (replace(_view(), sync_healthy=False), True),
+        (replace(_view(), attempts_settled=False), True),
+    ],
+)
+def test_selector_rejects_stale_unknown_or_conflicting_owner_facts(view, fresh):
+    assert _select(view, fresh=fresh) == ()
 
 
 def test_selector_emits_full_idle_candidate_with_lb_source_seq():
@@ -159,7 +126,6 @@ def test_selector_emits_full_idle_candidate_with_lb_source_seq():
     assert first.source_seq == 7
     assert first.manager_revision == 2
     assert first.lb_revision == 4
-    assert first.engine_digest
     assert first.engine_digest == _activity("r1").digest
     assert first.reason == "CLOSED_STALENESS"
     assert first.stable_idle_ms == 500
@@ -170,54 +136,18 @@ def test_selector_emits_full_idle_candidate_with_lb_source_seq():
 
 
 def test_engine_digest_changes_when_server_observation_changes():
-    first = _activity(engine_seq=5)
-    second = _activity(engine_seq=6)
-    assert first.digest
-    assert second.digest
-    assert first.digest != second.digest
+    assert _activity(engine_seq=5).digest != _activity(engine_seq=6).digest
 
 
 def test_selector_respects_capacity_and_routable_lower_bounds():
-    assert select_idle_candidates(
-        _window(),
-        [_view("r1", gpu_count=4)],
-        source_seq=1,
-        observations_fresh=True,
-        min_active_gpus=8,
-        current_active_gpus=8,
-        routable_count=2,
-    ) == ()
-    assert select_idle_candidates(
-        _window(),
-        [_view("r1", gpu_count=1)],
-        source_seq=2,
-        observations_fresh=True,
-        min_active_gpus=0,
-        current_active_gpus=1,
-        routable_count=1,
-    ) == ()
+    assert _select(_view(gpu_count=4), minimum=8, active=8) == ()
+    assert _select(_view(), active=1, routable=1, seq=2) == ()
 
 
 def test_source_seq_is_external_to_production_window():
     window = _window(epoch=4, revision=12)
-    first = select_idle_candidates(
-        window,
-        [_view()],
-        source_seq=10,
-        observations_fresh=True,
-        min_active_gpus=0,
-        current_active_gpus=2,
-        routable_count=2,
-    )[0]
-    second = select_idle_candidates(
-        window,
-        [_view()],
-        source_seq=11,
-        observations_fresh=True,
-        min_active_gpus=0,
-        current_active_gpus=2,
-        routable_count=2,
-    )[0]
+    first = _select(_view(), window=window, seq=10)[0]
+    second = _select(_view(), window=window, seq=11)[0]
     assert window.epoch == 4 and window.revision == 12
     assert first.source_seq == 10
     assert second.source_seq == 11
