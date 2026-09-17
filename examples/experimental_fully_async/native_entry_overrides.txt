@@ -1,6 +1,7 @@
 # Append to the native experimental Fully Async entry, with your model/data/resources.
-# Native main/config must contain the companion profile bridge.
-multitask.runtime.profile=experimental_fully_async_standalone
+# Install verl-multitask in the training environment on every Ray node.
+# Native main/config must contain the optional plugin bridge.
+multitask.enabled=true
 actor_rollout_ref.hybrid_engine=false
 actor_rollout_ref.rollout.name=vllm
 actor_rollout_ref.rollout.mode=async

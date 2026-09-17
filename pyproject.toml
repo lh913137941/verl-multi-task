@@ -5,10 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "verl-multitask"
 version = "0.1.0.dev0"
-description = "Source-first MultiTask passthrough integration for verl experimental Fully Async"
+description = "Optional MultiTask runtime integration for verl experimental Fully Async"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest==8.3.5", "PyYAML==6.0.2", "hydra-core==1.3.2"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
