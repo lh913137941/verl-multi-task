@@ -1,15 +1,16 @@
-"""Idle-bubble sensing that emits canonical ``IdleCandidate`` evidence.
+"""Idle-bubble sensing aligned with the simplified fusion design §6.6.
 
-Missing observations are UNKNOWN, never zero. A candidate is emitted only when
-production, Manager, LB and engine facts are all present, fresh and mutually
-consistent. The result is directly suitable for ``IdleCandidateReport``; no
-ID-only candidate wrapper exists.
+ProductionWindow is the Rollouter-owned task production fact. ServerActivity is
+the per-runtime engine observation. LB combines those facts with Manager/LB
+revisions and capacity/sync checks to freeze an IdleCandidate. ``source_seq``
+is intentionally supplied by LB and is not a ProductionWindow field.
 """
 
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from enum import Enum
 from typing import Sequence
 
 from .contracts import IdleCandidate, ReplicaKey
@@ -20,25 +21,88 @@ def _digest(*parts: object) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+class WindowState(str, Enum):
+    OPEN = "OPEN"
+    CLOSED_STALENESS = "CLOSED_STALENESS"
+    CLOSED_BACKPRESSURE = "CLOSED_BACKPRESSURE"
+    EXHAUSTED = "EXHAUSTED"
+    UNKNOWN = "UNKNOWN"
+
+
 @dataclass(frozen=True)
-class ReplicaObservation:
-    """Versioned Server/LB activity facts for one exact runtime."""
+class ProductionWindow:
+    """Rollouter-owned versioned production facts for one task session."""
+
+    task_session: str
+    epoch: int
+    revision: int
+    state: WindowState
+    eligible_pending: int | None
+    held_samples: int | None
+    active_samples: int
+    output_queue_size: int
+    max_queue_size: int
+    producer_exhausted: bool
+    policy_refresh_inflight: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "state", WindowState(self.state))
+        if not self.task_session:
+            raise ValueError("task_session must be nonempty")
+        if self.epoch < 0 or self.revision < 0:
+            raise ValueError("production epoch/revision must be nonnegative")
+        for value in (self.eligible_pending, self.held_samples):
+            if value is not None and value < 0:
+                raise ValueError("P/H must be nonnegative when observed")
+        for value in (
+            self.active_samples,
+            self.output_queue_size,
+            self.max_queue_size,
+        ):
+            if value < 0:
+                raise ValueError("production counters must be nonnegative")
+        if self.output_queue_size > self.max_queue_size:
+            raise ValueError("output_queue_size cannot exceed max_queue_size")
+
+    @property
+    def idle(self) -> bool:
+        """Whether the task window supports considering an idle replica.
+
+        The state itself is produced by the native Rollouter logic; this helper
+        does not reimplement staleness/backpressure thresholds. P/H must be
+        explicitly observed as zero and a policy refresh cannot be in flight.
+        """
+        return (
+            self.state
+            in {
+                WindowState.CLOSED_STALENESS,
+                WindowState.CLOSED_BACKPRESSURE,
+                WindowState.EXHAUSTED,
+            }
+            and self.eligible_pending == 0
+            and self.held_samples == 0
+            and not self.policy_refresh_inflight
+        )
+
+    @property
+    def idle_reason(self) -> str | None:
+        return self.state.value if self.idle else None
+
+
+@dataclass(frozen=True)
+class ServerActivity:
+    """All-backend activity observation for one exact runtime."""
 
     key: ReplicaKey
     engine_seq: int
     observed_age_ms: int
+    admitting: int | None
+    queued: int | None
+    running: int | None
+    pending_admissions: int | None
+    transfer_inflight: bool
+    all_backends_observed: bool
     engine_digest: str
-    in_flight: int | None = None
-    admitting: int | None = None
-    queued: int | None = None
-    running: int | None = None
-    pending_admissions: int | None = None
-    production_epoch: int | None = None
-    all_backends_observed: bool = False
-    is_active_native: bool = True
-    transfer_inflight: bool = False
-    concurrent_validation: bool = False
-    concurrent_scaling: bool = False
 
     def __post_init__(self) -> None:
         if self.engine_seq < 0 or self.observed_age_ms < 0:
@@ -46,7 +110,6 @@ class ReplicaObservation:
         if not self.engine_digest:
             raise ValueError("engine_digest must be nonempty")
         for value in (
-            self.in_flight,
             self.admitting,
             self.queued,
             self.running,
@@ -59,80 +122,34 @@ class ReplicaObservation:
     def quiet(self) -> bool:
         return (
             self.all_backends_observed
-            and self.pending_admissions == 0
-            and self.in_flight == 0
             and self.admitting == 0
             and self.queued == 0
             and self.running == 0
-        )
-
-    @property
-    def scalable(self) -> bool:
-        return (
-            self.is_active_native
+            and self.pending_admissions == 0
             and not self.transfer_inflight
-            and not self.concurrent_validation
-            and not self.concurrent_scaling
         )
-
-
-@dataclass(frozen=True)
-class ProductionWindow:
-    """Versioned production-side facts used by the idle-candidate predicate."""
-
-    production_epoch: int = 0
-    source_seq: int = 0
-    production_revision: int = 0
-    eligible_pending: int | None = None
-    held: int | None = None
-    policy_refresh_inflight: bool = False
-    closed_by_staleness: bool = False
-    closed_by_backpressure: bool = False
-    exhausted_this_round: bool = False
-
-    def __post_init__(self) -> None:
-        if self.production_epoch < 0 or self.source_seq < 0 or self.production_revision < 0:
-            raise ValueError("production revisions must be nonnegative")
-        for value in (self.eligible_pending, self.held):
-            if value is not None and value < 0:
-                raise ValueError("production counts must be nonnegative when observed")
-
-    @property
-    def idle(self) -> bool:
-        if self.policy_refresh_inflight:
-            return False
-        if self.eligible_pending != 0 or self.held != 0:
-            return False
-        return (
-            self.closed_by_staleness
-            or self.closed_by_backpressure
-            or self.exhausted_this_round
-        )
-
-    @property
-    def idle_reason(self) -> str | None:
-        """Return the canonical reason or None when the window is not idle."""
-        if not self.idle:
-            return None
-        if self.closed_by_staleness:
-            return "CLOSED_STALENESS"
-        if self.closed_by_backpressure:
-            return "CLOSED_BACKPRESSURE"
-        if self.exhausted_this_round:
-            return "EXHAUSTED"
-        return None
 
 
 @dataclass(frozen=True)
 class ReplicaView:
-    """Cross-owner facts required to freeze one ``IdleCandidate``."""
+    """LB-local aggregate of the cross-owner facts needed for donation sensing.
 
-    observation: ReplicaObservation
+    This is an implementation helper, not a public wire type. The booleans are
+    already-validated facts from Manager/capacity/sync/attempt owners; they are
+    kept outside ServerActivity so that the public ServerActivity shape remains
+    exactly the design contract.
+    """
+
+    activity: ServerActivity
     manager_revision: int
     lb_revision: int
     placement_digest: str
     stable_idle_ms: int
     gpu_count: int = 1
+    active_native: bool = True
+    sync_healthy: bool = True
+    attempts_settled: bool = True
+    lifecycle_conflict: bool = False
 
     def __post_init__(self) -> None:
         for value in (
@@ -147,6 +164,15 @@ class ReplicaView:
         if not self.placement_digest:
             raise ValueError("placement_digest must be nonempty")
 
+    @property
+    def eligible(self) -> bool:
+        return (
+            self.active_native
+            and self.sync_healthy
+            and self.attempts_settled
+            and not self.lifecycle_conflict
+        )
+
 
 def candidate(
     window: ProductionWindow,
@@ -156,14 +182,12 @@ def candidate(
     keeps_min_active_gpus: bool,
     leaves_routable: bool,
 ) -> bool:
-    observation = view.observation
-    if not observations_fresh:
+    activity = view.activity
+    if activity.key.task_session != window.task_session:
         return False
-    if observation.production_epoch != window.production_epoch:
+    if not observations_fresh or not window.idle:
         return False
-    if not window.idle or window.idle_reason is None:
-        return False
-    if not observation.quiet or not observation.scalable:
+    if not activity.quiet or not view.eligible:
         return False
     if not keeps_min_active_gpus or not leaves_routable:
         return False
@@ -174,12 +198,15 @@ def select_idle_candidates(
     window: ProductionWindow,
     replicas: Sequence[ReplicaView],
     *,
+    source_seq: int,
     observations_fresh: bool,
     min_active_gpus: int,
     current_active_gpus: int,
     routable_count: int,
 ) -> tuple[IdleCandidate, ...]:
-    """Return a complete set of evidence-bearing idle candidates."""
+    """Freeze one complete candidate set using the LB-owned observation seq."""
+    if source_seq < 0:
+        raise ValueError("source_seq must be nonnegative")
     if min_active_gpus < 0 or current_active_gpus < 0 or routable_count < 0:
         raise ValueError("capacity counts must be nonnegative")
 
@@ -196,51 +223,46 @@ def select_idle_candidates(
             leaves_routable=leaves_routable,
         ):
             continue
-        observation = view.observation
+
+        activity = view.activity
         evidence_digest = _digest(
-            observation.key,
-            window.production_epoch,
-            window.source_seq,
-            window.production_revision,
+            activity.key,
+            window.task_session,
+            window.epoch,
+            window.revision,
+            window.state,
+            window.eligible_pending,
+            window.held_samples,
+            window.active_samples,
+            window.output_queue_size,
+            window.max_queue_size,
+            window.producer_exhausted,
+            window.policy_refresh_inflight,
+            source_seq,
             view.manager_revision,
             view.lb_revision,
-            observation.engine_seq,
-            observation.engine_digest,
+            activity.engine_seq,
+            activity.engine_digest,
             reason,
             view.stable_idle_ms,
-            observation.observed_age_ms,
+            activity.observed_age_ms,
             view.gpu_count,
             view.placement_digest,
         )
         result.append(
             IdleCandidate(
-                key=observation.key,
-                production_epoch=window.production_epoch,
-                source_seq=window.source_seq,
+                key=activity.key,
+                production_epoch=window.epoch,
+                source_seq=source_seq,
                 manager_revision=view.manager_revision,
                 lb_revision=view.lb_revision,
-                engine_digest=observation.engine_digest,
+                engine_digest=activity.engine_digest,
                 reason=reason,
                 stable_idle_ms=view.stable_idle_ms,
-                observed_age_ms=observation.observed_age_ms,
+                observed_age_ms=activity.observed_age_ms,
                 gpu_count=view.gpu_count,
                 evidence_digest=evidence_digest,
                 placement_digest=view.placement_digest,
             )
         )
     return tuple(result)
-
-
-def advance_source_seq(window: ProductionWindow) -> ProductionWindow:
-    """Invalidate previous candidate observations without changing their epoch."""
-    return ProductionWindow(
-        production_epoch=window.production_epoch,
-        source_seq=window.source_seq + 1,
-        production_revision=window.production_revision,
-        eligible_pending=window.eligible_pending,
-        held=window.held,
-        policy_refresh_inflight=window.policy_refresh_inflight,
-        closed_by_staleness=window.closed_by_staleness,
-        closed_by_backpressure=window.closed_by_backpressure,
-        exhausted_this_round=window.exhausted_this_round,
-    )
