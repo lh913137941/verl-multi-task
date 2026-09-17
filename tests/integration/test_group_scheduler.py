@@ -1,4 +1,4 @@
-"""Selected CPU Ray tests: GS discovery, handles and test-only subclass creation.
+"""Selected CPU Ray tests for GS discovery, handles and simplified contracts.
 
 These tests do not import verl or claim validation of GPU/native trainer actors.
 Run this file explicitly; it creates and removes only its own test actors.
@@ -12,21 +12,19 @@ import ray
 
 from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
 from multi_task_scheduler.orchestration.contracts import (
-    Command,
-    GpuPlacement,
-    NodeBlock,
-    OperationContext,
+    NodePlacement,
+    OperationCommand,
     OperationResult,
     PlacementSpec,
 )
-from multi_task_scheduler.orchestration.operation_journal import OperationType
+from multi_task_scheduler.orchestration.operation_journal import (
+    OperationKind,
+    OperationStatus,
+    Phase,
+)
 from multi_task_scheduler.scheduler import discovery
 from multi_task_scheduler.scheduler.group_scheduler import RUNTIME_KIND
-from multi_task_scheduler.scheduler.ledger import (
-    IdleReport,
-    LeaseRecord,
-    ResourceManifest,
-)
+from multi_task_scheduler.scheduler.ledger import IdleReport, LeaseRecord, ResourceManifest
 
 
 pytestmark = pytest.mark.ray_integration
@@ -58,7 +56,13 @@ def isolated_ray(monkeypatch):
     namespace = f"multitask-test-{uuid.uuid4().hex}"
     monkeypatch.setattr(discovery, "GROUP_SCHEDULER_NAME", name)
     monkeypatch.setattr(discovery, "GROUP_SCHEDULER_NAMESPACE", namespace)
-    ray.init(address="local", num_cpus=2, num_gpus=0, include_dashboard=False, _node_ip_address="127.0.0.1")
+    ray.init(
+        address="local",
+        num_cpus=2,
+        num_gpus=0,
+        include_dashboard=False,
+        _node_ip_address="127.0.0.1",
+    )
     try:
         yield
     finally:
@@ -79,7 +83,9 @@ def test_discovery_requires_an_initialized_ray_runtime():
 
 def test_concurrent_discovery_returns_one_real_scheduler_and_round_trips_handles(isolated_ray):
     with ThreadPoolExecutor(max_workers=4) as executor:
-        schedulers = list(executor.map(lambda _: discovery.get_or_create_group_scheduler(), range(8)))
+        schedulers = list(
+            executor.map(lambda _: discovery.get_or_create_group_scheduler(), range(8))
+        )
     assert all(isinstance(scheduler, ray.actor.ActorHandle) for scheduler in schedulers)
     assert len({scheduler._actor_id for scheduler in schedulers}) == 1
     scheduler = schedulers[0]
@@ -127,61 +133,106 @@ def test_real_ray_unwrap_subclass_and_remote_constructor_delegate_to_parent(isol
 
 
 def _placement():
-    block = NodeBlock(
+    node = NodePlacement(
         node_id="n1",
-        gpus=(GpuPlacement(gpu_uuid="u0", physical_id=0, global_rank=0, local_rank=0),),
+        gpu_uuids=("u0",),
+        physical_gpu_ids=(0,),
+        global_ranks=(0,),
+        local_ranks=(0,),
     )
-    return PlacementSpec(node_blocks=(block,), model_signature="sig-1")
+    return PlacementSpec(
+        node=node,
+        model_signature="sig-1",
+        placement_digest="placement-u0",
+    )
 
 
-def _command(operation_id="op-1", digest="d1"):
-    return Command(
-        protocol_version="p1", gs_epoch=1, target_task_id="task-a",
-        target_task_session="s1", operation_id=operation_id, payload_digest=digest,
-        kind=OperationType.ADD, lease_id="l1", lease_epoch=0,
-        command_seq=0, replica_id="r1",
+def _command(protocol_version, gs_epoch, operation_id="op-1", digest="d1"):
+    return OperationCommand(
+        protocol_version=protocol_version,
+        gs_epoch=gs_epoch,
+        target_task_id="task-a",
+        target_task_session="s1",
+        operation_id=operation_id,
+        payload_digest=digest,
+        kind=OperationKind.ADD,
+        lease_id="l1",
+        lease_epoch=0,
+        command_seq=0,
+        replica_id="r1",
     )
 
 
 def test_gs_control_interfaces_round_trip(isolated_ray):
-    """The section 4.4 interfaces store intent and merge receipts, no policy."""
+    """GS stores fenced intent and merges typed progress; no GPU policy is claimed."""
     scheduler = discovery.get_or_create_group_scheduler()
     task = TaskRunnerProbe.remote()
     try:
         attached = ray.get(scheduler.attach_controller.remote("task-a", "s1", task))
         assert attached["status"] == "INITIALIZING"
+        protocol_version = attached["protocol_version"]
+        gs_epoch = attached["gs_epoch"]
+        assert type(protocol_version) is int
+        assert isinstance(gs_epoch, str) and gs_epoch
 
-        manifest = ResourceManifest(owner_task_session="s1", placement=_placement(), replica_id="r1")
+        manifest = ResourceManifest(
+            owner_task_session="s1", placement=_placement(), replica_id="r1"
+        )
         assert ray.get(scheduler.register_resources.remote("reg-1", manifest))["status"] == "READY"
 
-        assert ray.get(scheduler.submit_operation.remote(_command()))["state"] == "ACCEPTED"
-        # Same ID, conflicting digest -> REJECTED, never overwrites intent.
-        rejected = ray.get(scheduler.submit_operation.remote(_command(digest="other")))
-        assert rejected["state"] == "REJECTED"
+        command = _command(protocol_version, gs_epoch)
+        assert ray.get(scheduler.submit_operation.remote(command))["status"] == "ACCEPTED"
+        rejected = ray.get(
+            scheduler.submit_operation.remote(
+                _command(protocol_version, gs_epoch, digest="other")
+            )
+        )
+        assert rejected["status"] == "FAILED"
+
+        stale = ray.get(
+            scheduler.submit_operation.remote(
+                _command(protocol_version, "old-gs", operation_id="op-stale")
+            )
+        )
+        assert stale["status"] == "FAILED"
 
         query = ray.get(scheduler.query_operation.remote("op-1"))
-        assert query["phase"] == "ACCEPTED"
+        assert query["phase"] == Phase.VALIDATE.value
+        assert query["status"] == OperationStatus.ACCEPTED.value
 
         result = OperationResult(
-            identity_fields=OperationContext(
-                protocol_version="p1", gs_epoch=1, task_id="task-a", task_session="s1",
-                operation_id="op-1", lease_id="l1", lease_epoch=0, command_seq=0,
-            ),
-            phase="APPLYING", phase_revision=1, state="COMMITTED",
-            actual_replica_state="ACTIVE",
+            identity_fields=command.context,
+            phase=Phase.CREATE,
+            phase_revision=1,
+            state=OperationStatus.RUNNING,
+            actual_replica_state="PREPARING",
         )
         assert ray.get(scheduler.report_operation_result.remote(result))["merged"] is True
-        assert ray.get(scheduler.query_operation.remote("op-1"))["final_result"].state == "COMMITTED"
+        merged = ray.get(scheduler.query_operation.remote("op-1"))["final_result"]
+        assert merged.status is OperationStatus.RUNNING
+        assert merged.phase is Phase.CREATE
 
         snapshot = ray.get(scheduler.get_resource_snapshot.remote("s1"))
         assert snapshot["expected_session"] == "s1"
+        assert snapshot["protocol_version"] == protocol_version
+        assert snapshot["gs_epoch"] == gs_epoch
         assert any(g["gpu_uuid"] == "u0" for g in snapshot["gpus"])
 
-        idle = IdleReport(source_session="s1", source_seq=1, production_epoch=0, candidate_ids=("r1",))
+        idle = IdleReport(
+            source_session="s1",
+            source_seq=1,
+            production_epoch=0,
+            candidate_ids=("r1",),
+        )
         assert ray.get(scheduler.report_idle_candidates.remote(idle))["candidates"] == ["r1"]
 
-        opened = ray.get(scheduler.open_lease.remote(LeaseRecord(lease_id="l1", donor_session="s1")))
+        opened = ray.get(
+            scheduler.open_lease.remote(LeaseRecord(lease_id="l1", donor_session="s1"))
+        )
         assert opened["state"] == "PLANNED"
-        assert ray.get(scheduler.advance_lease.remote("l1", "DONOR_DRAINING"))["state"] == "DONOR_DRAINING"
+        assert (
+            ray.get(scheduler.advance_lease.remote("l1", "DONOR_DRAINING"))["state"]
+            == "DONOR_DRAINING"
+        )
     finally:
         ray.kill(task, no_restart=True)
