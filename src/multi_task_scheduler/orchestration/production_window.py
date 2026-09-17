@@ -66,12 +66,6 @@ class ProductionWindow:
 
     @property
     def idle(self) -> bool:
-        """Whether the task window supports considering an idle replica.
-
-        The state itself is produced by the native Rollouter logic; this helper
-        does not reimplement staleness/backpressure thresholds. P/H must be
-        explicitly observed as zero and a policy refresh cannot be in flight.
-        """
         return (
             self.state
             in {
@@ -128,7 +122,6 @@ class ServerActivity:
 
     @property
     def digest(self) -> str:
-        """Stable digest of the complete aggregate engine observation."""
         return _digest(
             "SERVER_ACTIVITY",
             self.key,
@@ -145,13 +138,7 @@ class ServerActivity:
 
 @dataclass(frozen=True)
 class ReplicaView:
-    """LB-local aggregate of the cross-owner facts needed for donation sensing.
-
-    This is an implementation helper, not a public wire type. The booleans are
-    already-validated facts from Manager/capacity/sync/attempt owners; they are
-    kept outside ServerActivity so that the public ServerActivity shape remains
-    exactly the design contract.
-    """
+    """LB-local owner facts needed for donation sensing; not a wire type."""
 
     activity: ServerActivity
     manager_revision: int
@@ -165,46 +152,15 @@ class ReplicaView:
     lifecycle_conflict: bool = False
 
     def __post_init__(self) -> None:
-        for value in (
-            self.manager_revision,
-            self.lb_revision,
-            self.stable_idle_ms,
+        if any(
+            value < 0
+            for value in (self.manager_revision, self.lb_revision, self.stable_idle_ms)
         ):
-            if value < 0:
-                raise ValueError("candidate revisions/timing must be nonnegative")
+            raise ValueError("candidate revisions/timing must be nonnegative")
         if self.gpu_count <= 0:
             raise ValueError("gpu_count must be positive")
         if not self.placement_digest:
             raise ValueError("placement_digest must be nonempty")
-
-    @property
-    def eligible(self) -> bool:
-        return (
-            self.active_native
-            and self.sync_healthy
-            and self.attempts_settled
-            and not self.lifecycle_conflict
-        )
-
-
-def candidate(
-    window: ProductionWindow,
-    view: ReplicaView,
-    *,
-    observations_fresh: bool,
-    keeps_min_active_gpus: bool,
-    leaves_routable: bool,
-) -> bool:
-    activity = view.activity
-    if activity.key.task_session != window.task_session:
-        return False
-    if not observations_fresh or not window.idle:
-        return False
-    if not activity.quiet or not view.eligible:
-        return False
-    if not keeps_min_active_gpus or not leaves_routable:
-        return False
-    return True
 
 
 def select_idle_candidates(
@@ -222,22 +178,25 @@ def select_idle_candidates(
         raise ValueError("source_seq must be nonnegative")
     if min_active_gpus < 0 or current_active_gpus < 0 or routable_count < 0:
         raise ValueError("capacity counts must be nonnegative")
+    if not observations_fresh or not window.idle or routable_count <= 1:
+        return ()
 
     result: list[IdleCandidate] = []
     reason = window.idle_reason
     for view in replicas:
-        keeps_min = current_active_gpus - view.gpu_count >= min_active_gpus
-        leaves_routable = routable_count - 1 >= 1
-        if not candidate(
-            window,
-            view,
-            observations_fresh=observations_fresh,
-            keeps_min_active_gpus=keeps_min,
-            leaves_routable=leaves_routable,
+        activity = view.activity
+        if activity.key.task_session != window.task_session or not activity.quiet:
+            continue
+        if (
+            not view.active_native
+            or not view.sync_healthy
+            or not view.attempts_settled
+            or view.lifecycle_conflict
         ):
             continue
+        if current_active_gpus - view.gpu_count < min_active_gpus:
+            continue
 
-        activity = view.activity
         engine_digest = activity.digest
         evidence_digest = _digest(
             activity.key,
