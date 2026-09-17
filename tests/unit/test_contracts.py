@@ -165,6 +165,23 @@ def test_operation_result_keeps_phase_and_status_independent():
             phase_revision=3,
         )
 
+    with pytest.raises(ValueError, match="UNKNOWN"):
+        OperationResult(
+            ctx=_ctx(),
+            target=ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0),
+            status=OperationStatus.UNKNOWN,
+            phase=Phase.CREATE,
+            phase_revision=3,
+        )
+
+    assert OperationResult(
+        ctx=_ctx(),
+        target=ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0),
+        status=OperationStatus.UNKNOWN,
+        phase=Phase.RECONCILE,
+        phase_revision=4,
+    ).phase is Phase.RECONCILE
+
 
 def test_published_weight_snapshot_requires_real_content_identity():
     snapshot = PublishedWeightSnapshot(
