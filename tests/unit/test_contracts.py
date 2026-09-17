@@ -156,6 +156,7 @@ def test_add_command_requires_nested_identity_authorization_and_matching_placeme
     assert command.ctx is ctx
     assert command.target is target
     assert command.kind is OperationKind.ADD
+    assert command.recall_mode is None
 
     with pytest.raises(ValueError, match="placement must match authorization"):
         OperationCommand(
@@ -169,10 +170,47 @@ def test_add_command_requires_nested_identity_authorization_and_matching_placeme
         )
 
 
+def test_add_and_restore_must_not_carry_recall_mode():
+    ctx = _ctx()
+    target = ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0)
+    with pytest.raises(ValueError, match="must not carry recall_mode"):
+        OperationCommand(
+            ctx=ctx,
+            kind=OperationKind.ADD,
+            target=target,
+            authorization=_authorization(OperationKind.ADD, ctx),
+            payload_digest="payload-1",
+            remaining_budget_ms=1000,
+            placement=_placement(),
+            recall_mode=RecallMode.NATURAL,
+        )
+
+    restore_ctx = _ctx(operation_id="restore-1")
+    restore = OperationCommand(
+        ctx=restore_ctx,
+        kind=OperationKind.RESTORE,
+        target=target,
+        authorization=_authorization(OperationKind.RESTORE, restore_ctx),
+        payload_digest="restore-payload",
+        remaining_budget_ms=1000,
+    )
+    assert restore.recall_mode is None
+    with pytest.raises(ValueError, match="must not carry recall_mode"):
+        OperationCommand(
+            ctx=restore_ctx,
+            kind=OperationKind.RESTORE,
+            target=target,
+            authorization=_authorization(OperationKind.RESTORE, restore_ctx),
+            payload_digest="restore-payload",
+            remaining_budget_ms=1000,
+            recall_mode=RecallMode.NATURAL,
+        )
+
+
 def test_force_verified_is_remove_only():
     ctx = _ctx()
     target = ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0)
-    with pytest.raises(ValueError, match="FORCE_VERIFIED"):
+    with pytest.raises(ValueError, match="recall_mode"):
         OperationCommand(
             ctx=ctx,
             kind=OperationKind.ADD,
