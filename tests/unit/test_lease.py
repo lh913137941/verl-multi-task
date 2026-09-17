@@ -1,4 +1,4 @@
-"""Global lease state machine uses simplified OperationStatus receipts."""
+"""Global lease state machine requires typed successful operation results."""
 
 import pytest
 
@@ -13,40 +13,49 @@ from multi_task_scheduler.scheduler.ledger import LeaseRecord
 
 
 def _machine():
-    sm = LeaseStateMachine()
-    sm.register(LeaseRecord(lease_id="l1", donor_session="s1"))
-    return sm
+    machine = LeaseStateMachine()
+    machine.register(LeaseRecord(lease_id="l1", donor_session="s1"))
+    return machine
 
 
-def test_full_happy_path_requires_succeeded_receipts_on_receipt_edges():
+def test_full_happy_path_requires_typed_succeeded_results_on_authorization_edges():
     sm = _machine()
     sm.advance("l1", LeaseState.DONOR_DRAINING)
-    sm.advance("l1", LeaseState.DONOR_RELEASED, supporting_result_state=OperationStatus.SUCCEEDED)
+    sm.advance(
+        "l1",
+        LeaseState.DONOR_RELEASED,
+        supporting_result_state=OperationStatus.SUCCEEDED,
+    )
     sm.advance("l1", LeaseState.BORROWER_PREPARING)
-    sm.advance("l1", LeaseState.BORROWER_ACTIVE, supporting_result_state="SUCCEEDED")
+    sm.advance(
+        "l1",
+        LeaseState.BORROWER_ACTIVE,
+        supporting_result_state=OperationStatus.SUCCEEDED,
+    )
     sm.advance("l1", LeaseState.RECALLING)
-    sm.advance("l1", LeaseState.BORROWER_RELEASED, supporting_result_state="SUCCEEDED")
+    sm.advance(
+        "l1",
+        LeaseState.BORROWER_RELEASED,
+        supporting_result_state=OperationStatus.SUCCEEDED,
+    )
     sm.advance("l1", LeaseState.DONOR_RESTORING)
-    sm.advance("l1", LeaseState.CLOSED, supporting_result_state="SUCCEEDED")
+    sm.advance(
+        "l1",
+        LeaseState.CLOSED,
+        supporting_result_state=OperationStatus.SUCCEEDED,
+    )
     assert sm.get("l1").state == LeaseState.CLOSED.value
 
 
-def test_receipt_edge_without_receipt_raises():
+def test_receipt_edge_without_success_result_raises():
     sm = _machine()
     sm.advance("l1", LeaseState.DONOR_DRAINING)
     with pytest.raises(MissingReceiptError):
         sm.advance("l1", LeaseState.DONOR_RELEASED)
 
 
-def test_old_committed_state_is_rejected():
-    sm = _machine()
-    sm.advance("l1", LeaseState.DONOR_DRAINING)
-    with pytest.raises(MissingReceiptError, match="SUCCEEDED"):
-        sm.advance("l1", LeaseState.DONOR_RELEASED, supporting_result_state="COMMITTED")
-
-
-def test_failed_or_unknown_result_cannot_advance_authorization():
-    for status in (OperationStatus.FAILED, OperationStatus.UNKNOWN):
+def test_failed_unknown_or_untyped_result_cannot_advance_authorization():
+    for status in (OperationStatus.FAILED, OperationStatus.UNKNOWN, "SUCCEEDED"):
         sm = _machine()
         sm.advance("l1", LeaseState.DONOR_DRAINING)
         with pytest.raises(MissingReceiptError):
@@ -59,7 +68,7 @@ def test_illegal_skip_raises():
         sm.advance("l1", LeaseState.DONOR_RELEASED)
 
 
-def test_reconciling_edges():
+def test_reconciling_is_terminal_for_automatic_authorization_progress():
     sm = _machine()
     sm.advance("l1", LeaseState.DONOR_DRAINING)
     sm.advance("l1", LeaseState.RECONCILING)
@@ -69,16 +78,16 @@ def test_reconciling_edges():
 
 def test_quarantine_after_restore_failure():
     sm = _machine()
-    for state, receipt in [
+    for state, result in (
         (LeaseState.DONOR_DRAINING, None),
-        (LeaseState.DONOR_RELEASED, "SUCCEEDED"),
+        (LeaseState.DONOR_RELEASED, OperationStatus.SUCCEEDED),
         (LeaseState.BORROWER_PREPARING, None),
-        (LeaseState.BORROWER_ACTIVE, "SUCCEEDED"),
+        (LeaseState.BORROWER_ACTIVE, OperationStatus.SUCCEEDED),
         (LeaseState.RECALLING, None),
-        (LeaseState.BORROWER_RELEASED, "SUCCEEDED"),
+        (LeaseState.BORROWER_RELEASED, OperationStatus.SUCCEEDED),
         (LeaseState.DONOR_RESTORING, None),
-    ]:
-        sm.advance("l1", state, supporting_result_state=receipt)
+    ):
+        sm.advance("l1", state, supporting_result_state=result)
     sm.advance("l1", LeaseState.QUARANTINED)
     assert sm.get("l1").state == LeaseState.QUARANTINED.value
 
@@ -86,7 +95,11 @@ def test_quarantine_after_restore_failure():
 def test_borrower_preparing_can_reconcile():
     sm = _machine()
     sm.advance("l1", LeaseState.DONOR_DRAINING)
-    sm.advance("l1", LeaseState.DONOR_RELEASED, supporting_result_state="SUCCEEDED")
+    sm.advance(
+        "l1",
+        LeaseState.DONOR_RELEASED,
+        supporting_result_state=OperationStatus.SUCCEEDED,
+    )
     sm.advance("l1", LeaseState.BORROWER_PREPARING)
     sm.advance("l1", LeaseState.RECONCILING)
     assert sm.get("l1").state == LeaseState.RECONCILING.value
