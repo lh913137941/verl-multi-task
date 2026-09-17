@@ -1,9 +1,8 @@
 """Native routing subclass with a conservative orchestration R view.
 
-Native request selection remains inherited.  The overlay owns only routing
-eligibility, a monotonic route revision and attempt facts used by lifecycle
-operations.  It never discards unresolved attempts in order to manufacture a
-successful remove.
+Native request selection remains inherited. The overlay owns routing eligibility,
+a monotonic route revision and attempt facts used by lifecycle operations. It
+never discards unresolved attempts in order to manufacture a successful remove.
 """
 
 from verl.workers.rollout.llm_server import DEFAULT_ROUTING_CACHE_SIZE, GlobalRequestLoadBalancer
@@ -27,12 +26,17 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         self.draining_ids = set()
         self.attempts = {}
         self.route_metadata = {
-            replica_id: {"serving_version": None, "ce_revision": None, "lease_valid": True}
+            replica_id: {
+                "serving_version": None,
+                "ce_revision": None,
+                "lease_valid": True,
+                "committed_before": True,
+            }
             for replica_id in servers
         }
 
     def begin_drain(self, replica_id: str) -> int:
-        """Atomically close new routing and advance the per-task route fence."""
+        """Atomically close new routing and advance the route fence."""
         self.draining_ids.add(replica_id)
         self.routable_ids.discard(replica_id)
         self.routing_epoch += 1
@@ -42,19 +46,43 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         self,
         replica_id: str,
         *,
-        serving_version: int,
-        ce_revision: int,
-        lease_valid: bool,
+        serving_version: int | None = None,
+        ce_revision: int | None = None,
+        lease_valid: bool | None = None,
     ) -> int:
-        """Open routing only with explicit weight/member/lease commit evidence."""
+        """Publish a route after evidence, or cancel a not-yet-committed drain.
+
+        ADD/RESTORE must provide weight/member/lease evidence. A replica that was
+        already committed before the current drain may be reopened without new
+        evidence when the drain is safely cancelled before CE removal.
+        """
+        previous = self.route_metadata.get(replica_id)
+        cancelling_drain = (
+            replica_id in self.draining_ids
+            and previous is not None
+            and previous.get("committed_before") is True
+            and serving_version is None
+            and ce_revision is None
+            and lease_valid is None
+        )
+        if cancelling_drain:
+            self.routable_ids.add(replica_id)
+            self.draining_ids.discard(replica_id)
+            self.routing_epoch += 1
+            return self.routing_epoch
+
+        if serving_version is None or ce_revision is None or lease_valid is None:
+            raise ValueError("new route commit requires serving_version, ce_revision and lease_valid")
         if serving_version < 0 or ce_revision < 0:
             raise ValueError("serving_version and ce_revision must be nonnegative")
         if not lease_valid:
             raise ValueError("cannot route a replica without a valid lease/identity fence")
+
         self.route_metadata[replica_id] = {
             "serving_version": serving_version,
             "ce_revision": ce_revision,
             "lease_valid": True,
+            "committed_before": True,
         }
         self.routable_ids.add(replica_id)
         self.draining_ids.discard(replica_id)
@@ -87,5 +115,5 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         return True
 
     def query_routing_operation(self, operation_id: str) -> str:
-        """Reconciliation hook; unknown is not evidence that nothing executed."""
+        """Unknown is not evidence that nothing executed."""
         return "unknown"
