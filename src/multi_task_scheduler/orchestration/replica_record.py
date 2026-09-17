@@ -1,19 +1,14 @@
 """Replica lifecycle metadata independent of distributed runtime handles.
 
-``ReplicaState`` follows the two lifecycles of the fusion design (section 3.4):
-the borrowed path (``CREATING -> HIDDEN -> BOOTSTRAPPING -> CE_EFFECTIVE ->
-ACTIVE -> DRAINING -> CE_REMOVED -> DESTROYING -> DESTROYED``) and the donor
-sleep/wake path (``... -> CE_REMOVED -> SLEEPING -> DORMANT -> WAKING_WEIGHTS ->
-BOOTSTRAPPING -> ...``). Rollback returns a borrowed target to ``HIDDEN`` and a
-donor target to ``DORMANT``; corrupt transfer/cleanup ends in ``QUARANTINED``.
+The public lifecycle is intentionally small. Fine-grained bootstrap, CE, route,
+sleep and destroy steps belong in the operation journal and evidence records,
+not in a second mutable lifecycle state machine.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-
-from .replica_sync_gate import GateOwner
 
 
 class ReplicaKind(str, Enum):
@@ -22,64 +17,47 @@ class ReplicaKind(str, Enum):
 
 
 class ReplicaState(str, Enum):
-    CREATING = "CREATING"
-    HIDDEN = "HIDDEN"
-    FAILED_HIDDEN = "FAILED_HIDDEN"
-    BOOTSTRAPPING = "BOOTSTRAPPING"
-    CE_EFFECTIVE = "CE_EFFECTIVE"
+    PREPARING = "PREPARING"
     ACTIVE = "ACTIVE"
     DRAINING = "DRAINING"
-    CE_REMOVED = "CE_REMOVED"
-    DESTROYING = "DESTROYING"
-    DESTROYED = "DESTROYED"
-    SLEEPING = "SLEEPING"
+    DETACHED = "DETACHED"
     DORMANT = "DORMANT"
-    WAKING_WEIGHTS = "WAKING_WEIGHTS"
+    RESTORING = "RESTORING"
+    DESTROYED = "DESTROYED"
     QUARANTINED = "QUARANTINED"
 
 
 class IllegalReplicaTransitionError(RuntimeError):
-    """Raised when orchestration skips a required replica lifecycle state."""
+    """Raised when orchestration skips a required evidence-backed state edge."""
 
 
-# Union of the borrowed and donor machines, including rollback edges. The
-# kind-specific terminal choice (DESTROYED vs DORMANT) is enforced by the
-# transaction layer; this table only rejects genuinely illegal jumps.
 _ALLOWED = {
-    ReplicaState.CREATING: {ReplicaState.HIDDEN, ReplicaState.FAILED_HIDDEN},
-    ReplicaState.HIDDEN: {
-        ReplicaState.BOOTSTRAPPING,
-        ReplicaState.DESTROYING,
-        ReplicaState.QUARANTINED,
-    },
-    ReplicaState.FAILED_HIDDEN: {
-        ReplicaState.DESTROYING,
-        ReplicaState.QUARANTINED,
-    },
-    ReplicaState.BOOTSTRAPPING: {
-        ReplicaState.CE_EFFECTIVE,
-        ReplicaState.HIDDEN,
-        ReplicaState.DORMANT,
-        ReplicaState.QUARANTINED,
-    },
-    ReplicaState.CE_EFFECTIVE: {
+    ReplicaState.PREPARING: {
         ReplicaState.ACTIVE,
-        ReplicaState.HIDDEN,
-        ReplicaState.DORMANT,
+        ReplicaState.DESTROYED,
         ReplicaState.QUARANTINED,
     },
     ReplicaState.ACTIVE: {ReplicaState.DRAINING},
-    ReplicaState.DRAINING: {ReplicaState.CE_REMOVED, ReplicaState.QUARANTINED},
-    ReplicaState.CE_REMOVED: {
-        ReplicaState.DESTROYING,
-        ReplicaState.SLEEPING,
+    ReplicaState.DRAINING: {
+        ReplicaState.DETACHED,
+        ReplicaState.ACTIVE,
         ReplicaState.QUARANTINED,
     },
-    ReplicaState.DESTROYING: {ReplicaState.DESTROYED, ReplicaState.QUARANTINED},
+    ReplicaState.DETACHED: {
+        ReplicaState.DORMANT,
+        ReplicaState.DESTROYED,
+        ReplicaState.QUARANTINED,
+    },
+    ReplicaState.DORMANT: {
+        ReplicaState.RESTORING,
+        ReplicaState.QUARANTINED,
+    },
+    ReplicaState.RESTORING: {
+        ReplicaState.ACTIVE,
+        ReplicaState.DORMANT,
+        ReplicaState.QUARANTINED,
+    },
     ReplicaState.DESTROYED: set(),
-    ReplicaState.SLEEPING: {ReplicaState.DORMANT, ReplicaState.QUARANTINED},
-    ReplicaState.DORMANT: {ReplicaState.WAKING_WEIGHTS, ReplicaState.QUARANTINED},
-    ReplicaState.WAKING_WEIGHTS: {ReplicaState.BOOTSTRAPPING, ReplicaState.QUARANTINED},
     ReplicaState.QUARANTINED: set(),
 }
 
@@ -89,27 +67,44 @@ class ReplicaRecord:
     replica_id: str
     kind: ReplicaKind = ReplicaKind.BORROWED
     state: ReplicaState | None = None
+    revision: int = 0
     operation_id: str | None = None
+    lease_id: str | None = None
     lease_epoch: int = 0
     runtime_epoch: int = 0
     routing_epoch: int | None = None
-    last_synced_weight_version: int | None = None
-    bootstrap_target_version: int | None = None
-    replica_sync_gate_owner: GateOwner | None = None
+    loaded_version: int | None = None
+    last_error: object | None = None
     lifecycle_pins: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.kind = ReplicaKind(self.kind)
+        if not self.replica_id:
+            raise ValueError("replica_id must be nonempty")
+        if self.revision < 0 or self.lease_epoch < 0 or self.runtime_epoch < 0:
+            raise ValueError("revision and epochs must be nonnegative")
         if self.state is None:
-            # A donor native replica is already serving; only a borrowed
-            # target starts life in CREATING (section 3.4).
             self.state = (
                 ReplicaState.ACTIVE
                 if self.kind is ReplicaKind.NATIVE
-                else ReplicaState.CREATING
+                else ReplicaState.PREPARING
             )
         else:
             self.state = ReplicaState(self.state)
+        self._validate_kind_state(self.state)
+
+    def _validate_kind_state(self, state: ReplicaState) -> None:
+        if self.kind is ReplicaKind.BORROWED and state in {
+            ReplicaState.DORMANT,
+            ReplicaState.RESTORING,
+        }:
+            raise IllegalReplicaTransitionError(
+                f"borrowed replica {self.replica_id} cannot enter {state.value}"
+            )
+        if self.kind is ReplicaKind.NATIVE and state is ReplicaState.DESTROYED:
+            raise IllegalReplicaTransitionError(
+                f"native replica {self.replica_id} must sleep, never destroy"
+            )
 
     def transition_to(self, new_state: ReplicaState) -> None:
         new_state = ReplicaState(new_state)
@@ -120,4 +115,6 @@ class ReplicaRecord:
                 f"illegal replica transition for {self.replica_id}: "
                 f"{self.state.value} -> {new_state.value}"
             )
+        self._validate_kind_state(new_state)
         self.state = new_state
+        self.revision += 1
