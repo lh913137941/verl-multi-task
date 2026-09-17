@@ -79,9 +79,20 @@ class LeaseRecord:
     state: str = "PLANNED"
     operation_ids: Tuple[str, ...] = ()
     last_operation_id: str | None = None
+    last_release_digest: str | None = None
     deadline: float | None = None
     placement: PlacementSpec | None = None
     model_constraints: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.lease_id or not self.donor_session:
+            raise ValueError("lease_id and donor_session must be nonempty")
+        if self.lease_epoch < 0:
+            raise ValueError("lease_epoch must be nonnegative")
+        if self.borrower_session is not None and not self.borrower_session:
+            raise ValueError("borrower_session must be nonempty when present")
+        if self.last_release_digest is not None and not self.last_release_digest:
+            raise ValueError("last_release_digest must be nonempty when present")
 
 
 @dataclass(frozen=True)
@@ -102,6 +113,11 @@ class OperationRecord:
     accepted_at: float = field(default_factory=time.monotonic)
     phase: Phase = Phase.VALIDATE
     final_result: OperationResult | None = None
+
+    @property
+    def deadline_at(self) -> float:
+        """Deadline fixed by the first accepted command; retries never reset it."""
+        return self.accepted_at + self.command.remaining_budget_ms / 1000.0
 
 
 @dataclass
@@ -285,7 +301,7 @@ class Ledger:
 
     @staticmethod
     def _command_identity(command: OperationCommand) -> tuple:
-        """Business identity; remaining transport budget may decrease on retry."""
+        """Business identity; transport budget is intentionally excluded."""
         return (
             command.ctx,
             command.kind,
