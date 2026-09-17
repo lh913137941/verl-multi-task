@@ -1,8 +1,8 @@
 """Experimental Fully Async Rollouter with the simplified lifecycle surface.
 
 Native generation/queue behavior stays inherited. Device/runtime actions remain
-explicit failures until a verified native backend is available. Idle reporting
-uses the canonical evidence-bearing ``IdleCandidateReport`` contract.
+explicit failures until a verified native backend is available. Rollouter owns
+ProductionWindow facts; LB owns idle-candidate construction and reporting.
 """
 
 import ray
@@ -14,11 +14,7 @@ from verl.experimental.fully_async_policy.fully_async_rollouter import (
 from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
 
 from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
-from multi_task_scheduler.orchestration.contracts import IdleCandidateReport
-from multi_task_scheduler.orchestration.production_window import (
-    ProductionWindow,
-    select_idle_candidates,
-)
+from multi_task_scheduler.orchestration.production_window import ProductionWindow
 
 from .llm_server_manager import MultiTaskLLMServerManager
 
@@ -29,12 +25,8 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
 
     def __init__(self, config, tokenizer, processor=None, device_name=None, *, group_scheduler=None):
         self.group_scheduler = group_scheduler
+        self._production_window = None
         super().__init__(config, tokenizer, processor=processor, device_name=device_name)
-
-    def _ensure_production_window(self) -> ProductionWindow:
-        if not hasattr(self, "_production_window"):
-            self._production_window = ProductionWindow()
-        return self._production_window
 
     async def _init_async_rollout_manager(self):
         enable_agent_reward_loop = (
@@ -66,48 +58,22 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         )
 
     @property
-    def production_window(self) -> ProductionWindow:
-        return self._ensure_production_window()
+    def production_window(self) -> ProductionWindow | None:
+        """Return the latest task-session production fact, if one is established."""
+        return self._production_window
 
     def set_production_window(self, window: ProductionWindow) -> None:
         if not isinstance(window, ProductionWindow):
             raise TypeError("set_production_window requires ProductionWindow")
+        current = self._production_window
+        if current is not None:
+            if window.task_session != current.task_session:
+                raise ValueError("production window task_session cannot change in-place")
+            if window.epoch < current.epoch:
+                raise ValueError("production window epoch cannot move backwards")
+            if window.epoch == current.epoch and window.revision < current.revision:
+                raise ValueError("production window revision cannot move backwards")
         self._production_window = window
-
-    def report_idle_candidates(
-        self,
-        window: ProductionWindow,
-        replicas,
-        *,
-        task_session: str,
-        gs_epoch: str,
-        lb_session: str,
-        valid_for_ms: int,
-        observations_fresh: bool,
-        min_active_gpus: int,
-        current_active_gpus: int,
-        routable_count: int,
-    ) -> IdleCandidateReport:
-        """Freeze the complete current candidate set for GS replacement semantics."""
-        if window is not self.production_window:
-            raise ValueError("idle report must use the Rollouter current production window")
-        candidates = select_idle_candidates(
-            window,
-            replicas,
-            observations_fresh=observations_fresh,
-            min_active_gpus=min_active_gpus,
-            current_active_gpus=current_active_gpus,
-            routable_count=routable_count,
-        )
-        return IdleCandidateReport(
-            task_session=task_session,
-            gs_epoch=gs_epoch,
-            lb_session=lb_session,
-            source_seq=window.source_seq,
-            production_revision=window.production_revision,
-            valid_for_ms=valid_for_ms,
-            candidates=candidates,
-        )
 
     def prepare_replica(self, ctx, key, placement):
         """Hidden-create one borrowed runtime without publishing service."""
