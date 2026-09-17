@@ -9,9 +9,9 @@
 """Native Fully Async Trainer plus the task-local G and published snapshot holder.
 
 Native training stays inherited. Lifecycle commits and native weight sync share
-one gate. A version integer is kept only as compatibility/telemetry metadata;
-ADD/RESTORE must use ``published_snapshot`` and therefore cannot manufacture
-weight contents from a version number.
+one gate. A version integer is compatibility/telemetry metadata only;
+ADD/RESTORE must use ``published_snapshot`` and cannot manufacture weight
+contents from a version number.
 """
 
 import ray
@@ -54,8 +54,8 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
         lease = await gate.acquire(f"native-sync:{self.current_param_version}", GateKind.NATIVE_SYNC)
         try:
             result = await lease.guard(super()._fit_update_weights)
-            # Native VERL currently returns synchronization timing/results, not
-            # the immutable replayable snapshot required by ADD/RESTORE. Do not
+            # Native VERL currently returns timing/results rather than the
+            # immutable replayable snapshot required by ADD/RESTORE. Do not
             # fabricate PublishedWeightSnapshot here.
             self._last_native_serving_version = self.current_param_version
             return result
@@ -70,7 +70,6 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
         return getattr(self, "_published_snapshot", None)
 
     def current_snapshot(self) -> PublishedWeightSnapshot | None:
-        """PublishedSnapshotStore-compatible read used by orchestration core."""
         return self.published_snapshot
 
     def publish_snapshot(self, snapshot: PublishedWeightSnapshot) -> None:
@@ -83,7 +82,6 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
         self._last_native_serving_version = snapshot.version
 
     def publish(self, snapshot: PublishedWeightSnapshot) -> None:
-        """PublishedSnapshotStore-compatible write."""
         self.publish_snapshot(snapshot)
 
     @property
@@ -107,6 +105,11 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
         """REMOVE/DONATE service-exit entry; physical release happens afterwards."""
         raise NotImplementedError("REMOVE transaction requires verified native backend")
 
-    async def restore_and_publish(self, ctx, key):
-        """RESTORE native runtime using the donor task's current published snapshot."""
+    async def restore_and_publish(self, ctx, key, fence_satisfied=None):
+        """RESTORE native runtime using the donor task's current published snapshot.
+
+        ``fence_satisfied`` is accepted only for compatibility with the previous
+        binding signature; the simplified contract carries release authority in
+        the GS operation/lease evidence rather than as a free boolean.
+        """
         raise NotImplementedError("RESTORE transaction requires verified native backend")
