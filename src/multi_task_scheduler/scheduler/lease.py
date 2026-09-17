@@ -77,6 +77,11 @@ _SERVICE_REQUIREMENTS = {
     (LeaseState.DONOR_RESTORING, LeaseState.CLOSED): "donor",
 }
 
+_POST_RELEASE_AUTHORIZATION_EDGES = {
+    (LeaseState.DONOR_RELEASED, LeaseState.BORROWER_PREPARING),
+    (LeaseState.BORROWER_RELEASED, LeaseState.DONOR_RESTORING),
+}
+
 
 class LeaseStateMachine:
     def __init__(self) -> None:
@@ -199,6 +204,13 @@ class LeaseStateMachine:
             service_role = _SERVICE_REQUIREMENTS.get(edge)
             if service_role is not None:
                 self._validate_service_edge(lease, supporting_result, service_role)
+            elif edge in _POST_RELEASE_AUTHORIZATION_EDGES:
+                if supporting_result is not None:
+                    raise ValueError("post-release authorization consumes the stored release digest")
+                if lease.last_release_digest is None:
+                    raise MissingEvidenceError(
+                        "post-release authorization requires a GS-confirmed release digest"
+                    )
             elif supporting_result is not None:
                 raise ValueError("this lease edge does not consume an OperationResult")
 
