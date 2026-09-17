@@ -265,7 +265,7 @@ def test_service_activation_requires_add_evidence_not_status_only():
         release_digest="release-d1",
     )
     remove_result = _service_result("borrower", "op-add", ServiceAction.REMOVE)
-    with pytest.raises(MissingEvidenceError, match="ServiceEvidence\(ADD\)"):
+    with pytest.raises(MissingEvidenceError, match=r"ServiceEvidence\(ADD\)"):
         sm.advance(
             "l1",
             LeaseState.BORROWER_ACTIVE,
