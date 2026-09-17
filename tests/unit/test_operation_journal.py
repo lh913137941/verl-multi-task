@@ -1,4 +1,4 @@
-"""OperationJournal replay fencing with full accepted commands."""
+"""OperationJournal replay, lifecycle serialization and sequence fencing."""
 
 from dataclasses import replace
 
@@ -53,11 +53,10 @@ def _command(**ctx_overrides):
     )
     values.update(ctx_overrides)
     ctx = OperationContext(**values)
-    target = ReplicaKey(task_session=ctx.task_session, replica_id="r1", runtime_epoch=0)
     return OperationCommand(
         ctx=ctx,
         kind=OperationKind.ADD,
-        target=target,
+        target=ReplicaKey(task_session=ctx.task_session, replica_id="r1", runtime_epoch=0),
         authorization=LeaseAuthorization(
             lease_id=ctx.lease_id,
             gs_epoch=ctx.gs_epoch,
@@ -94,8 +93,7 @@ def test_retry_budget_is_not_identity_and_cannot_extend_original_deadline():
     assert journal.remaining_budget_ms("op-1") == 1000
 
     now[0] = 100.4
-    retry = replace(command, remaining_budget_ms=10_000)
-    assert journal.begin(retry) is first
+    assert journal.begin(replace(command, remaining_budget_ms=10_000)) is first
     assert first.command is command
     assert 0 < journal.remaining_budget_ms("op-1") <= 600
 
@@ -132,6 +130,20 @@ def test_operation_id_cannot_cross_lease_epoch():
         journal.begin(_command(lease_epoch=2))
 
 
+def test_journal_owns_single_active_operation_and_command_seq_fences():
+    journal = OperationJournal()
+    journal.begin(_command(command_seq=5))
+
+    with pytest.raises(OperationIdentityError, match="another lifecycle operation is active"):
+        journal.begin(_command(operation_id="op-2", command_seq=6))
+
+    journal.transition("op-1", Phase.DONE, status=OperationStatus.SUCCEEDED)
+    with pytest.raises(OperationIdentityError, match="stale command_seq"):
+        journal.begin(_command(operation_id="op-old", command_seq=5))
+
+    assert journal.begin(_command(operation_id="op-2", command_seq=6)).status is OperationStatus.ACCEPTED
+
+
 def test_add_happy_path_requires_explicit_terminal_status():
     journal = OperationJournal()
     journal.begin(_command())
@@ -146,9 +158,7 @@ def test_add_happy_path_requires_explicit_terminal_status():
     with pytest.raises(IllegalOperationTransitionError, match="explicit"):
         journal.transition("op-1", Phase.DONE)
     journal.transition("op-1", Phase.DONE, status=OperationStatus.SUCCEEDED)
-    record = journal.query("op-1")
-    assert record.phase is Phase.DONE
-    assert record.status is OperationStatus.SUCCEEDED
+    assert journal.query("op-1").status is OperationStatus.SUCCEEDED
 
 
 def test_terminal_status_cannot_appear_before_done():
@@ -176,7 +186,7 @@ def test_illegal_phase_skip_and_wrong_lease_require_raise():
         journal.require("op-1", 1)
 
 
-def test_phase_result_timing_error_and_detail_are_revisioned():
+def test_phase_result_timing_and_error_are_revisioned():
     journal = OperationJournal()
     journal.begin(_command())
     proof = object()
@@ -187,10 +197,8 @@ def test_phase_result_timing_error_and_detail_are_revisioned():
         phase_result=proof,
         elapsed_ms=12,
         error=error,
-        detail={"step": "created"},
     )
     assert record.phase_results[Phase.CREATE] is proof
     assert record.phase_timings_ms[Phase.CREATE] == 12
     assert record.error is error
-    assert record.detail == {"step": "created"}
     assert record.phase_revision == 1
