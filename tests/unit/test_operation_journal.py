@@ -86,13 +86,21 @@ def test_begin_stores_full_command_and_returns_validate_accepted():
     assert record.status is OperationStatus.ACCEPTED
 
 
-def test_retry_may_reduce_transport_budget_but_not_change_business_identity():
-    journal = OperationJournal()
+def test_retry_budget_is_not_identity_and_cannot_extend_original_deadline():
+    now = [100.0]
+    journal = OperationJournal(clock=lambda: now[0])
     command = _command()
     first = journal.begin(command)
-    retry = replace(command, remaining_budget_ms=100)
+    assert journal.remaining_budget_ms("op-1") == 1000
+
+    now[0] = 100.4
+    retry = replace(command, remaining_budget_ms=10_000)
     assert journal.begin(retry) is first
     assert first.command is command
+    assert 0 < journal.remaining_budget_ms("op-1") <= 600
+
+    now[0] = 101.1
+    assert journal.remaining_budget_ms("op-1") == 0
 
 
 def test_conflicting_command_identity_is_rejected():
