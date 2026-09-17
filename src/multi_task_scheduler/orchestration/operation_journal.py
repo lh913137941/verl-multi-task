@@ -1,8 +1,8 @@
-"""Replayable operation metadata aligned with simplified design §6.1/§6.3.
+"""Replayable operation journal aligned with simplified design §6.3.
 
-``status`` and ``phase`` are independent facts. ``Phase.DONE`` may describe a
-known success, a known failure, or a terminal unknown result, so terminal status
-is always explicit.
+The journal stores the accepted full OperationCommand as the immutable source
+of identity. ``status`` and ``phase`` are independent facts: DONE never implies
+success by itself, and RECONCILE represents unresolved side effects.
 """
 
 from __future__ import annotations
@@ -53,11 +53,11 @@ class Outcome(str, Enum):
 
 
 class ExpiredLeaseError(RuntimeError):
-    """A command does not match the journal's current lease epoch."""
+    """A command does not match the journal's accepted lease epoch."""
 
 
 class OperationIdentityError(RuntimeError):
-    """An operation ID is replayed with conflicting immutable fields."""
+    """An operation ID was replayed with conflicting immutable business identity."""
 
 
 class IllegalOperationTransitionError(RuntimeError):
@@ -108,23 +108,60 @@ def _default_status_for_phase(phase: Phase) -> OperationStatus:
     return OperationStatus.RUNNING
 
 
+def _require_command_shape(command: object) -> None:
+    """Avoid importing contracts.py here because it imports these enums."""
+    try:
+        ctx = command.ctx
+        target = command.target
+        kind = command.kind
+        payload_digest = command.payload_digest
+    except AttributeError as exc:
+        raise TypeError("journal begin requires a complete OperationCommand") from exc
+    if not ctx.operation_id or not target.replica_id:
+        raise ValueError("operation_id and target replica_id must be nonempty")
+    if not isinstance(payload_digest, str) or not payload_digest:
+        raise ValueError("payload_digest must be a nonempty string")
+    OperationKind(kind)
+
+
+def _command_identity(command: object) -> tuple:
+    """Immutable business identity; remaining transport budget may shrink on retry."""
+    return (
+        command.ctx,
+        OperationKind(command.kind),
+        command.target,
+        command.authorization,
+        command.placement,
+        command.candidate,
+        command.recall_mode,
+        command.payload_digest,
+    )
+
+
 @dataclass
 class OperationRecord:
-    operation_id: str
-    lease_epoch: int
-    replica_id: str
-    kind: OperationKind
-    phase: Phase = Phase.VALIDATE
+    command: object
     status: OperationStatus = OperationStatus.ACCEPTED
+    phase: Phase = Phase.VALIDATE
     phase_revision: int = 0
-    payload_digest: str | None = None
-    command_seq: int = 0
-    detail: dict[str, object] = field(default_factory=dict)
     phase_results: dict[Phase, object] = field(default_factory=dict)
     phase_timings_ms: dict[Phase, int] = field(default_factory=dict)
     error: object | None = None
+    detail: dict[str, object] = field(default_factory=dict)
     created_at: float = field(default_factory=time.monotonic)
     updated_at: float = field(default_factory=time.monotonic)
+
+    @property
+    def operation_id(self) -> str:
+        return self.command.ctx.operation_id
+
+    @property
+    def lease_epoch(self) -> int:
+        return self.command.ctx.lease_epoch
+
+    @property
+    def target(self):
+        return self.command.target
 
 
 class OperationJournal:
@@ -139,52 +176,28 @@ class OperationJournal:
     def set_validation_freeze(self, frozen: bool) -> None:
         self._validation_frozen = bool(frozen)
 
-    def begin(
-        self,
-        operation_id: str,
-        lease_epoch: int,
-        replica_id: str,
-        kind: OperationKind,
-        *,
-        payload_digest: str | None = None,
-        command_seq: int = 0,
-    ) -> OperationRecord:
-        if not operation_id or not replica_id:
-            raise ValueError("operation_id and replica_id must be nonempty")
-        if lease_epoch < 0 or command_seq < 0:
-            raise ValueError("lease_epoch and command_seq must be nonnegative")
-        kind = OperationKind(kind)
-
+    def begin(self, command: object) -> OperationRecord:
+        """Accept one full command idempotently without executing side effects."""
+        _require_command_shape(command)
+        operation_id = command.ctx.operation_id
         existing = self._records.get(operation_id)
         if existing is not None:
-            if lease_epoch < existing.lease_epoch:
+            if command.ctx.lease_epoch < existing.lease_epoch:
                 raise ExpiredLeaseError(
-                    f"operation {operation_id!r} epoch {lease_epoch} is older than "
+                    f"operation {operation_id!r} epoch {command.ctx.lease_epoch} is older than "
                     f"{existing.lease_epoch}"
                 )
-            if lease_epoch == existing.lease_epoch:
-                if (
-                    existing.replica_id != replica_id
-                    or existing.kind is not kind
-                    or existing.payload_digest != payload_digest
-                    or existing.command_seq != command_seq
-                ):
-                    raise OperationIdentityError(
-                        f"conflicting replay for operation {operation_id!r}"
-                    )
-                return existing
-            raise OperationIdentityError(
-                f"operation {operation_id!r} cannot be reused for a different lease epoch"
-            )
+            if command.ctx.lease_epoch > existing.lease_epoch:
+                raise OperationIdentityError(
+                    f"operation {operation_id!r} cannot be reused for another lease epoch"
+                )
+            if _command_identity(existing.command) != _command_identity(command):
+                raise OperationIdentityError(
+                    f"conflicting replay for operation {operation_id!r}"
+                )
+            return existing
 
-        record = OperationRecord(
-            operation_id=operation_id,
-            lease_epoch=lease_epoch,
-            replica_id=replica_id,
-            kind=kind,
-            payload_digest=payload_digest,
-            command_seq=command_seq,
-        )
+        record = OperationRecord(command=command)
         self._records[operation_id] = record
         return record
 
