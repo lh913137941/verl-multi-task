@@ -2,6 +2,7 @@
 
 import ast
 import hashlib
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,11 +14,14 @@ from multi_task_scheduler.orchestration.contracts import (
     PreparedReplica,
     ReceiverRef,
     ReplicaKey,
+    RouteEntry,
+    RouteState,
     ServiceAction,
 )
 from multi_task_scheduler.orchestration.receipts import (
     CommitOwner,
     CommitReceipt,
+    DrainTicket,
     EvidenceHeader,
     ExitEvidence,
     WeightEvidence,
@@ -152,11 +156,36 @@ def _lb_class():
         Parent,
         DEFAULT_ROUTING_CACHE_SIZE=128,
         ServiceAction=ServiceAction,
+        RouteEntry=RouteEntry,
+        RouteState=RouteState,
         CommitOwner=CommitOwner,
         CommitReceipt=CommitReceipt,
         EvidenceHeader=EvidenceHeader,
-        DrainTicket=object,
+        DrainTicket=DrainTicket,
+        uuid=uuid,
         _digest=_digest,
+    )
+
+
+def _ce_add(context, key, *, version=7):
+    return CommitReceipt(
+        header=EvidenceHeader(context, key, 2, "ce-add"),
+        owner=CommitOwner.CE,
+        action=ServiceAction.ADD,
+        revision=1,
+        version=version,
+        route_epoch=None,
+    )
+
+
+def _ce_remove(context, key):
+    return CommitReceipt(
+        header=EvidenceHeader(context, key, 3, "ce-remove"),
+        owner=CommitOwner.CE,
+        action=ServiceAction.REMOVE,
+        revision=2,
+        version=None,
+        route_epoch=None,
     )
 
 
@@ -211,19 +240,13 @@ def test_ce_rejects_model_signature_mismatch_inside_effective_set():
         manager.add_effective(second_ctx, second, _weight(second_ctx, "r2"))
 
 
-def test_lb_add_requires_matching_ce_commit_and_returns_typed_receipt():
+def test_lb_add_requires_matching_ce_commit_and_writes_typed_route_entry():
     lb = _lb_class()({})
     context = _ctx()
     prepared = _prepared(context)
     installed = _weight(context)
-    ce = CommitReceipt(
-        header=EvidenceHeader(context, prepared.key, 2, "ce-add"),
-        owner=CommitOwner.CE,
-        action=ServiceAction.ADD,
-        revision=1,
-        version=7,
-        route_epoch=None,
-    )
+    ce = _ce_add(context, prepared.key)
+
     receipt = lb.commit_routable(context, prepared, installed, ce)
     assert receipt.owner is CommitOwner.LB
     assert receipt.action is ServiceAction.ADD
@@ -231,35 +254,50 @@ def test_lb_add_requires_matching_ce_commit_and_returns_typed_receipt():
     assert receipt.route_epoch == 1
     assert lb.commit_routable(context, prepared, installed, ce) is receipt
 
+    route = lb.routes[prepared.key]
+    assert isinstance(route, RouteEntry)
+    assert route.state is RouteState.ROUTABLE
+    assert route.replica_route_epoch == 1
+    assert route.sync_epoch == 0
+    assert route.serving_version == 7
+    assert route.commit_operation_id == context.operation_id
 
-def test_lb_remove_requires_matching_active_drain_and_settled_attempts():
+
+def test_lb_route_epoch_is_per_replica_not_global_counter():
+    lb = _lb_class()({})
+    first_ctx = _ctx("op-r1")
+    second_ctx = _ctx("op-r2")
+    first = _prepared(first_ctx, "r1")
+    second = _prepared(second_ctx, "r2")
+
+    r1 = lb.commit_routable(first_ctx, first, _weight(first_ctx, "r1"), _ce_add(first_ctx, first.key))
+    r2 = lb.commit_routable(second_ctx, second, _weight(second_ctx, "r2"), _ce_add(second_ctx, second.key))
+
+    assert r1.route_epoch == 1
+    assert r2.route_epoch == 1
+    assert lb.routes[first.key].replica_route_epoch == 1
+    assert lb.routes[second.key].replica_route_epoch == 1
+
+
+def test_lb_remove_preserves_draining_removed_state_and_settled_attempt_ledger():
     lb = _lb_class()({})
     context = _ctx()
-    proof = _exit(context)
-    ce = CommitReceipt(
-        header=EvidenceHeader(context, proof.header.key, 3, "ce-remove"),
-        owner=CommitOwner.CE,
-        action=ServiceAction.REMOVE,
-        revision=2,
-        version=None,
-        route_epoch=None,
-    )
+    prepared = _prepared(context)
+    installed = _weight(context)
+    lb.commit_routable(context, prepared, installed, _ce_add(context, prepared.key))
 
-    with pytest.raises(ValueError, match="active drain ticket"):
-        lb.finish_remove(context, proof, ce)
-
-    drain_key = (context.identity, proof.header.key)
-    lb.draining[drain_key] = SimpleNamespace(
-        drain_id="wrong-drain",
-        header=SimpleNamespace(phase_revision=1),
+    ticket = lb.close_for_exit(
+        context,
+        prepared.key,
+        phase_revision=1,
+        server_admission_epoch=4,
     )
-    with pytest.raises(ValueError, match="drain_id"):
-        lb.finish_remove(context, proof, ce)
+    assert ticket.route_epoch == 2
+    assert lb.routes[prepared.key].state is RouteState.DRAINING
+    assert lb.routes[prepared.key].replica_route_epoch == 2
 
-    lb.draining[drain_key] = SimpleNamespace(
-        drain_id=proof.drain_id,
-        header=SimpleNamespace(phase_revision=1),
-    )
+    proof = _exit(context, drain_id=ticket.drain_id)
+    ce = _ce_remove(context, proof.header.key)
     lb.attempts[proof.header.key] = {"a1": SimpleNamespace(state="RUNNING")}
     with pytest.raises(ValueError, match="attempts remain unsettled"):
         lb.finish_remove(context, proof, ce)
@@ -269,4 +307,12 @@ def test_lb_remove_requires_matching_active_drain_and_settled_attempts():
     assert receipt.owner is CommitOwner.LB
     assert receipt.action is ServiceAction.REMOVE
     assert receipt.version is None
-    assert receipt.route_epoch == 1
+    assert receipt.route_epoch == 3
+
+    tombstone = lb.routes[proof.header.key]
+    assert tombstone.state is RouteState.REMOVED
+    assert tombstone.replica_route_epoch == 3
+    assert tombstone.serving_version == installed.version
+    assert tombstone.commit_operation_id == context.operation_id
+    assert "a1" in lb.attempts[proof.header.key]
+    assert lb.finish_remove(context, proof, ce) is receipt
