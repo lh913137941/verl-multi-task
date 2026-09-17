@@ -254,6 +254,89 @@ class Ledger:
         gpu.lease_epoch = 0
         gpu.state = "FREE"
 
+    def _lease_gpu_records(
+        self, lease: LeaseRecord
+    ) -> Tuple[Tuple[Tuple[str, str, str], GpuRecord], ...]:
+        """Resolve a lease placement to registered GS GPU records.
+
+        ``current_user is None`` means the registered native owner retains the
+        implicit authorization. A borrower authorization is always explicit and
+        carries the matching lease identity on every GPU record.
+        """
+        if lease.placement is None:
+            raise ValueError("lease placement is required for GPU authorization")
+        node = lease.placement.node
+        records = []
+        for gpu_uuid in node.gpu_uuids:
+            gpu_key = (self.protocol.gs_epoch, node.node_id, gpu_uuid)
+            gpu = self.gpus.get(gpu_key)
+            if gpu is None:
+                raise ValueError(f"lease references unregistered GPU {gpu_key}")
+            if gpu.native_owner != lease.donor_session:
+                raise ValueError(
+                    f"GPU {gpu_key} native owner {gpu.native_owner!r} "
+                    f"does not match donor {lease.donor_session!r}"
+                )
+            records.append((gpu_key, gpu))
+        return tuple(records)
+
+    def validate_borrower_gpu_authorization(
+        self, lease: LeaseRecord
+    ) -> Tuple[Tuple[str, str, str], ...]:
+        """Preflight donor->borrower authorization without mutating GS state."""
+        if lease.borrower_session is None:
+            raise ValueError("borrower_session is required for borrower authorization")
+        records = self._lease_gpu_records(lease)
+        for gpu_key, gpu in records:
+            if gpu.current_user is not None:
+                raise ValueError(f"GPU {gpu_key} already has current_user {gpu.current_user!r}")
+            if gpu.lease_id is not None or gpu.state != "FREE":
+                raise ValueError(f"GPU {gpu_key} is not free for borrower authorization")
+        return tuple(gpu_key for gpu_key, _ in records)
+
+    def authorize_borrower_gpus(
+        self,
+        lease: LeaseRecord,
+        gpu_keys: Tuple[Tuple[str, str, str], ...],
+    ) -> None:
+        """Commit a previously validated donor->borrower authorization."""
+        if lease.borrower_session is None:
+            raise ValueError("borrower_session is required for borrower authorization")
+        for gpu_key in gpu_keys:
+            self.set_current_user(
+                gpu_key,
+                lease.borrower_session,
+                lease.lease_id,
+                lease.lease_epoch,
+            )
+
+    def validate_native_gpu_restoration(
+        self, lease: LeaseRecord
+    ) -> Tuple[Tuple[str, str, str], ...]:
+        """Preflight borrower->native authorization without mutating GS state."""
+        if lease.borrower_session is None:
+            raise ValueError("borrower_session is required for native restoration")
+        records = self._lease_gpu_records(lease)
+        for gpu_key, gpu in records:
+            if gpu.current_user != lease.borrower_session:
+                raise ValueError(
+                    f"GPU {gpu_key} is not authorized to borrower {lease.borrower_session!r}"
+                )
+            if gpu.lease_id != lease.lease_id or gpu.lease_epoch != lease.lease_epoch:
+                raise ValueError(f"GPU {gpu_key} borrower authorization belongs to another lease")
+            if gpu.state != "LENT":
+                raise ValueError(f"GPU {gpu_key} is not in LENT state")
+        return tuple(gpu_key for gpu_key, _ in records)
+
+    def restore_native_gpus(
+        self,
+        lease: LeaseRecord,
+        gpu_keys: Tuple[Tuple[str, str, str], ...],
+    ) -> None:
+        """Commit a previously validated borrower->native authorization."""
+        for gpu_key in gpu_keys:
+            self.clear_current_user(gpu_key)
+
     def open_lease(self, lease: LeaseRecord) -> None:
         if lease.lease_id in self.leases:
             raise ValueError(f"lease already exists: {lease.lease_id}")
