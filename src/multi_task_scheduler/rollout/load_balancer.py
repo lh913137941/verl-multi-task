@@ -148,7 +148,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         return bool(attempts)
 
     def finish_remove(self, ctx, proof, ce_commit) -> CommitReceipt:
-        """Commit R=REMOVED only after ExitEvidence and CE REMOVE are verified."""
+        """Commit R=REMOVED only for this operation's active, settled drain."""
         key = proof.header.key
         if proof.header.ctx != ctx:
             raise ValueError("LB REMOVE exit evidence belongs to another operation")
@@ -159,12 +159,21 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             or ce_commit.action is not ServiceAction.REMOVE
         ):
             raise ValueError("LB REMOVE requires matching CE REMOVE commit")
-        if self._has_unsettled_attempts(key):
-            raise ValueError("cannot remove route while attempts remain unsettled")
+
         cache_key = (ctx.identity, key, ServiceAction.REMOVE)
         cached = self._commit_receipts.get(cache_key)
         if cached is not None:
             return cached
+
+        ticket = self.draining.get((ctx.identity, key))
+        if ticket is None:
+            raise ValueError("LB REMOVE requires the active drain ticket")
+        if proof.drain_id != ticket.drain_id:
+            raise ValueError("ExitEvidence drain_id does not match active drain ticket")
+        if proof.header.phase_revision < ticket.header.phase_revision:
+            raise ValueError("ExitEvidence predates the active drain ticket")
+        if self._has_unsettled_attempts(key):
+            raise ValueError("cannot remove route while attempts remain unsettled")
 
         self.routing_epoch += 1
         self.lb_revision += 1
