@@ -32,7 +32,7 @@ pytestmark = pytest.mark.native
 
 @pytest.mark.parametrize("extension,native,inherited", [
     (MultiTaskFullyAsyncTaskRunner, FullyAsyncTaskRunner, ("_initialize_components", "_run_training_loop")),
-    (MultiTaskFullyAsyncTrainer, FullyAsyncTrainer, ("init_workers", "fit", "_fit_update_weights")),
+    (MultiTaskFullyAsyncTrainer, FullyAsyncTrainer, ("init_workers", "fit")),
     (MultiTaskFullyAsyncRollouter, FullyAsyncRollouter, ("init_workers", "fit")),
 ])
 def test_real_actor_subclasses_preserve_native_methods_and_resource_options(extension, native, inherited):

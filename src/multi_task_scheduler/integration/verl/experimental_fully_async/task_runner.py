@@ -23,6 +23,7 @@ from verl.experimental.separation.utils import create_resource_pool_manager
 from verl.trainer.ppo.utils import Role
 
 from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
+from multi_task_scheduler.orchestration.operation_journal import OperationJournal
 from multi_task_scheduler.scheduler.discovery import get_or_create_group_scheduler
 
 from .rollouter import MultiTaskFullyAsyncRollouter
@@ -38,6 +39,27 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
     def __init__(self):
         super().__init__()
         self.group_scheduler = None
+
+    def _ensure_journal(self) -> OperationJournal:
+        # Lazy so the inherited native TaskRunner constructor stays untouched.
+        if not hasattr(self, "_operation_journal"):
+            self._operation_journal = OperationJournal()
+        return self._operation_journal
+
+    def begin_operation(self, command):
+        """Record an incoming GS command idempotently (section 3.2)."""
+        return self._ensure_journal().begin(
+            command.operation_id,
+            command.lease_epoch,
+            command.replica_id,
+            command.kind,
+            payload_digest=command.payload_digest,
+            command_seq=command.command_seq,
+        )
+
+    def query_operation(self, operation_id: str):
+        """Return the task-internal operation record, if any."""
+        return self._ensure_journal().query(operation_id)
 
     def run(self, config):
         """Attach this Actor to GS, then execute verl's original run method."""

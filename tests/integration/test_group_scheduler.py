@@ -11,8 +11,22 @@ import pytest
 import ray
 
 from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
+from multi_task_scheduler.orchestration.contracts import (
+    Command,
+    GpuPlacement,
+    NodeBlock,
+    OperationContext,
+    OperationResult,
+    PlacementSpec,
+)
+from multi_task_scheduler.orchestration.operation_journal import OperationType
 from multi_task_scheduler.scheduler import discovery
 from multi_task_scheduler.scheduler.group_scheduler import RUNTIME_KIND
+from multi_task_scheduler.scheduler.ledger import (
+    IdleReport,
+    LeaseRecord,
+    ResourceManifest,
+)
 
 
 pytestmark = pytest.mark.ray_integration
@@ -110,3 +124,64 @@ def test_real_ray_unwrap_subclass_and_remote_constructor_delegate_to_parent(isol
         assert ray.get(child.describe.remote()) == (17, True, "ChildProbe")
     finally:
         ray.kill(child, no_restart=True)
+
+
+def _placement():
+    block = NodeBlock(
+        node_id="n1",
+        gpus=(GpuPlacement(gpu_uuid="u0", physical_id=0, global_rank=0, local_rank=0),),
+    )
+    return PlacementSpec(node_blocks=(block,), model_signature="sig-1")
+
+
+def _command(operation_id="op-1", digest="d1"):
+    return Command(
+        protocol_version="p1", gs_epoch=1, target_task_id="task-a",
+        target_task_session="s1", operation_id=operation_id, payload_digest=digest,
+        kind=OperationType.ADD, lease_id="l1", lease_epoch=0,
+        command_seq=0, replica_id="r1",
+    )
+
+
+def test_gs_control_interfaces_round_trip(isolated_ray):
+    """The section 4.4 interfaces store intent and merge receipts, no policy."""
+    scheduler = discovery.get_or_create_group_scheduler()
+    task = TaskRunnerProbe.remote()
+    try:
+        attached = ray.get(scheduler.attach_controller.remote("task-a", "s1", task))
+        assert attached["status"] == "INITIALIZING"
+
+        manifest = ResourceManifest(owner_task_session="s1", placement=_placement(), replica_id="r1")
+        assert ray.get(scheduler.register_resources.remote("reg-1", manifest))["status"] == "READY"
+
+        assert ray.get(scheduler.submit_operation.remote(_command()))["state"] == "ACCEPTED"
+        # Same ID, conflicting digest -> REJECTED, never overwrites intent.
+        rejected = ray.get(scheduler.submit_operation.remote(_command(digest="other")))
+        assert rejected["state"] == "REJECTED"
+
+        query = ray.get(scheduler.query_operation.remote("op-1"))
+        assert query["phase"] == "ACCEPTED"
+
+        result = OperationResult(
+            identity_fields=OperationContext(
+                protocol_version="p1", gs_epoch=1, task_id="task-a", task_session="s1",
+                operation_id="op-1", lease_id="l1", lease_epoch=0, command_seq=0,
+            ),
+            phase="APPLYING", phase_revision=1, state="COMMITTED",
+            actual_replica_state="ACTIVE",
+        )
+        assert ray.get(scheduler.report_operation_result.remote(result))["merged"] is True
+        assert ray.get(scheduler.query_operation.remote("op-1"))["final_result"].state == "COMMITTED"
+
+        snapshot = ray.get(scheduler.get_resource_snapshot.remote("s1"))
+        assert snapshot["expected_session"] == "s1"
+        assert any(g["gpu_uuid"] == "u0" for g in snapshot["gpus"])
+
+        idle = IdleReport(source_session="s1", source_seq=1, production_epoch=0, candidate_ids=("r1",))
+        assert ray.get(scheduler.report_idle_candidates.remote(idle))["candidates"] == ["r1"]
+
+        opened = ray.get(scheduler.open_lease.remote(LeaseRecord(lease_id="l1", donor_session="s1")))
+        assert opened["state"] == "PLANNED"
+        assert ray.get(scheduler.advance_lease.remote("l1", "DONOR_DRAINING"))["state"] == "DONOR_DRAINING"
+    finally:
+        ray.kill(task, no_restart=True)

@@ -14,6 +14,15 @@ from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
+from multi_task_scheduler.orchestration.operation_journal import OperationJournal, OperationType
+from multi_task_scheduler.orchestration.production_window import (
+    ProductionWindow,
+    ReplicaObservation,
+    ReplicaView,
+    select_idle_candidates,
+)
+from multi_task_scheduler.orchestration.replica_sync_gate import GateFencedError, GateKind, ReplicaSyncGate
+
 
 SOURCE = Path(__file__).resolve().parents[2] / "src/multi_task_scheduler"
 INTEGRATION = "integration/verl/experimental_fully_async"
@@ -248,3 +257,198 @@ def test_trainer_uses_rollouter_replica_projection_for_native_checkpoint_manager
     factory.assert_called_once_with(config=checkpoint_config, actor_wg=trainer.actor_wg, replicas=replicas)
     assert trainer.checkpoint_manager is factory.return_value
     assert not hasattr(trainer, "group_scheduler")
+
+
+# --------------------------------------------------------------------------- #
+# Orchestration overlay bindings (Slice 4)
+# --------------------------------------------------------------------------- #
+
+
+def test_load_balancer_routing_overlay_transitions_without_native_routing():
+    class Parent:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    balancer_class = _isolated_class(
+        "rollout/load_balancer.py", "MultiTaskGlobalRequestLoadBalancer", Parent, DEFAULT_ROUTING_CACHE_SIZE=123,
+    )
+    balancer = balancer_class({"server-a": object(), "server-b": object()})
+    assert balancer.routable_ids == {"server-a", "server-b"}
+    assert balancer.begin_drain("server-a") == 1
+    assert "server-a" in balancer.draining_ids
+    assert "server-a" not in balancer.routable_ids
+    assert balancer.commit_routable("server-a") == 2
+    assert "server-a" in balancer.routable_ids
+    assert "server-a" not in balancer.draining_ids
+    assert balancer.finish_remove("server-a") is True
+    assert "server-a" not in balancer.routable_ids
+    assert balancer.query_routing_operation("op-1") == "unknown"
+
+
+def test_replica_borrowed_cuda_setup_fails_and_native_delegates():
+    class Parent:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def _setup_env_cuda_visible_devices(self, *args, **kwargs):
+            return "native-setup"
+
+    ray_sub = SimpleNamespace(remote=Mock(side_effect=[object(), object()]))
+    replica_class = _isolated_class(
+        "rollout/replica.py", "MultiTaskvLLMReplica", Parent, ray=ray_sub,
+        MultiTaskvLLMHttpServer=object(), MultiTaskCheckpointEngineWorker=object(),
+        RayClassWithInitArgs=Mock(),
+    )
+    native = replica_class("model", replica_rank=0)
+    assert native.replica_kind == "native"
+    assert native._setup_env_cuda_visible_devices() == "native-setup"
+    borrowed = replica_class("model", replica_rank=1, replica_kind="borrowed")
+    with pytest.raises(NotImplementedError):
+        borrowed._setup_env_cuda_visible_devices()
+
+
+def test_http_server_wake_and_abort_are_explicit_failures():
+    server_class = _isolated_class("rollout/http_server.py", "MultiTaskvLLMHttpServer", object)
+    server = server_class()
+    with pytest.raises(NotImplementedError):
+        server.wake_weights("r1")
+    with pytest.raises(NotImplementedError):
+        server.wake_kv_and_validate(object())
+    with pytest.raises(NotImplementedError):
+        server.abort_target("r1")
+
+
+def test_manager_lifecycle_overlay_records_and_fails_gpu_primitives():
+    class Parent:
+        def __init__(self, *args):
+            pass
+
+    manager_class = _isolated_class(
+        f"{INTEGRATION}/llm_server_manager.py", "MultiTaskLLMServerManager", Parent,
+        MultiTaskvLLMReplica=object(), MultiTaskGlobalRequestLoadBalancer=object(),
+        DEFAULT_ROUTING_CACHE_SIZE=123,
+        ray=SimpleNamespace(remote=Mock(return_value=SimpleNamespace(remote=Mock()))),
+    )
+    manager = manager_class(object())
+    record = SimpleNamespace(replica_id="r1")
+    assert manager.record_lifecycle(record) is record
+    assert manager.inspect_runtime(None, "r1") is record
+    assert manager.inspect_runtime(None, "missing") is None
+    with pytest.raises(NotImplementedError):
+        manager.materialize_hidden(None, None, None)
+    with pytest.raises(NotImplementedError):
+        manager.sleep_runtime(None, "r1")
+    with pytest.raises(NotImplementedError):
+        manager.destroy_runtime(None, "r1")
+
+
+def test_rollouter_production_window_lazy_and_candidate_reporting():
+    class Parent:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    rollouter_class = _isolated_class(
+        f"{INTEGRATION}/rollouter.py", "MultiTaskFullyAsyncRollouter", Parent,
+        MultiTaskLLMServerManager=SimpleNamespace(), FullyAsyncAgentLoopManager=SimpleNamespace(),
+        FullyAsyncLLMServerClient=object(), ProductionWindow=ProductionWindow,
+        select_idle_candidates=select_idle_candidates,
+    )
+    rollouter = rollouter_class(object(), object(), None, "cuda")
+    window = rollouter.production_window
+    assert isinstance(window, ProductionWindow)
+    assert rollouter.production_window is window  # lazy singleton
+    rollouter.set_production_window(
+        ProductionWindow(production_epoch=3, source_seq=1, exhausted_this_round=True, eligible_pending=0, held=0)
+    )
+    obs = ReplicaObservation(replica_id="r1", in_flight=0, admitting=0, queued=0, running=0,
+                             pending_admissions=0, production_epoch=3, all_backends_observed=True)
+    candidates = rollouter.report_idle_candidates(
+        rollouter.production_window, [ReplicaView(obs)],
+        observations_fresh=True, min_active_gpus=1, current_active_gpus=2, routable_count=2,
+    )
+    assert candidates.candidate_ids == ("r1",)
+    with pytest.raises(NotImplementedError):
+        rollouter.prepare_replica(None, None)
+    with pytest.raises(NotImplementedError):
+        rollouter.begin_drain(None, "r1")
+
+
+def test_trainer_gate_version_and_transaction_entry_points():
+    trainer_class = _isolated_class(
+        f"{INTEGRATION}/trainer.py", "MultiTaskFullyAsyncTrainer", object,
+        omega_conf_to_dataclass=Mock(), MultiTaskCheckpointEngineManager=Mock(),
+        ReplicaSyncGate=ReplicaSyncGate,
+    )
+    trainer = trainer_class()
+    assert trainer.published_serving_version == 0
+    trainer.publish_serving_version(7)
+    assert trainer.published_serving_version == 7
+    gate = trainer.replica_sync_gate
+    assert isinstance(gate, ReplicaSyncGate)
+    assert trainer.replica_sync_gate is gate  # lazy singleton
+    with pytest.raises(NotImplementedError):
+        asyncio.run(trainer.bootstrap_and_publish(None, None))
+    with pytest.raises(NotImplementedError):
+        asyncio.run(trainer.remove_and_commit(None, "r1"))
+    with pytest.raises(NotImplementedError):
+        asyncio.run(trainer.restore_and_publish(None, None, True))
+
+
+def test_task_runner_operation_journal_is_idempotent():
+    class Parent:
+        def __init__(self):
+            pass
+
+    runner_class = _isolated_class(
+        f"{INTEGRATION}/task_runner.py", "MultiTaskFullyAsyncTaskRunner", Parent,
+        OperationJournal=OperationJournal,
+    )
+    runner = runner_class()
+    cmd = SimpleNamespace(
+        operation_id="op-1", lease_epoch=2, replica_id="r1", kind=OperationType.ADD,
+        payload_digest="d1", command_seq=0,
+    )
+    first = runner.begin_operation(cmd)
+    second = runner.begin_operation(cmd)  # idempotent replay
+    assert first is second
+    assert runner.query_operation("op-1") is first
+    assert runner.query_operation("missing") is None
+
+
+@pytest.mark.parametrize("failure", [None, RuntimeError, asyncio.CancelledError])
+def test_native_sync_runs_under_the_same_gate_and_uncertainty_blocks_followups(failure):
+    async def scenario():
+        events = []
+
+        class Parent:
+            async def _fit_update_weights(self):
+                assert self.replica_sync_gate.owner.kind is GateKind.NATIVE_SYNC
+                events.append("native_sync")
+                if failure:
+                    raise failure("native sync interrupted")
+                return {"timing": 1}
+
+        trainer_class = _isolated_class(
+            f"{INTEGRATION}/trainer.py", "MultiTaskFullyAsyncTrainer", Parent,
+            ReplicaSyncGate=ReplicaSyncGate, GateKind=GateKind,
+        )
+        trainer = trainer_class()
+        trainer.local_trigger_step = 1
+        trainer.current_param_version = 7
+        if failure:
+            with pytest.raises(failure):
+                await trainer._fit_update_weights()
+            assert trainer.replica_sync_gate.health == "BLOCKED"
+            with pytest.raises(GateFencedError):
+                await trainer.replica_sync_gate.acquire("add", GateKind.ADD)
+        else:
+            assert await trainer._fit_update_weights() == {"timing": 1}
+            assert trainer.replica_sync_gate.health == "HEALTHY"
+        assert trainer.replica_sync_gate.owner is None
+        assert events == ["native_sync"]
+        # A native no-op must not start synchronization or change gate health.
+        trainer.local_trigger_step = 2
+        assert await trainer._fit_update_weights() is None
+        assert events == ["native_sync"]
+
+    asyncio.run(scenario())

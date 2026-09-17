@@ -34,6 +34,9 @@ def config():
 @pytest.mark.parametrize("disabled", [
     {}, {"multitask": None}, {"multitask": {"runtime": None}},
     {"multitask": {"runtime": {"profile": None}}},
+    {"multitask": {"enabled": False}},
+    {"multitask": {"enabled": False, "runtime": {"profile": PROFILE_ID}}},
+    {"multitask": {"enabled": False, "runtime": {"profile": "unknown"}}},
 ])
 def test_disabled_resolution_has_no_runtime_import(disabled):
     before = set(sys.modules)
@@ -54,6 +57,22 @@ def test_valid_configuration_is_not_mutated(config, use_omegaconf):
     selected = OmegaConf.create(config) if use_omegaconf else config
     assert validate_runtime_profile(selected)
     assert (OmegaConf.to_container(selected) if use_omegaconf else selected) == before
+
+
+@pytest.mark.parametrize("runtime", [None, {}, {"profile": None}, {"profile": PROFILE_ID}])
+def test_enabled_switch_selects_supported_profile_without_mutating_config(config, runtime):
+    config["multitask"] = {"enabled": True, "runtime": runtime}
+    selected = OmegaConf.create(config)
+    before = OmegaConf.to_container(selected)
+    assert validate_runtime_profile(selected) is True
+    assert OmegaConf.to_container(selected) == before
+
+
+@pytest.mark.parametrize("value", [None, "true", "false", 0, 1, [], {}])
+def test_switch_requires_a_boolean_even_with_a_valid_profile(config, value):
+    config["multitask"]["enabled"] = value
+    with pytest.raises(ProfileConfigurationError, match="multitask.enabled"):
+        resolve_runtime_profile(config)
 
 
 @pytest.mark.parametrize("path,value", [

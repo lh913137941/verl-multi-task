@@ -28,17 +28,35 @@ def _select(config, path, default=_MISSING):
 def validate_runtime_profile(config) -> bool:
     """Check selection and minimal native preconditions without changing config.
 
+    Explicit ``enabled=false`` overrides any stored profile. ``enabled=true``
+    selects the sole profile by default; old custom configs without the switch
+    can still select it explicitly. Nothing is written back to Hydra config.
+
     Native main has already mapped rollout node/GPU counts. Backend placement and
     training algorithm checks remain native; this is not a full topology validator.
     """
     if not isinstance(config, Mapping):
         raise ProfileConfigurationError("Configuration must be a mapping")
+    multitask = _select(config, "multitask", None)
+    if multitask is None:
+        return False
+    if not isinstance(multitask, Mapping):
+        raise ProfileConfigurationError("multitask must be a mapping")
+    enabled = multitask.get("enabled", False)
+    if "enabled" in multitask:
+        if type(enabled) is not bool:
+            raise ProfileConfigurationError("multitask.enabled must be a boolean")
+        if not enabled:
+            return False
     profile = _select(config, "multitask.runtime.profile", None)
     if profile is None:
-        return False
+        if not enabled:
+            return False
+        profile = PROFILE_ID
     if not isinstance(profile, str) or profile != PROFILE_ID:
         raise ProfileConfigurationError(f"Unknown multitask.runtime.profile: {profile!r}")
-    if set(_select(config, "multitask.runtime")) != {"profile"}:
+    runtime = _select(config, "multitask.runtime", None)
+    if runtime is not None and set(runtime) - {"profile"}:
         raise ProfileConfigurationError("multitask.runtime accepts only profile, not per-class selectors")
     if _select(config, "multitask.rollout_deployment", None) is not None:
         raise ProfileConfigurationError("Use only multitask.runtime.profile to select the deployment")

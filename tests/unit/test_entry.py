@@ -9,8 +9,10 @@ import builtins
 import os
 from pathlib import Path
 import subprocess
+import sys
 from types import SimpleNamespace
 
+from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 import pytest
 import yaml
@@ -19,7 +21,7 @@ import yaml
 MAIN = "verl/experimental/fully_async_policy/fully_async_main.py"
 CONFIG = "verl/experimental/fully_async_policy/config/fully_async_ppo_trainer.yaml"
 # Keep the unmodified upstream baseline stable when the wiring patch is committed.
-UPSTREAM_BASELINE = "adc7eefa16dad75c5f7b878823d5a76eac90c7b3"
+UPSTREAM_BASELINE = "f92febf50fe3db102273eaf59b1854f392ae761d"
 _MISSING = object()
 
 
@@ -32,7 +34,7 @@ def verl_root():
     return root
 
 
-def _main_with_scoped_imports(verl_root, events, resolve):
+def _main_with_scoped_imports(verl_root, events, resolve, *, import_error=None):
     tree = ast.parse((verl_root / MAIN).read_text())
     main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
     main.decorator_list = []
@@ -46,6 +48,8 @@ def _main_with_scoped_imports(verl_root, events, resolve):
             return SimpleNamespace(run_ppo=run_ppo)
         if name == "multi_task_scheduler.integration.verl.runtime_profile":
             events.append(("companion_import",))
+            if import_error is not None:
+                raise import_error
             return SimpleNamespace(resolve_runtime_profile=resolve)
         if name == "time":
             return builtins.__import__(name, globals, locals, fromlist, level)
@@ -79,7 +83,12 @@ def _config(multitask=_MISSING):
     return OmegaConf.create(values)
 
 
-@pytest.mark.parametrize("multitask", [_MISSING, None, {"runtime": None}, {"runtime": {"profile": None}}])
+@pytest.mark.parametrize("multitask", [
+    _MISSING, None, {"runtime": None}, {"runtime": {"profile": None}},
+    {"enabled": False},
+    {"enabled": False, "runtime": {"profile": "experimental_fully_async_standalone"}},
+    {"enabled": False, "runtime": {"profile": "unknown"}},
+])
 def test_disabled_entry_keeps_native_actor_and_never_imports_companion(verl_root, multitask):
     events = []
 
@@ -107,7 +116,12 @@ def test_entry_rejects_nonmapping_profile_parents_without_import_or_native_fallb
     assert not any(event[0] in {"run_ppo", "companion_import"} for event in events)
 
 
-def test_enabled_entry_selects_root_only_after_native_config_mapping(verl_root):
+@pytest.mark.parametrize("multitask", [
+    {"enabled": True},
+    {"enabled": True, "runtime": {"profile": None}},
+    {"runtime": {"profile": "experimental_fully_async_standalone"}},
+])
+def test_enabled_entry_selects_root_only_after_native_config_mapping(verl_root, multitask):
     events = []
     selected_actor = object()  # Explicit entry-boundary substitute, not an ActorClass.
 
@@ -118,7 +132,7 @@ def test_enabled_entry_selects_root_only_after_native_config_mapping(verl_root):
         return selected_actor
 
     main, _ = _main_with_scoped_imports(verl_root, events, resolve)
-    main(_config({"runtime": {"profile": "experimental_fully_async_standalone"}}))
+    main(_config(multitask))
     assert [event[0] for event in events] == [
         "auto_set_device", "reward_migration", "companion_import", "resolve", "run_ppo"
     ]
@@ -135,6 +149,69 @@ def test_enabled_entry_propagates_resolution_failure_without_native_fallback(ver
     with pytest.raises(RuntimeError, match="explicit integration failure"):
         main(_config({"runtime": {"profile": "experimental_fully_async_standalone"}}))
     assert not any(event[0] == "run_ppo" for event in events)
+
+
+@pytest.mark.parametrize("value", [None, "true", "false", 0, 1, [], {}])
+def test_invalid_switch_fails_before_import_or_native_launch(verl_root, value):
+    events = []
+    main, _ = _main_with_scoped_imports(verl_root, events, lambda config: pytest.fail("must not resolve"))
+    with pytest.raises(ValueError, match="multitask.enabled"):
+        main(_config({"enabled": value}))
+    assert not any(event[0] in {"companion_import", "run_ppo"} for event in events)
+
+
+def test_enabled_entry_does_not_accept_disabled_resolution(verl_root):
+    events = []
+    main, _ = _main_with_scoped_imports(verl_root, events, lambda config: None)
+    with pytest.raises(RuntimeError, match="TaskRunner"):
+        main(_config({"enabled": True}))
+    assert not any(event[0] == "run_ppo" for event in events)
+
+
+@pytest.mark.parametrize("missing", ["multi_task_scheduler", "ray", "vllm"])
+def test_enabled_entry_reports_missing_package_without_hiding_backend_import_failures(verl_root, missing):
+    events = []
+    error = ModuleNotFoundError(f"No module named {missing!r}", name=missing)
+    main, _ = _main_with_scoped_imports(verl_root, events, None, import_error=error)
+    with pytest.raises(ImportError) as raised:
+        main(_config({"enabled": True}))
+    if missing == "multi_task_scheduler":
+        assert "install" in str(raised.value).lower()
+        assert raised.value.__cause__ is error
+    else:
+        assert raised.value is error
+    assert not any(event[0] == "run_ppo" for event in events)
+
+
+def test_native_hydra_config_and_example_reach_the_real_plugin_resolver(verl_root, monkeypatch):
+    from multi_task_scheduler.integration.verl.runtime_profile import resolve_runtime_profile
+
+    # Use the actual primary and defaults tree. Only map Hydra's config search to
+    # files, avoiding import of GPU-dependent verl.__init__ in this CPU test.
+    searchpath = "file://" + (verl_root / "verl/trainer/config").as_posix()
+    overrides = [f"hydra.searchpath=['{searchpath}']"]
+    with initialize_config_dir(config_dir=str((verl_root / CONFIG).parent), version_base=None):
+        disabled = compose(config_name="fully_async_ppo_trainer", overrides=overrides)
+        example = Path(__file__).resolve().parents[2] / "examples/experimental_fully_async/native_entry_overrides.txt"
+        selected = compose(config_name="fully_async_ppo_trainer", overrides=overrides + [
+            line.strip() for line in example.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.startswith("#")
+        ])
+    assert disabled.multitask.enabled is False
+    assert selected.multitask.enabled is True
+    events = []
+    main, native_actor = _main_with_scoped_imports(verl_root, events, resolve_runtime_profile)
+    main(disabled)
+    assert events[-1][1] is native_actor
+    assert not any(event[0] == "companion_import" for event in events)
+    # Replace only the GPU ActorClass import; execute the actual selection and
+    # precondition validation on the composed native config.
+    selected_actor = object()
+    monkeypatch.setitem(sys.modules,
+                        "multi_task_scheduler.integration.verl.experimental_fully_async.task_runner",
+                        SimpleNamespace(MultiTaskFullyAsyncTaskRunner=selected_actor))
+    main(selected)
+    assert events[-1][1] is selected_actor
 
 
 @pytest.mark.parametrize("relative", [
@@ -159,12 +236,12 @@ def test_native_class_implementations_are_unchanged_from_upstream_baseline(verl_
     assert classes((verl_root / relative).read_text()) == classes(committed)
 
 
-def test_native_primary_adds_only_disabled_profile_default(verl_root):
+def test_native_primary_adds_only_disabled_plugin_defaults(verl_root):
     committed = subprocess.run(
         ["git", "-C", str(verl_root), "show", f"{UPSTREAM_BASELINE}:{CONFIG}"],
         check=True, capture_output=True, text=True,
     ).stdout
     original = yaml.safe_load(committed)
     current = yaml.safe_load((verl_root / CONFIG).read_text())
-    assert current.pop("multitask") == {"runtime": {"profile": None}}
+    assert current.pop("multitask") == {"enabled": False, "runtime": {"profile": None}}
     assert current == original
