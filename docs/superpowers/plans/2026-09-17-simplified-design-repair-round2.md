@@ -14,7 +14,12 @@
 - [x] PlacementSpec 首版收敛为单个 `NodePlacement` + `placement_digest`；删除旧多节点 `NodeBlock` wire shape，不保留兼容投影。
 - [x] ReleaseKind 对齐为 `DONOR_SLEEP_RELEASED / BORROWER_RUNTIME_DESTROYED`，公共证明统一使用 `ReleaseEvidence`；删除旧 `ReleaseReceipt` alias。
 - [x] `OperationKind` 为唯一公共操作枚举；删除旧 `OperationType` alias。
+- [x] ProductionWindow 对齐 v3：RO 只保存 `task_session/epoch/revision/state/P/H/...` 生产事实，不再承载 `source_seq`；ServerActivity 不塞自造 digest 字段。
+- [x] 空泡候选 owner 对齐：LB 负责 `source_seq`、完整 IdleCandidate 集合与 `IdleCandidateReport` 上报；同 seq 传输重试不续 TTL，空集合按完整替换撤销旧候选。
 - [x] IdleCandidate 直接携带完整观察身份；删除 ID-only CandidateSet / CandidateRef 公共包装。
+- [x] E 视图只保存 `EffectiveReplicaEntry` 投影，不把 PreparedReplica/Manager 准备态对象长期塞进 CE 成员真值；REMOVE 在参数 transfer 未静默时显式拒绝。
+- [x] R 视图改为 typed `RouteEntry`；ADD/DRAIN/REMOVE 按 replica 独立推进 route epoch，REMOVE 保留 `REMOVED` tombstone 与已结清 attempt 账本用于对账。
+- [x] `CapacityRecord / SyncSnapshot / TaskSnapshot` 对齐 v3 公共数据形状；`probe_task` 在真实 M/E/R/C 聚合 wiring 完成前保持显式 `NotImplementedError`，不伪造稳定快照。
 - [x] CE/LB owner 提交统一返回 typed `CommitReceipt`，不再保留 bool/int 兼容结果。
 - [x] TaskRunner 控制入口统一为 `submit_operation/query_operation/probe_task`，删除 `begin_operation`；退出入口统一为 `prepare_exit`，删除 `begin_drain`。
 - [x] GS 查询优先读取 TaskRunner 权威 operation journal，控制器不可达时只保守返回本地已知事实，不用健康状态猜执行结果。
