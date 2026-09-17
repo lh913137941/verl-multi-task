@@ -150,14 +150,16 @@ class GroupScheduler:
         self.ledger.merge_operation_result(command.ctx.operation_id, result)
         return result
 
-    def query_operation(
-        self, task_session: str, operation_id: str
-    ) -> QueryResult[OperationResult]:
-        record = self.ledger.operations.get(operation_id)
-        if record is None or record.command.ctx.task_session != task_session:
-            return QueryResult(found=False, value=None, outcome=Outcome.UNKNOWN)
+    @staticmethod
+    def _local_query_result(record) -> QueryResult[OperationResult]:
         if record.final_result is not None:
             result = record.final_result
+            if result.status in {OperationStatus.SUCCEEDED, OperationStatus.FAILED}:
+                outcome = Outcome.KNOWN_APPLIED
+            elif result.status is OperationStatus.ACCEPTED:
+                outcome = Outcome.KNOWN_NOT_APPLIED
+            else:
+                outcome = Outcome.UNKNOWN
         else:
             result = OperationResult(
                 ctx=record.command.ctx,
@@ -166,12 +168,36 @@ class GroupScheduler:
                 phase=Phase.VALIDATE,
                 phase_revision=0,
             )
-        outcome = (
-            Outcome.KNOWN_APPLIED
-            if result.status in {OperationStatus.SUCCEEDED, OperationStatus.FAILED}
-            else Outcome.UNKNOWN
-        )
+            # GS has recorded intent but cannot prove whether a dispatched RPC
+            # reached TaskRunner; this fallback must remain conservative.
+            outcome = Outcome.UNKNOWN
         return QueryResult(found=True, value=result, outcome=outcome)
+
+    def query_operation(
+        self, task_session: str, operation_id: str
+    ) -> QueryResult[OperationResult]:
+        """Prefer the TaskRunner authoritative journal; never infer from health."""
+        record = self.ledger.operations.get(operation_id)
+        if record is None or record.command.ctx.task_session != task_session:
+            return QueryResult(found=False, value=None, outcome=Outcome.UNKNOWN)
+
+        controller = self.controllers.get(
+            (record.command.ctx.task_id, record.command.ctx.task_session)
+        )
+        if controller is None:
+            return self._local_query_result(record)
+        try:
+            queried = ray.get(
+                controller.query_operation.remote(task_session, operation_id),
+                timeout=30,
+            )
+        except Exception:
+            return self._local_query_result(record)
+        if not isinstance(queried, QueryResult):
+            raise TypeError("TaskRunner query returned a non-QueryResult")
+        if queried.found and queried.value is not None:
+            self.ledger.merge_operation_result(operation_id, queried.value)
+        return queried
 
     def probe_task(self, task_id: str, task_session: str):
         controller = self.controllers.get((task_id, task_session))
