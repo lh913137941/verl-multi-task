@@ -18,7 +18,7 @@
 - [x] TaskRunner 控制入口统一为 `submit_operation/query_operation/probe_task`，删除 `begin_operation`；退出入口统一为 `prepare_exit`，删除 `begin_drain`。
 - [x] GS 查询优先读取 TaskRunner 权威 operation journal，控制器不可达时只保守返回本地已知事实，不用健康状态猜执行结果。
 - [x] FORCE_VERIFIED continuation 必须显式证明 `old_terminal.device_finished=True`；缺字段不能默认通过。
-- [ ] GS lease 授权闭环：释放边必须核验完整 `OperationResult + ReleaseEvidence`，并把确认过的 release digest 绑定到后续 ADD/RESTORE authorization。
+- [x] GS lease 授权闭环：释放边核验完整 `OperationResult + ServiceEvidence(REMOVE) + ReleaseEvidence`，要求逐 GPU 释放证明完整覆盖 lease placement，并把确认过的 release digest 绑定到后续 ADD/RESTORE authorization。
 - [x] 修正第一轮计划错误勾选，并更新相关 docstring 编号/语义。
 - [x] CPU Ray GS 集成测试迁移到新 protocol/epoch/placement/status 合同（仍需真实执行环境验证）。
 
