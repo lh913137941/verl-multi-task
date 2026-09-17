@@ -1,8 +1,8 @@
 """Replayable operation metadata aligned with simplified design §6.1/§6.3.
 
-``status`` and ``phase`` are deliberately independent facts.  In particular,
-``Phase.DONE`` can describe either a known success or a known failure, so code
-must never infer the terminal ``OperationStatus`` from the phase alone.
+``status`` and ``phase`` are independent facts. ``Phase.DONE`` may describe a
+known success, a known failure, or a terminal unknown result, so terminal status
+is always explicit.
 """
 
 from __future__ import annotations
@@ -17,6 +17,14 @@ class OperationKind(str, Enum):
     DONATE = "DONATE"
     REMOVE = "REMOVE"
     RESTORE = "RESTORE"
+
+
+class OperationStatus(str, Enum):
+    ACCEPTED = "ACCEPTED"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    UNKNOWN = "UNKNOWN"
 
 
 class Phase(str, Enum):
@@ -38,19 +46,10 @@ class Phase(str, Enum):
     DONE = "DONE"
 
 
-class OperationStatus(str, Enum):
-    ACCEPTED = "ACCEPTED"
-    RUNNING = "RUNNING"
-    SUCCEEDED = "SUCCEEDED"
-    FAILED = "FAILED"
+class Outcome(str, Enum):
+    KNOWN_NOT_APPLIED = "KNOWN_NOT_APPLIED"
+    KNOWN_APPLIED = "KNOWN_APPLIED"
     UNKNOWN = "UNKNOWN"
-
-
-# Compatibility names for callers outside this repository.  Repository code
-# uses the simplified-design names above.
-OperationType = OperationKind
-OperationPhase = Phase
-OperationState = OperationStatus
 
 
 class ExpiredLeaseError(RuntimeError):
@@ -97,28 +96,15 @@ _TERMINAL_STATUSES = {
 }
 
 
-def phase_to_state(
-    phase: Phase,
-    *,
-    terminal_status: OperationStatus | None = None,
-) -> OperationStatus:
-    """Compatibility helper without collapsing independent status semantics.
-
-    ``DONE`` is ambiguous by design, therefore its status must be supplied.
-    ``RECONCILE`` represents an unresolved side effect and maps to UNKNOWN.
-    """
-    phase = Phase(phase)
+def _default_status_for_phase(phase: Phase) -> OperationStatus:
     if phase is Phase.VALIDATE:
         return OperationStatus.ACCEPTED
     if phase is Phase.RECONCILE:
         return OperationStatus.UNKNOWN
     if phase is Phase.DONE:
-        if terminal_status is None:
-            raise ValueError("DONE phase requires an explicit terminal OperationStatus")
-        terminal_status = OperationStatus(terminal_status)
-        if terminal_status not in _TERMINAL_STATUSES:
-            raise ValueError("DONE requires SUCCEEDED, FAILED, or UNKNOWN")
-        return terminal_status
+        raise IllegalOperationTransitionError(
+            "DONE requires an explicit SUCCEEDED/FAILED/UNKNOWN status"
+        )
     return OperationStatus.RUNNING
 
 
@@ -127,7 +113,7 @@ class OperationRecord:
     operation_id: str
     lease_epoch: int
     replica_id: str
-    operation_kind: OperationKind
+    kind: OperationKind
     phase: Phase = Phase.VALIDATE
     status: OperationStatus = OperationStatus.ACCEPTED
     phase_revision: int = 0
@@ -139,16 +125,6 @@ class OperationRecord:
     error: object | None = None
     created_at: float = field(default_factory=time.monotonic)
     updated_at: float = field(default_factory=time.monotonic)
-
-    @property
-    def operation_type(self) -> OperationKind:
-        """Compatibility alias for the superseded field name."""
-        return self.operation_kind
-
-    @property
-    def state(self) -> OperationStatus:
-        """Compatibility alias; status is stored, not derived from phase."""
-        return self.status
 
 
 class OperationJournal:
@@ -168,7 +144,7 @@ class OperationJournal:
         operation_id: str,
         lease_epoch: int,
         replica_id: str,
-        operation_kind: OperationKind,
+        kind: OperationKind,
         *,
         payload_digest: str | None = None,
         command_seq: int = 0,
@@ -177,7 +153,7 @@ class OperationJournal:
             raise ValueError("operation_id and replica_id must be nonempty")
         if lease_epoch < 0 or command_seq < 0:
             raise ValueError("lease_epoch and command_seq must be nonnegative")
-        operation_kind = OperationKind(operation_kind)
+        kind = OperationKind(kind)
 
         existing = self._records.get(operation_id)
         if existing is not None:
@@ -189,7 +165,7 @@ class OperationJournal:
             if lease_epoch == existing.lease_epoch:
                 if (
                     existing.replica_id != replica_id
-                    or existing.operation_kind is not operation_kind
+                    or existing.kind is not kind
                     or existing.payload_digest != payload_digest
                     or existing.command_seq != command_seq
                 ):
@@ -205,7 +181,7 @@ class OperationJournal:
             operation_id=operation_id,
             lease_epoch=lease_epoch,
             replica_id=replica_id,
-            operation_kind=operation_kind,
+            kind=kind,
             payload_digest=payload_digest,
             command_seq=command_seq,
         )
@@ -243,15 +219,11 @@ class OperationJournal:
                 f"{record.phase.value} -> {new_phase.value}"
             )
 
-        if status is None:
-            if new_phase is Phase.DONE:
-                raise IllegalOperationTransitionError(
-                    "DONE requires an explicit SUCCEEDED/FAILED/UNKNOWN status"
-                )
-            new_status = phase_to_state(new_phase)
-        else:
-            new_status = OperationStatus(status)
-
+        new_status = (
+            _default_status_for_phase(new_phase)
+            if status is None
+            else OperationStatus(status)
+        )
         if new_phase is Phase.DONE:
             if new_status not in _TERMINAL_STATUSES:
                 raise IllegalOperationTransitionError(
