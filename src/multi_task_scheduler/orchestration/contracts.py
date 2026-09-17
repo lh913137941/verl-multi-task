@@ -418,6 +418,11 @@ class OperationResult:
             OperationStatus.FAILED,
         }:
             raise ValueError("SUCCEEDED/FAILED require DONE")
+        if self.status is OperationStatus.UNKNOWN and self.phase not in {
+            Phase.RECONCILE,
+            Phase.DONE,
+        }:
+            raise ValueError("UNKNOWN is only valid while reconciling or at DONE")
 
 
 @dataclass(frozen=True)
