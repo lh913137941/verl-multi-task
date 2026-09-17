@@ -120,21 +120,6 @@ class ServerActivity:
             and not self.transfer_inflight
         )
 
-    @property
-    def digest(self) -> str:
-        return _digest(
-            "SERVER_ACTIVITY",
-            self.key,
-            self.engine_seq,
-            self.observed_age_ms,
-            self.admitting,
-            self.queued,
-            self.running,
-            self.pending_admissions,
-            self.transfer_inflight,
-            self.all_backends_observed,
-        )
-
 
 @dataclass(frozen=True)
 class ReplicaView:
@@ -197,7 +182,18 @@ def select_idle_candidates(
         if current_active_gpus - view.gpu_count < min_active_gpus:
             continue
 
-        engine_digest = activity.digest
+        engine_digest = _digest(
+            "SERVER_ACTIVITY",
+            activity.key,
+            activity.engine_seq,
+            activity.observed_age_ms,
+            activity.admitting,
+            activity.queued,
+            activity.running,
+            activity.pending_admissions,
+            activity.transfer_inflight,
+            activity.all_backends_observed,
+        )
         evidence_digest = _digest(
             activity.key,
             window.task_session,

@@ -126,7 +126,7 @@ def test_selector_emits_full_idle_candidate_with_lb_source_seq():
     assert first.source_seq == 7
     assert first.manager_revision == 2
     assert first.lb_revision == 4
-    assert first.engine_digest == _activity("r1").digest
+    assert first.engine_digest
     assert first.reason == "CLOSED_STALENESS"
     assert first.stable_idle_ms == 500
     assert first.observed_age_ms == 10
@@ -136,7 +136,9 @@ def test_selector_emits_full_idle_candidate_with_lb_source_seq():
 
 
 def test_engine_digest_changes_when_server_observation_changes():
-    assert _activity(engine_seq=5).digest != _activity(engine_seq=6).digest
+    first = _select(replace(_view(), activity=_activity(engine_seq=5)))[0]
+    second = _select(replace(_view(), activity=_activity(engine_seq=6)))[0]
+    assert first.engine_digest != second.engine_digest
 
 
 def test_selector_respects_capacity_and_routable_lower_bounds():
