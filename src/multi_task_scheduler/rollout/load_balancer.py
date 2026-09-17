@@ -1,8 +1,9 @@
 """Native routing subclass plus the simplified R-view commit protocol.
 
 Dynamic service commits use full ReplicaKey identity and return CommitReceipt.
-No bool/int compatibility result is exposed. Native request selection remains
-inherited until dynamic routing is wired end-to-end.
+LB also owns idle-candidate observation sequencing/reporting, as required by the
+simplified fusion contract. Native request selection remains inherited until
+dynamic routing is wired end-to-end.
 """
 
 from __future__ import annotations
@@ -10,10 +11,16 @@ from __future__ import annotations
 import hashlib
 import uuid
 
+import ray
 from verl.workers.rollout.llm_server import DEFAULT_ROUTING_CACHE_SIZE, GlobalRequestLoadBalancer
 
-from multi_task_scheduler.orchestration.contracts import ServiceAction
+from multi_task_scheduler.orchestration.contracts import IdleCandidateReport, ServiceAction
+from multi_task_scheduler.orchestration.production_window import (
+    ProductionWindow,
+    select_idle_candidates,
+)
 from multi_task_scheduler.orchestration.receipts import (
+    Ack,
     CommitOwner,
     CommitReceipt,
     DrainTicket,
@@ -27,7 +34,7 @@ def _digest(*parts: object) -> str:
 
 
 class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
-    """LB owns R and its attempt ledger; native selection stays inherited."""
+    """LB owns R, its attempt ledger, and idle-candidate report sequencing."""
 
     def __init__(
         self,
@@ -45,6 +52,72 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         self.draining = {}
         self.attempts = {}
         self._commit_receipts = {}
+        self._idle_source_seq = -1
+        self._last_idle_report = None
+
+    @property
+    def last_idle_report(self) -> IdleCandidateReport | None:
+        return self._last_idle_report
+
+    def build_idle_candidate_report(
+        self,
+        window: ProductionWindow,
+        replicas,
+        *,
+        gs_epoch: str,
+        lb_session: str,
+        valid_for_ms: int,
+        observations_fresh: bool,
+        min_active_gpus: int,
+        current_active_gpus: int,
+        routable_count: int,
+    ) -> IdleCandidateReport:
+        """Freeze one new complete candidate observation with an LB-owned seq."""
+        if not isinstance(window, ProductionWindow):
+            raise TypeError("idle reporting requires ProductionWindow")
+        source_seq = self._idle_source_seq + 1
+        candidates = select_idle_candidates(
+            window,
+            replicas,
+            source_seq=source_seq,
+            observations_fresh=observations_fresh,
+            min_active_gpus=min_active_gpus,
+            current_active_gpus=current_active_gpus,
+            routable_count=routable_count,
+        )
+        report = IdleCandidateReport(
+            task_session=window.task_session,
+            gs_epoch=gs_epoch,
+            lb_session=lb_session,
+            source_seq=source_seq,
+            production_revision=window.revision,
+            valid_for_ms=valid_for_ms,
+            candidates=candidates,
+        )
+        self._idle_source_seq = source_seq
+        self._last_idle_report = report
+        return report
+
+    def report_idle_candidates(self, report: IdleCandidateReport) -> Ack:
+        """Send one already-frozen report to GS; retries reuse the same object.
+
+        Constructing and sending are intentionally separate. If an ACK is lost,
+        callers resend the original report and therefore the same source_seq;
+        they must not construct a new report merely to retry transport.
+        """
+        if not isinstance(report, IdleCandidateReport):
+            raise TypeError("report_idle_candidates requires IdleCandidateReport")
+        if self.group_scheduler is None:
+            raise RuntimeError("GroupScheduler handle is required for idle reporting")
+        if self._last_idle_report is None or report != self._last_idle_report:
+            raise ValueError("LB may report only its latest frozen candidate set")
+        ack = ray.get(
+            self.group_scheduler.report_idle_candidates.remote(report),
+            timeout=30,
+        )
+        if not isinstance(ack, Ack):
+            raise TypeError("GroupScheduler returned a non-Ack idle-report response")
+        return ack
 
     def close_for_exit(
         self,
