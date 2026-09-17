@@ -1,8 +1,8 @@
 """Global lease authorization state machine for simplified design §8-§14.
 
 Authorization changes are GS decisions. Receipt-backed edges advance only from
-a matching terminal operation status; ``ACCEPTED``/``RUNNING`` never transfer
-GPU authority.
+a typed SUCCEEDED OperationStatus; ACCEPTED/RUNNING/UNKNOWN never transfer GPU
+authority.
 """
 
 from __future__ import annotations
@@ -51,10 +51,10 @@ _ALLOWED = {
 }
 
 _RECEIPT_REQUIRED = {
-    (LeaseState.DONOR_DRAINING, LeaseState.DONOR_RELEASED): OperationStatus.SUCCEEDED,
-    (LeaseState.BORROWER_PREPARING, LeaseState.BORROWER_ACTIVE): OperationStatus.SUCCEEDED,
-    (LeaseState.RECALLING, LeaseState.BORROWER_RELEASED): OperationStatus.SUCCEEDED,
-    (LeaseState.DONOR_RESTORING, LeaseState.CLOSED): OperationStatus.SUCCEEDED,
+    (LeaseState.DONOR_DRAINING, LeaseState.DONOR_RELEASED),
+    (LeaseState.BORROWER_PREPARING, LeaseState.BORROWER_ACTIVE),
+    (LeaseState.RECALLING, LeaseState.BORROWER_RELEASED),
+    (LeaseState.DONOR_RESTORING, LeaseState.CLOSED),
 }
 
 
@@ -74,40 +74,27 @@ class LeaseStateMachine:
         lease_id: str,
         new_state: LeaseState,
         *,
-        supporting_result_state: OperationStatus | str | None = None,
+        supporting_result_state: OperationStatus | None = None,
         operation_id: str | None = None,
     ) -> LeaseRecord:
         lease = self._leases[lease_id]
         current = LeaseState(lease.state)
         new_state = LeaseState(new_state)
-
         if new_state not in _ALLOWED[current]:
             raise IllegalLeaseTransitionError(
                 f"illegal lease transition for {lease_id}: "
                 f"{current.value} -> {new_state.value}"
             )
-
-        required = _RECEIPT_REQUIRED.get((current, new_state))
-        if required is not None:
-            try:
-                supplied = (
-                    OperationStatus(supporting_result_state)
-                    if supporting_result_state is not None
-                    else None
-                )
-            except ValueError:
-                supplied = None
-            if supplied is not required:
-                supplied_value = (
-                    supporting_result_state.value
-                    if isinstance(supporting_result_state, OperationStatus)
-                    else supporting_result_state
-                )
+        if (current, new_state) in _RECEIPT_REQUIRED:
+            if supporting_result_state is not OperationStatus.SUCCEEDED:
                 raise MissingReceiptError(
                     f"lease {lease_id} {current.value} -> {new_state.value} "
-                    f"requires a {required.value} operation result, "
-                    f"got {supplied_value!r}"
+                    "requires OperationStatus.SUCCEEDED"
                 )
+        elif supporting_result_state is not None and not isinstance(
+            supporting_result_state, OperationStatus
+        ):
+            raise TypeError("supporting_result_state must be OperationStatus or None")
 
         lease.state = new_state.value
         if operation_id is not None:
