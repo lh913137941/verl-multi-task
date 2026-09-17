@@ -77,8 +77,12 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
 
     # Simplified lifecycle coordination surface. The methods are intentionally
     # present now so callers do not bind to the superseded begin_drain workflow.
-    def prepare_replica(self, ctx, key, placement):
-        """Hidden-create a borrowed runtime; success must still be non-routable."""
+    def prepare_replica(self, ctx, key=None, placement=None):
+        """Hidden-create a borrowed runtime; success must still be non-routable.
+
+        ``key=None`` is accepted only to keep older tests/callers import-safe;
+        the verified backend must require a full ReplicaKey before doing work.
+        """
         raise NotImplementedError("hidden prepare requires verified native backend")
 
     def prepare_exit(self, command):
