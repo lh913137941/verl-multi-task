@@ -2,6 +2,7 @@
 
 import ast
 import hashlib
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,6 +29,15 @@ SOURCE = Path(__file__).resolve().parents[2] / "src/multi_task_scheduler"
 
 def _digest(*parts):
     return hashlib.sha256("|".join(repr(p) for p in parts).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class _EffectiveReplicaEntry:
+    key: ReplicaKey
+    receivers: tuple[ReceiverRef, ...]
+    loaded_version: int
+    model_signature: str
+    membership_operation_id: str
 
 
 def _isolated_class(relative, name, parent, **globals_for_test):
@@ -92,11 +102,11 @@ def _weight(context=None, replica_id="r1"):
     )
 
 
-def _exit(context=None, replica_id="r1"):
+def _exit(context=None, replica_id="r1", *, drain_id=None):
     context = context or _ctx()
     return ExitEvidence(
         header=EvidenceHeader(context, _key(replica_id), 2, f"exit-{replica_id}"),
-        drain_id=f"drain-{replica_id}",
+        drain_id=drain_id or f"drain-{replica_id}",
         recall_mode=RecallMode.NATURAL,
         inflight=0,
         admitting=0,
@@ -126,6 +136,7 @@ def _ce_class():
         CommitOwner=CommitOwner,
         CommitReceipt=CommitReceipt,
         EvidenceHeader=EvidenceHeader,
+        EffectiveReplicaEntry=_EffectiveReplicaEntry,
         _digest=_digest,
     )
 
@@ -162,6 +173,15 @@ def test_ce_membership_revision_is_monotonic_idempotent_and_typed():
     assert first.action is ServiceAction.ADD
     assert first.revision == 1
 
+    entry = manager.effective_replicas[prepared.key]
+    assert entry.key == prepared.key
+    assert entry.receivers == prepared.receivers
+    assert entry.loaded_version == installed.version
+    assert entry.model_signature == prepared.model_signature
+    assert entry.membership_operation_id == context.operation_id
+    assert not hasattr(entry, "head_server")
+    assert not hasattr(entry, "ctx")
+
     removed = manager.remove_effective(context, prepared.key, _exit(context))
     replay_removed = manager.remove_effective(context, prepared.key, _exit(context))
     assert removed is replay_removed
@@ -169,6 +189,26 @@ def test_ce_membership_revision_is_monotonic_idempotent_and_typed():
     assert removed.revision == 2
     assert manager.effective_revision == 2
     assert manager.effective_replicas == {}
+
+
+def test_ce_rejects_model_signature_mismatch_inside_effective_set():
+    manager = _ce_class()()
+    first_ctx = _ctx("op-1")
+    first = _prepared(first_ctx, "r1")
+    manager.add_effective(first_ctx, first, _weight(first_ctx, "r1"))
+
+    second_ctx = _ctx("op-2")
+    second = PreparedReplica(
+        key=_key("r2"),
+        ctx=second_ctx,
+        placement_digest="placement-2",
+        model_signature="other-sig",
+        receivers=(ReceiverRef("w0", "n1", "u1", 0, object()),),
+        head_server=object(),
+        manager_revision=2,
+    )
+    with pytest.raises(ValueError, match="model signature conflicts"):
+        manager.add_effective(second_ctx, second, _weight(second_ctx, "r2"))
 
 
 def test_lb_add_requires_matching_ce_commit_and_returns_typed_receipt():
@@ -192,7 +232,7 @@ def test_lb_add_requires_matching_ce_commit_and_returns_typed_receipt():
     assert lb.commit_routable(context, prepared, installed, ce) is receipt
 
 
-def test_lb_remove_rejects_unsettled_attempts_then_commits_remove():
+def test_lb_remove_requires_matching_active_drain_and_settled_attempts():
     lb = _lb_class()({})
     context = _ctx()
     proof = _exit(context)
@@ -203,6 +243,22 @@ def test_lb_remove_rejects_unsettled_attempts_then_commits_remove():
         revision=2,
         version=None,
         route_epoch=None,
+    )
+
+    with pytest.raises(ValueError, match="active drain ticket"):
+        lb.finish_remove(context, proof, ce)
+
+    drain_key = (context.identity, proof.header.key)
+    lb.draining[drain_key] = SimpleNamespace(
+        drain_id="wrong-drain",
+        header=SimpleNamespace(phase_revision=1),
+    )
+    with pytest.raises(ValueError, match="drain_id"):
+        lb.finish_remove(context, proof, ce)
+
+    lb.draining[drain_key] = SimpleNamespace(
+        drain_id=proof.drain_id,
+        header=SimpleNamespace(phase_revision=1),
     )
     lb.attempts[proof.header.key] = {"a1": SimpleNamespace(state="RUNNING")}
     with pytest.raises(ValueError, match="attempts remain unsettled"):
