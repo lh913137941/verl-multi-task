@@ -4,21 +4,27 @@
 
 ## 本轮修复
 
-- [x] OperationStatus 对齐为 `ACCEPTED / RUNNING / SUCCEEDED / FAILED / UNKNOWN`，租约回执边同步要求 `SUCCEEDED`。
-- [x] Phase 对齐为 16 个阶段；`status` 与 `phase` 独立保存，`DONE` 不自动推导成功/失败。
+- [x] OperationStatus 对齐为 `ACCEPTED / RUNNING / SUCCEEDED / FAILED / UNKNOWN`；status、phase、outcome 分开保存。
+- [x] Phase 对齐为 16 个阶段；`DONE` 不自动推导成功/失败，终态 status 必须显式记录。
 - [x] OperationContext 改为 `protocol_version: int`、`gs_epoch: str`，GS 启动生成新的 epoch 字符串。
 - [x] CompletionKey 改为 `(task_session, logical_sample_id)`，移除 turn/attempt 维度；首次提交保存并重放 CompletionEvidence。
-- [x] Ledger 的 operation replay 校验覆盖命令身份、lease、command_seq、target 与摘要；不同身份不再复用。
-- [x] Ledger 合并 OperationResult 前核验完整 OperationContext；迟到旧 session/lease/seq 结果不能靠更高 revision 覆盖。
-- [x] PlacementSpec 首版收敛为单个 `NodePlacement` + `placement_digest`，保留只读兼容投影，不再允许多节点 wire shape。
-- [x] ReleaseKind 对齐为 `DONOR_SLEEP_RELEASED / BORROWER_RUNTIME_DESTROYED`，公共名改为 ReleaseEvidence；旧 ReleaseReceipt 仅保留 import alias。
-- [x] OperationKind 为公共名称；旧 OperationType 仅保留 import alias。
+- [x] Ledger / OperationJournal 的 operation replay 校验覆盖完整业务身份、lease、command_seq、target 与摘要；`remaining_budget_ms` 不参与业务摘要，同号重试不能新建另一场操作或重置原受理操作的总时限。
+- [x] Ledger 合并 OperationResult 前核验完整 OperationContext 与 ReplicaKey；迟到旧 session/lease/seq 结果不能靠更高 revision 覆盖。
+- [x] PlacementSpec 首版收敛为单个 `NodePlacement` + `placement_digest`；删除旧多节点 `NodeBlock` wire shape，不保留兼容投影。
+- [x] ReleaseKind 对齐为 `DONOR_SLEEP_RELEASED / BORROWER_RUNTIME_DESTROYED`，公共证明统一使用 `ReleaseEvidence`；删除旧 `ReleaseReceipt` alias。
+- [x] `OperationKind` 为唯一公共操作枚举；删除旧 `OperationType` alias。
+- [x] IdleCandidate 直接携带完整观察身份；删除 ID-only CandidateSet / CandidateRef 公共包装。
+- [x] CE/LB owner 提交统一返回 typed `CommitReceipt`，不再保留 bool/int 兼容结果。
+- [x] TaskRunner 控制入口统一为 `submit_operation/query_operation/probe_task`，删除 `begin_operation`；退出入口统一为 `prepare_exit`，删除 `begin_drain`。
+- [x] GS 查询优先读取 TaskRunner 权威 operation journal，控制器不可达时只保守返回本地已知事实，不用健康状态猜执行结果。
+- [x] FORCE_VERIFIED continuation 必须显式证明 `old_terminal.device_finished=True`；缺字段不能默认通过。
+- [ ] GS lease 授权闭环：释放边必须核验完整 `OperationResult + ReleaseEvidence`，并把确认过的 release digest 绑定到后续 ADD/RESTORE authorization。
 - [x] 修正第一轮计划错误勾选，并更新相关 docstring 编号/语义。
-- [x] CPU Ray GS 集成测试改为新 protocol/epoch/placement/status 合同。
+- [x] CPU Ray GS 集成测试迁移到新 protocol/epoch/placement/status 合同（仍需真实执行环境验证）。
 
 ## 设计复核修正
 
-主设计里 `OperationRecord.status` 与 `phase` 是两个独立字段，因此第二轮原排查稿中“由 phase 映射 status”的表述不能用于终态：`Phase.DONE` 同时可对应 `SUCCEEDED`、`FAILED` 或 `UNKNOWN`。实现改为显式终态 status。
+主设计里 `OperationRecord.status` 与 `phase` 是两个独立字段，因此第二轮原排查稿中“由 phase 映射 status”的表述不能用于终态：`Phase.DONE` 可对应 `SUCCEEDED`、`FAILED` 或在对账后仍需保留的 `UNKNOWN`。实现改为显式终态 status。
 
 用户上传的精简设计文档另发现两处纯文字瑕疵：
 
