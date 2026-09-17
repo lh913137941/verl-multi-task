@@ -162,6 +162,12 @@ class GroupScheduler:
             if authorization.prior_release_digest != lease.last_release_digest:
                 raise ValueError("prior_release_digest does not match GS-confirmed release")
 
+        self.lease_sm.validate_authorization(
+            command.ctx.lease_id,
+            command.ctx.operation_id,
+            authorization.authorization_seq,
+        )
+
     def _validate_command_fence(self, command: OperationCommand) -> None:
         protocol = self.ledger.protocol
         if command.ctx.protocol_version != protocol.protocol_version:
@@ -184,18 +190,41 @@ class GroupScheduler:
         self._validate_lease_authorization(command)
 
     def submit_operation(self, command: OperationCommand) -> OperationResult:
-        """Record GS intent, forward once to TR, and return TR's current result."""
+        """Record/forward a new intent or replay an already accepted operation.
+
+        Current lease-state authorization is evaluated only for a new operation.
+        Once an operation_id has been accepted, later retries are fenced by its
+        immutable recorded command and must keep returning/querying that same
+        progress even after the lease moves to a later state.
+        """
         if not isinstance(command, OperationCommand):
             raise TypeError("submit_operation requires OperationCommand")
-        self._validate_command_fence(command)
-        record = self.ledger.record_operation(command)
+
+        existing = self.ledger.operations.get(command.ctx.operation_id)
+        if existing is None:
+            self._validate_command_fence(command)
+            record = self.ledger.record_operation(command)
+            self.lease_sm.record_authorization(
+                command.ctx.lease_id,
+                command.ctx.operation_id,
+                command.authorization.authorization_seq,
+            )
+        else:
+            record = self.ledger.record_operation(command)
+
         if record.final_result is not None:
             return record.final_result
-        controller = self.controllers[(command.ctx.task_id, command.ctx.task_session)]
-        result = ray.get(controller.submit_operation.remote(command), timeout=30)
+
+        controller = self.controllers.get(
+            (record.command.ctx.task_id, record.command.ctx.task_session)
+        )
+        if controller is None:
+            return self._local_query_result(record).value
+
+        result = ray.get(controller.submit_operation.remote(record.command), timeout=30)
         if not isinstance(result, OperationResult):
             raise TypeError("TaskRunner returned a non-OperationResult")
-        self.ledger.merge_operation_result(command.ctx.operation_id, result)
+        self.ledger.merge_operation_result(record.operation_id, result)
         return result
 
     @staticmethod
