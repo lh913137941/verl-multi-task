@@ -39,14 +39,14 @@ def _window(
     )
 
 
-def _activity(replica_id="r1", task_session="s1"):
+def _activity(replica_id="r1", task_session="s1", *, engine_seq=5):
     return ServerActivity(
         key=ReplicaKey(
             task_session=task_session,
             replica_id=replica_id,
             runtime_epoch=0,
         ),
-        engine_seq=5,
+        engine_seq=engine_seq,
         observed_age_ms=10,
         admitting=0,
         queued=0,
@@ -153,21 +153,28 @@ def test_selector_emits_full_idle_candidate_with_lb_source_seq():
         routable_count=3,
     )
     assert tuple(item.key.replica_id for item in result) == ("r1", "r2")
-    first, second = result
+    first = result[0]
     assert first.key.task_session == "s1"
     assert first.production_epoch == 3
     assert first.source_seq == 7
     assert first.manager_revision == 2
     assert first.lb_revision == 4
     assert first.engine_digest
-    assert second.engine_digest
-    assert first.engine_digest != second.engine_digest
+    assert first.engine_digest == _activity("r1").digest
     assert first.reason == "CLOSED_STALENESS"
     assert first.stable_idle_ms == 500
     assert first.observed_age_ms == 10
     assert first.gpu_count == 4
     assert first.placement_digest == "placement-r1"
     assert first.evidence_digest
+
+
+def test_engine_digest_changes_when_server_observation_changes():
+    first = _activity(engine_seq=5)
+    second = _activity(engine_seq=6)
+    assert first.digest
+    assert second.digest
+    assert first.digest != second.digest
 
 
 def test_selector_respects_capacity_and_routable_lower_bounds():
