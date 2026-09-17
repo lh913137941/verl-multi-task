@@ -1,7 +1,8 @@
-"""Public eight-state replica lifecycle and kind-specific terminal rules."""
+"""Public eight-state replica lifecycle with full current identity."""
 
 import pytest
 
+from multi_task_scheduler.orchestration.contracts import NodePlacement, PlacementSpec, ReplicaKey
 from multi_task_scheduler.orchestration.replica_record import (
     IllegalReplicaTransitionError,
     ReplicaKind,
@@ -10,85 +11,102 @@ from multi_task_scheduler.orchestration.replica_record import (
 )
 
 
-def test_borrowed_defaults_to_preparing():
-    record = ReplicaRecord(replica_id="r1")
-    assert record.kind is ReplicaKind.BORROWED
+def _placement():
+    return PlacementSpec(
+        node=NodePlacement(
+            node_id="n1",
+            gpu_uuids=("u0",),
+            physical_gpu_ids=(0,),
+            global_ranks=(0,),
+            local_ranks=(0,),
+        ),
+        tp=1,
+        dp=1,
+        pp=1,
+        model_signature="sig",
+        placement_digest="placement-1",
+    )
+
+
+def _record(*, replica_id="r1", runtime_epoch=0, kind=ReplicaKind.BORROWED, state=None):
+    if state is None:
+        state = ReplicaState.ACTIVE if kind is ReplicaKind.NATIVE else ReplicaState.PREPARING
+    return ReplicaRecord(
+        key=ReplicaKey(task_session="s1", replica_id=replica_id, runtime_epoch=runtime_epoch),
+        kind=kind,
+        state=state,
+        revision=0,
+        placement=_placement(),
+    )
+
+
+def test_borrowed_starts_preparing_and_advances_to_destroyed():
+    record = _record()
     assert record.state is ReplicaState.PREPARING
-    assert record.revision == 0
-
-
-def test_borrowed_lifecycle_advances_to_destroyed():
-    record = ReplicaRecord(replica_id="r1")
-    for state in [
+    for state in (
         ReplicaState.ACTIVE,
         ReplicaState.DRAINING,
         ReplicaState.DETACHED,
         ReplicaState.DESTROYED,
-    ]:
+    ):
         record.transition_to(state)
     assert record.state is ReplicaState.DESTROYED
     assert record.revision == 4
 
 
-def test_native_sleep_restore_path_keeps_same_runtime_identity():
-    record = ReplicaRecord(replica_id="r1", kind=ReplicaKind.NATIVE, runtime_epoch=3)
-    for state in [
+def test_native_sleep_restore_keeps_same_replica_key():
+    record = _record(kind=ReplicaKind.NATIVE, runtime_epoch=3)
+    original_key = record.key
+    for state in (
         ReplicaState.DRAINING,
         ReplicaState.DETACHED,
         ReplicaState.DORMANT,
         ReplicaState.RESTORING,
         ReplicaState.ACTIVE,
-    ]:
+    ):
         record.transition_to(state)
     assert record.state is ReplicaState.ACTIVE
-    assert record.runtime_epoch == 3
+    assert record.key is original_key
+    assert record.key.runtime_epoch == 3
 
 
-def test_failed_hidden_create_can_only_become_destroyed_with_cleanup_or_quarantined():
-    cleaned = ReplicaRecord(replica_id="r1")
+def test_failed_borrowed_prepare_can_destroy_or_quarantine():
+    cleaned = _record()
     cleaned.transition_to(ReplicaState.DESTROYED)
     assert cleaned.state is ReplicaState.DESTROYED
 
-    unknown = ReplicaRecord(replica_id="r2")
+    unknown = _record(replica_id="r2")
     unknown.transition_to(ReplicaState.QUARANTINED)
     assert unknown.state is ReplicaState.QUARANTINED
 
 
-def test_illegal_transition_raises():
-    record = ReplicaRecord(replica_id="r1")
+def test_illegal_transition_and_terminal_quarantine_raise():
+    record = _record()
     with pytest.raises(IllegalReplicaTransitionError):
         record.transition_to(ReplicaState.DETACHED)
-
-
-def test_transition_to_same_state_is_noop_and_does_not_bump_revision():
-    record = ReplicaRecord(replica_id="r1")
-    record.transition_to(ReplicaState.PREPARING)
-    assert record.revision == 0
-
-
-def test_quarantined_is_terminal():
-    record = ReplicaRecord(replica_id="r1")
     record.transition_to(ReplicaState.QUARANTINED)
     with pytest.raises(IllegalReplicaTransitionError):
         record.transition_to(ReplicaState.DESTROYED)
 
 
-def test_drain_can_be_safely_cancelled_before_service_detach():
-    record = ReplicaRecord(replica_id="r1")
+def test_same_state_is_noop_and_drain_can_cancel_before_detach():
+    record = _record()
+    record.transition_to(ReplicaState.PREPARING)
+    assert record.revision == 0
     record.transition_to(ReplicaState.ACTIVE)
     record.transition_to(ReplicaState.DRAINING)
     record.transition_to(ReplicaState.ACTIVE)
     assert record.state is ReplicaState.ACTIVE
 
 
-def test_native_never_destroys_and_borrowed_never_becomes_dormant():
-    native = ReplicaRecord(replica_id="n1", kind=ReplicaKind.NATIVE)
+def test_native_never_destroys_and_borrowed_never_sleeps():
+    native = _record(kind=ReplicaKind.NATIVE)
     native.transition_to(ReplicaState.DRAINING)
     native.transition_to(ReplicaState.DETACHED)
     with pytest.raises(IllegalReplicaTransitionError):
         native.transition_to(ReplicaState.DESTROYED)
 
-    borrowed = ReplicaRecord(replica_id="b1")
+    borrowed = _record()
     borrowed.transition_to(ReplicaState.ACTIVE)
     borrowed.transition_to(ReplicaState.DRAINING)
     borrowed.transition_to(ReplicaState.DETACHED)
