@@ -31,6 +31,7 @@ from multi_task_scheduler.orchestration.operation_journal import (
     OperationKind,
     OperationStatus,
     Outcome,
+    Phase,
 )
 from multi_task_scheduler.orchestration.production_window import (
     ProductionWindow,
@@ -134,6 +135,7 @@ def test_task_runner_submit_and_query_use_only_current_contract():
         OperationIdentityError=OperationIdentityError,
         OperationStatus=OperationStatus,
         Outcome=Outcome,
+        Phase=Phase,
         ServiceEvidence=ServiceEvidence,
         ReleaseEvidence=ReleaseEvidence,
     )
@@ -333,7 +335,7 @@ def test_trainer_native_sync_uses_gate_and_unknown_failure_blocks_followups():
                 await trainer._fit_update_weights()
             assert trainer.replica_sync_gate.health == "BLOCKED"
             with pytest.raises(GateFencedError):
-                await trainer.replica_sync_gate.acquire("add", GateKind.ADD)
+                await trainer.replica_sync_gate.acquire("later", GateKind.ADD)
         else:
             assert await trainer._fit_update_weights() == {"timing": 1}
             assert trainer.replica_sync_gate.health == "HEALTHY"
