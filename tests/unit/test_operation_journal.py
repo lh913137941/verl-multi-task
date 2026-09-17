@@ -19,7 +19,10 @@ from multi_task_scheduler.orchestration.operation_journal import (
     OperationJournal,
     OperationKind,
     OperationStatus,
+    Outcome,
     Phase,
+    command_identity,
+    operation_outcome,
 )
 
 
@@ -93,12 +96,21 @@ def test_retry_budget_is_not_identity_and_cannot_extend_original_deadline():
     assert journal.remaining_budget_ms("op-1") == 1000
 
     now[0] = 100.4
-    assert journal.begin(replace(command, remaining_budget_ms=10_000)) is first
+    retry = replace(command, remaining_budget_ms=10_000)
+    assert command_identity(command) == command_identity(retry)
+    assert journal.begin(retry) is first
     assert first.command is command
     assert 0 < journal.remaining_budget_ms("op-1") <= 600
 
     now[0] = 101.1
     assert journal.remaining_budget_ms("op-1") == 0
+
+
+def test_operation_outcome_mapping_is_shared_and_typed():
+    assert operation_outcome(OperationStatus.ACCEPTED) is Outcome.KNOWN_NOT_APPLIED
+    assert operation_outcome(OperationStatus.SUCCEEDED) is Outcome.KNOWN_APPLIED
+    assert operation_outcome(OperationStatus.RUNNING) is Outcome.UNKNOWN
+    assert operation_outcome(OperationStatus.UNKNOWN) is Outcome.UNKNOWN
 
 
 def test_conflicting_command_identity_is_rejected():
