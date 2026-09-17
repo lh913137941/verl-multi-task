@@ -132,8 +132,8 @@ class ContinuationRecord:
                 raise ValueError(f"{name} must be nonempty")
         if self.old_terminal is None or not self.old_release_acked:
             raise ValueError("continuation requires terminal and release acknowledgement")
-        if getattr(self.old_terminal, "device_finished", True) is not True:
-            raise ValueError("old attempt device work must be finished")
+        if getattr(self.old_terminal, "device_finished", False) is not True:
+            raise ValueError("old attempt device work must be explicitly finished")
         if (self.new_acceptance is None) == (self.completed_turn is None):
             raise ValueError("exactly one of new_acceptance/completed_turn must be present")
 
