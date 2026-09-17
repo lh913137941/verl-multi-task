@@ -258,6 +258,9 @@ class ReleaseEvidence:
             raise ValueError("permit_digest and inventory_digest must be nonempty")
         if not self.per_gpu:
             raise ValueError("ReleaseEvidence requires per-GPU proof")
+        gpu_uuids = tuple(gpu.gpu_uuid for gpu in self.per_gpu)
+        if len(set(gpu_uuids)) != len(gpu_uuids):
+            raise ValueError("ReleaseEvidence requires exactly one proof per GPU")
         if not self.all_backends_confirmed:
             raise ValueError("ReleaseEvidence requires all backend confirmations")
         if self.observation_interval_ms < 0:
