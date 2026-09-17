@@ -1,6 +1,7 @@
 """Canonical lifecycle evidence validation for the current design."""
 
 from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +17,7 @@ from multi_task_scheduler.orchestration.receipts import (
     AdmissionSnapshot,
     CommitOwner,
     CommitReceipt,
+    ContinuationRecord,
     EvidenceHeader,
     ExitEvidence,
     GPURelease,
@@ -151,6 +153,44 @@ def test_natural_exit_requires_zero_counts_closed_admission_and_no_continuations
             continuations=(),
             unresolved_count=0,
         )
+
+
+def test_force_continuation_requires_explicit_device_finished_true():
+    common = dict(
+        ctx=_ctx(),
+        key=_key(),
+        drain_id="drain-1",
+        old_attempt_id="attempt-1",
+        client_session="client-1",
+        prefix_digest="prefix-1",
+        old_release_acked=True,
+        new_acceptance=object(),
+        completed_turn=None,
+    )
+    with pytest.raises(ValueError, match="explicitly finished"):
+        ContinuationRecord(old_terminal=SimpleNamespace(), **common)
+    record = ContinuationRecord(
+        old_terminal=SimpleNamespace(device_finished=True),
+        **common,
+    )
+    force = ExitEvidence(
+        header=_header("force-exit"),
+        drain_id="drain-1",
+        recall_mode=RecallMode.FORCE_VERIFIED,
+        inflight=0,
+        admitting=0,
+        queued=0,
+        running=0,
+        pending_admissions=0,
+        closed_admission=True,
+        all_backends_confirmed=True,
+        lb_revision=5,
+        observed_age_ms=10,
+        engine_digest="engine-1",
+        continuations=(record,),
+        unresolved_count=0,
+    )
+    assert force.continuations == (record,)
 
 
 def test_service_evidence_distinguishes_add_and_remove_prerequisites():
