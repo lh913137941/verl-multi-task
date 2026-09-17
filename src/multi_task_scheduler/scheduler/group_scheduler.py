@@ -306,6 +306,8 @@ class GroupScheduler:
                     "gpu_uuid": gpu.gpu_uuid,
                     "state": gpu.state,
                     "current_user": gpu.current_user,
+                    "lease_id": gpu.lease_id,
+                    "lease_epoch": gpu.lease_epoch,
                 }
                 for gpu in self.ledger.gpus.values()
             ],
@@ -330,7 +332,33 @@ class GroupScheduler:
         new_state: str,
         operation_id: str | None = None,
     ) -> dict:
-        """Advance authorization using the authoritative operation result when required."""
+        """Advance lease state and the GS GPU-user ledger as one actor turn.
+
+        Evidence validation remains in ``LeaseStateMachine``. The two edges that
+        actually transfer authorization additionally preflight the exact
+        registered GPU set before changing the lease state, then commit the GPU
+        ledger after the state-machine transition succeeds. Because GS is a
+        single Ray actor, nothing can interleave between preflight and commit.
+        """
+        target_state = LeaseState(new_state)
+        before = self.lease_sm.get(lease_id)
+        current_state = LeaseState(before.state)
+
+        gpu_action = None
+        gpu_keys = ()
+        if (
+            current_state is LeaseState.DONOR_RELEASED
+            and target_state is LeaseState.BORROWER_PREPARING
+        ):
+            gpu_action = "BORROWER"
+            gpu_keys = self.ledger.validate_borrower_gpu_authorization(before)
+        elif (
+            current_state is LeaseState.BORROWER_RELEASED
+            and target_state is LeaseState.DONOR_RESTORING
+        ):
+            gpu_action = "NATIVE"
+            gpu_keys = self.ledger.validate_native_gpu_restoration(before)
+
         supporting_result = None
         if operation_id is not None:
             record = self.ledger.operations.get(operation_id)
@@ -339,11 +367,18 @@ class GroupScheduler:
             queried = self.query_operation(record.command.ctx.task_session, operation_id)
             if queried.found:
                 supporting_result = queried.value
+
         lease = self.lease_sm.advance(
             lease_id,
-            LeaseState(new_state),
+            target_state,
             supporting_result=supporting_result,
         )
+
+        if gpu_action == "BORROWER":
+            self.ledger.authorize_borrower_gpus(lease, gpu_keys)
+        elif gpu_action == "NATIVE":
+            self.ledger.restore_native_gpus(lease, gpu_keys)
+
         return {
             "lease_id": lease_id,
             "state": lease.state,
