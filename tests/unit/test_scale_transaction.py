@@ -9,8 +9,8 @@ from multi_task_scheduler.orchestration.contracts import (
     PreparedReplica,
     PublishedWeightSnapshot,
     RecallMode,
+    ReleaseEvidence,
     ReleaseKind,
-    ReleaseReceipt,
     TransferKind,
     TransferReceipt,
 )
@@ -37,7 +37,7 @@ from multi_task_scheduler.orchestration.scale_transaction import (
 
 def ctx(operation_id="op-1", lease_epoch=0):
     return OperationContext(
-        protocol_version="p1", gs_epoch=1, task_id="task-a", task_session="s1",
+        protocol_version=1, gs_epoch="gs-1", task_id="task-a", task_session="s1",
         operation_id=operation_id, lease_id="lease-1", lease_epoch=lease_epoch, command_seq=0,
     )
 
@@ -122,7 +122,7 @@ class FakeReplica(ReplicaProtocol):
         return prepared()
 
     def _release(self, ctx, replica_id, kind):
-        return ReleaseReceipt(
+        return ReleaseEvidence(
             replica_id=replica_id, runtime_epoch=1, lease_epoch=ctx.lease_epoch,
             lb_excluded=True, ce_excluded=True, no_inflight_transfer=True,
             process_cleared_or_slept=True, per_gpu_hbm_free={"u0": 10}, release_kind=kind,
@@ -130,11 +130,11 @@ class FakeReplica(ReplicaProtocol):
 
     async def sleep_runtime(self, ctx, replica_id):
         self.calls.append(("sleep", replica_id))
-        return self._release(ctx, replica_id, ReleaseKind.DONOR_SLEEP)
+        return self._release(ctx, replica_id, ReleaseKind.DONOR_SLEEP_RELEASED)
 
     async def destroy_runtime(self, ctx, replica_id, purpose):
         self.calls.append(("destroy", replica_id, purpose))
-        return self._release(ctx, replica_id, ReleaseKind.BORROWER_RELEASE)
+        return self._release(ctx, replica_id, ReleaseKind.BORROWER_RUNTIME_DESTROYED)
 
     async def inspect_runtime(self, ctx, replica_id):
         return {"replica_id": replica_id}
@@ -269,6 +269,7 @@ def test_remove_wrapper_destroys_only_after_service_commit():
         service, release = await tx.remove(ctx(), "r1")
         assert service.service_detached
         assert release.complete
+        assert release.release_kind is ReleaseKind.BORROWER_RUNTIME_DESTROYED
         assert replica.calls[-1][0] == "destroy"
     asyncio.run(scenario())
 
@@ -279,7 +280,7 @@ def test_donate_wrapper_sleeps_native_after_service_commit():
         tx = build(replica=replica)
         service, release = await tx.donate(ctx(), "r1")
         assert service.service_detached
-        assert release.release_kind is ReleaseKind.DONOR_SLEEP
+        assert release.release_kind is ReleaseKind.DONOR_SLEEP_RELEASED
         assert replica.calls[-1][0] == "sleep"
     asyncio.run(scenario())
 
