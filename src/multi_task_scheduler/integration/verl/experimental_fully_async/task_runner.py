@@ -17,8 +17,16 @@ from verl.experimental.separation.utils import create_resource_pool_manager
 from verl.trainer.ppo.utils import Role
 
 from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
-from multi_task_scheduler.orchestration.contracts import OperationResult
-from multi_task_scheduler.orchestration.operation_journal import OperationJournal
+from multi_task_scheduler.orchestration.contracts import (
+    OperationCommand,
+    OperationResult,
+    QueryResult,
+)
+from multi_task_scheduler.orchestration.operation_journal import (
+    OperationIdentityError,
+    OperationJournal,
+    Outcome,
+)
 from multi_task_scheduler.scheduler.discovery import get_or_create_group_scheduler
 
 from .rollouter import MultiTaskFullyAsyncRollouter
@@ -29,74 +37,76 @@ logger = logging.getLogger(__name__)
 
 @ray.remote(num_cpus=1)
 class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunner)):
-    """Own GS/Trainer/Rollouter handles and the one authoritative operation journal."""
+    """Own GS/Trainer/Rollouter handles and the authoritative operation journal."""
 
     def __init__(self):
         super().__init__()
         self.group_scheduler = None
+        self._operation_commands = {}
 
     def _ensure_journal(self) -> OperationJournal:
         if not hasattr(self, "_operation_journal"):
             self._operation_journal = OperationJournal()
         return self._operation_journal
 
-    def _record_operation(self, command):
-        return self._ensure_journal().begin(
-            command.operation_id,
-            command.lease_epoch,
-            command.replica_id,
+    def submit_operation(self, command: OperationCommand) -> OperationResult:
+        """Validate/idempotently accept one lifecycle command.
+
+        Real lifecycle execution is still unavailable until the native runtime
+        backends are wired. ACCEPTED therefore reports only journal acceptance.
+        """
+        if not isinstance(command, OperationCommand):
+            raise TypeError("submit_operation requires OperationCommand")
+        existing = self._operation_commands.get(command.ctx.operation_id)
+        if existing is not None and existing != command:
+            raise OperationIdentityError(
+                f"conflicting replay for operation {command.ctx.operation_id!r}"
+            )
+        record = self._ensure_journal().begin(
+            command.ctx.operation_id,
+            command.ctx.lease_epoch,
+            command.target.replica_id,
             command.kind,
             payload_digest=command.payload_digest,
-            command_seq=command.command_seq,
+            command_seq=command.ctx.command_seq,
         )
-
-    def submit_operation(self, command):
-        """Canonical GS -> TaskRunner control entry returning ACCEPTED progress.
-
-        This pass records and fences the operation idempotently. Real ADD /
-        DONATE / REMOVE / RESTORE execution remains unavailable until the
-        verified native runtime backend is wired; an ACCEPTED result must never
-        be confused with completed lifecycle work.
-        """
-        record = self._record_operation(command)
-        context = getattr(command, "context", None)
-        if context is None:
-            # Old ad-hoc callers are supported only by begin_operation(); the
-            # public submit_operation contract requires OperationCommand.
-            raise TypeError("submit_operation requires an OperationCommand with context")
+        self._operation_commands.setdefault(command.ctx.operation_id, command)
         return OperationResult(
-            identity_fields=context,
+            ctx=command.ctx,
+            target=command.target,
+            status=record.status,
             phase=record.phase,
             phase_revision=record.phase_revision,
-            state=record.status,
-            actual_replica_state=None,
         )
 
-    def begin_operation(self, command):
-        """Compatibility entry returning the internal journal record."""
-        return self._record_operation(command)
+    def query_operation(
+        self, task_session: str, operation_id: str
+    ) -> QueryResult[OperationResult]:
+        """Read the authoritative operation record without waiting for G/GPU work."""
+        command = self._operation_commands.get(operation_id)
+        record = self._ensure_journal().query(operation_id)
+        if command is None or record is None or command.ctx.task_session != task_session:
+            return QueryResult(found=False, value=None, outcome=Outcome.UNKNOWN)
+        result = OperationResult(
+            ctx=command.ctx,
+            target=command.target,
+            status=record.status,
+            phase=record.phase,
+            phase_revision=record.phase_revision,
+            error=record.error,
+        )
+        outcome = (
+            Outcome.KNOWN_APPLIED
+            if record.status.value in {"SUCCEEDED", "FAILED"}
+            else Outcome.UNKNOWN
+        )
+        return QueryResult(found=True, value=result, outcome=outcome)
 
-    def query_operation(self, task_session: str, operation_id: str | None = None):
-        """Read the operation journal without waiting for G or GPU work.
-
-        Canonical form is ``query_operation(task_session, operation_id)``.
-        For callers from the previous binding pass, a single positional argument
-        is still interpreted as ``operation_id``.
-        """
-        if operation_id is None:
-            operation_id = task_session
-        return self._ensure_journal().query(operation_id)
-
-    def probe_task(self, task_session: str | None = None):
-        """Return only facts this binding can currently prove."""
-        trainer = self.components.get("trainer") if hasattr(self, "components") else None
-        rollouter = self.components.get("rollouter") if hasattr(self, "components") else None
-        return {
-            "task_session": task_session,
-            "trainer_attached": trainer is not None,
-            "rollouter_attached": rollouter is not None,
-            "operation_count": len(self._ensure_journal()._records),
-        }
+    def probe_task(self, task_session: str):
+        """The full TaskSnapshot needs real M/E/R/C owner observations."""
+        raise NotImplementedError(
+            "probe_task requires M/E/R/C + production/sync snapshot wiring"
+        )
 
     def run(self, config):
         """Attach this Actor to GS, then execute verl's original run method."""
