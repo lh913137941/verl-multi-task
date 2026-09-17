@@ -69,9 +69,8 @@ def _command(**overrides):
 
 def _result(command=None, revision=1, phase=Phase.CREATE, status=OperationStatus.RUNNING):
     command = command or _command()
-    ctx = command.context
     return OperationResult(
-        identity_fields=ctx,
+        identity_fields=command.context,
         phase=phase,
         phase_revision=revision,
         state=status,
@@ -164,7 +163,7 @@ def test_record_operation_is_idempotent_for_exact_replay():
     ledger = Ledger(_protocol())
     first = ledger.record_operation(_command())
     second = ledger.record_operation(_command(remaining_budget_ms=20))
-    assert first is second  # remaining transport budget is not business identity
+    assert first is second
 
 
 @pytest.mark.parametrize(
@@ -276,12 +275,9 @@ def test_conflicting_idle_replay_is_rejected_and_infinite_lifetime_is_rejected()
         ledger.upsert_idle_observation(replace(report, candidate_ids=("r2",)), valid_until=100.0)
 
 
-def test_unknown_owner_with_invalid_model_signature_is_still_rejected_first():
-    ledger = Ledger(_protocol())
-    bad = replace(_placement(), model_signature="")
-    # PlacementSpec is frozen/validated at construction; dataclasses.replace re-runs validation.
+def test_placement_validation_happens_before_resource_registration():
     with pytest.raises(ValueError, match="model_signature"):
-        bad
+        replace(_placement(), model_signature="")
 
 
 def test_unknown_result_cannot_create_an_operation_record():
