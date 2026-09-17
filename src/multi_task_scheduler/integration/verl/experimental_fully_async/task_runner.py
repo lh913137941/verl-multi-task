@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 
 """TaskRunner binding for the single experimental Fully Async profile."""
 
@@ -23,8 +23,8 @@ from multi_task_scheduler.orchestration.contracts import (
     QueryResult,
 )
 from multi_task_scheduler.orchestration.operation_journal import (
-    OperationIdentityError,
     OperationJournal,
+    OperationStatus,
     Outcome,
 )
 from multi_task_scheduler.scheduler.discovery import get_or_create_group_scheduler
@@ -42,7 +42,6 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
     def __init__(self):
         super().__init__()
         self.group_scheduler = None
-        self._operation_commands = {}
 
     def _ensure_journal(self) -> OperationJournal:
         if not hasattr(self, "_operation_journal"):
@@ -50,56 +49,45 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         return self._operation_journal
 
     def submit_operation(self, command: OperationCommand) -> OperationResult:
-        """Validate/idempotently accept one lifecycle command.
+        """Validate/idempotently accept one complete lifecycle command.
 
         Real lifecycle execution is still unavailable until the native runtime
-        backends are wired. ACCEPTED therefore reports only journal acceptance.
+        backends are wired. ACCEPTED therefore proves only journal acceptance;
+        it never claims a lifecycle side effect has happened.
         """
         if not isinstance(command, OperationCommand):
             raise TypeError("submit_operation requires OperationCommand")
-        existing = self._operation_commands.get(command.ctx.operation_id)
-        if existing is not None and existing != command:
-            raise OperationIdentityError(
-                f"conflicting replay for operation {command.ctx.operation_id!r}"
-            )
-        record = self._ensure_journal().begin(
-            command.ctx.operation_id,
-            command.ctx.lease_epoch,
-            command.target.replica_id,
-            command.kind,
-            payload_digest=command.payload_digest,
-            command_seq=command.ctx.command_seq,
-        )
-        self._operation_commands.setdefault(command.ctx.operation_id, command)
+        record = self._ensure_journal().begin(command)
         return OperationResult(
-            ctx=command.ctx,
-            target=command.target,
+            ctx=record.command.ctx,
+            target=record.command.target,
             status=record.status,
             phase=record.phase,
             phase_revision=record.phase_revision,
+            error=record.error,
         )
 
     def query_operation(
         self, task_session: str, operation_id: str
     ) -> QueryResult[OperationResult]:
         """Read the authoritative operation record without waiting for G/GPU work."""
-        command = self._operation_commands.get(operation_id)
         record = self._ensure_journal().query(operation_id)
-        if command is None or record is None or command.ctx.task_session != task_session:
+        if record is None or record.command.ctx.task_session != task_session:
             return QueryResult(found=False, value=None, outcome=Outcome.UNKNOWN)
         result = OperationResult(
-            ctx=command.ctx,
-            target=command.target,
+            ctx=record.command.ctx,
+            target=record.command.target,
             status=record.status,
             phase=record.phase,
             phase_revision=record.phase_revision,
             error=record.error,
         )
-        outcome = (
-            Outcome.KNOWN_APPLIED
-            if record.status.value in {"SUCCEEDED", "FAILED"}
-            else Outcome.UNKNOWN
-        )
+        if record.status is OperationStatus.ACCEPTED:
+            outcome = Outcome.KNOWN_NOT_APPLIED
+        elif record.status in {OperationStatus.SUCCEEDED, OperationStatus.FAILED}:
+            outcome = Outcome.KNOWN_APPLIED
+        else:
+            outcome = Outcome.UNKNOWN
         return QueryResult(found=True, value=result, outcome=outcome)
 
     def probe_task(self, task_session: str):
@@ -114,14 +102,22 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         context = ray.get_runtime_context()
         task_id = context.get_actor_id()
         try:
-            ray.get(self.group_scheduler.attach_task.remote(task_id, context.current_actor), timeout=30)
+            ray.get(
+                self.group_scheduler.attach_task.remote(task_id, context.current_actor),
+                timeout=30,
+            )
             return super().run(config)
         finally:
             try:
-                ray.get(self.group_scheduler.detach_task.remote(task_id), timeout=30)
+                ray.get(
+                    self.group_scheduler.detach_task.remote(task_id),
+                    timeout=30,
+                )
             except Exception:
                 logger.warning(
-                    "Could not detach TaskRunner %s from GroupScheduler", task_id, exc_info=True
+                    "Could not detach TaskRunner %s from GroupScheduler",
+                    task_id,
+                    exc_info=True,
                 )
 
     def _create_rollouter(self, config) -> None:
