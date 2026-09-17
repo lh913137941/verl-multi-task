@@ -5,14 +5,8 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-"""Replace creation targets while inheriting the native initialization and fit loop."""
+"""TaskRunner binding for the single experimental Fully Async profile."""
 
 import logging
 
@@ -34,20 +28,25 @@ logger = logging.getLogger(__name__)
 
 @ray.remote(num_cpus=1)
 class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunner)):
-    """Own GS/Trainer/Rollouter handles, but no rollout or CE Manager objects."""
+    """Own GS/Trainer/Rollouter handles and the one authoritative operation journal."""
 
     def __init__(self):
         super().__init__()
         self.group_scheduler = None
 
     def _ensure_journal(self) -> OperationJournal:
-        # Lazy so the inherited native TaskRunner constructor stays untouched.
         if not hasattr(self, "_operation_journal"):
             self._operation_journal = OperationJournal()
         return self._operation_journal
 
-    def begin_operation(self, command):
-        """Record an incoming GS command idempotently (section 3.2)."""
+    def submit_operation(self, command):
+        """Canonical GS -> TaskRunner control entry.
+
+        This pass records and fences the operation idempotently. Real ADD /
+        DONATE / REMOVE / RESTORE execution remains unavailable until the
+        verified native runtime backend is wired; recording ACCEPTED intent must
+        not be confused with a completed lifecycle operation.
+        """
         return self._ensure_journal().begin(
             command.operation_id,
             command.lease_epoch,
@@ -57,9 +56,26 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             command_seq=command.command_seq,
         )
 
-    def query_operation(self, operation_id: str):
-        """Return the task-internal operation record, if any."""
+    def begin_operation(self, command):
+        """Compatibility alias for the superseded entry name."""
+        return self.submit_operation(command)
+
+    def query_operation(self, operation_id: str, task_session: str | None = None):
+        """Read the operation journal without waiting for G or GPU work."""
+        # task_session is accepted for the public contract; this Actor already
+        # represents one concrete task session, so session validation belongs to
+        # the GS/controller attachment boundary.
         return self._ensure_journal().query(operation_id)
+
+    def probe_task(self):
+        """Return only facts this binding can currently prove."""
+        trainer = self.components.get("trainer") if hasattr(self, "components") else None
+        rollouter = self.components.get("rollouter") if hasattr(self, "components") else None
+        return {
+            "trainer_attached": trainer is not None,
+            "rollouter_attached": rollouter is not None,
+            "operation_count": len(self._ensure_journal()._records),
+        }
 
     def run(self, config):
         """Attach this Actor to GS, then execute verl's original run method."""
@@ -73,11 +89,9 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             try:
                 ray.get(self.group_scheduler.detach_task.remote(task_id), timeout=30)
             except Exception:
-                # Cleanup must not replace the original initialization/training error.
                 logger.warning("Could not detach TaskRunner %s from GroupScheduler", task_id, exc_info=True)
 
     def _create_rollouter(self, config) -> None:
-        """Preserve native main.py:117-136; replace only the type and GS argument."""
         print("[ASYNC MAIN] Starting create rollouter...")
         rollouter = MultiTaskFullyAsyncRollouter.remote(
             config=config,
@@ -86,26 +100,21 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             device_name=config.trainer.device,
             group_scheduler=self.group_scheduler,
         )
-
         if "hybrid_worker_group" in self.components:
             ray.get(rollouter.set_hybrid_worker_group.remote(self.components["hybrid_worker_group"]))
             print("[ASYNC MAIN] Hybrid worker group injected into rollouter")
-
         ray.get(rollouter.init_workers.remote())
         ray.get(rollouter.set_max_required_samples.remote())
-
         self.components["rollouter"] = rollouter
         print("[ASYNC MAIN] Rollouter created and initialized successfully")
 
     def _create_trainer(self, config) -> None:
-        """Preserve native main.py:138-157; replace only the Trainer ActorClass."""
         print("[ASYNC MAIN] Starting create trainer...")
         trainer_role_mapping = {
             role: worker_cls
             for role, worker_cls in self.components["role_worker_mapping"].items()
             if role != Role.Rollout
         }
-
         trainer = MultiTaskFullyAsyncTrainer.remote(
             config=config,
             tokenizer=self.components["tokenizer"],
@@ -114,7 +123,6 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             ray_worker_group_cls=self.components["ray_worker_group_cls"],
             device_name=config.trainer.device,
         )
-
         ray.get(trainer.init_workers.remote())
         self.components["trainer"] = trainer
         print("[ASYNC MAIN] FullyAsyncTrainer created and initialized successfully")
