@@ -3,6 +3,7 @@
 import pytest
 
 from multi_task_scheduler.orchestration.contracts import (
+    CapacityRecord,
     LeaseAuthorization,
     NodePlacement,
     OperationCommand,
@@ -12,13 +13,26 @@ from multi_task_scheduler.orchestration.contracts import (
     PublishedWeightSnapshot,
     RecallMode,
     ReplicaKey,
+    RouteEntry,
+    RouteState,
+    SyncHealth,
+    SyncSnapshot,
+    TaskSnapshot,
 )
 from multi_task_scheduler.orchestration.operation_journal import (
     OperationKind,
     OperationStatus,
     Phase,
 )
-from multi_task_scheduler.orchestration.replica_record import ReplicaState
+from multi_task_scheduler.orchestration.production_window import (
+    ProductionWindow,
+    WindowState,
+)
+from multi_task_scheduler.orchestration.replica_record import (
+    ReplicaKind,
+    ReplicaRecord,
+    ReplicaState,
+)
 
 
 def _ctx(**overrides):
@@ -36,20 +50,20 @@ def _ctx(**overrides):
     return OperationContext(**values)
 
 
-def _placement():
+def _placement(*, task_gpu="u0"):
     return PlacementSpec(
         node=NodePlacement(
             node_id="n1",
-            gpu_uuids=("u0", "u1"),
-            physical_gpu_ids=(0, 1),
-            global_ranks=(0, 1),
-            local_ranks=(0, 1),
+            gpu_uuids=(task_gpu, "u1") if task_gpu == "u0" else (task_gpu,),
+            physical_gpu_ids=(0, 1) if task_gpu == "u0" else (0,),
+            global_ranks=(0, 1) if task_gpu == "u0" else (0,),
+            local_ranks=(0, 1) if task_gpu == "u0" else (0,),
         ),
-        tp=2,
+        tp=2 if task_gpu == "u0" else 1,
         dp=1,
         pp=1,
         model_signature="sig-1",
-        placement_digest="placement-1",
+        placement_digest="placement-1" if task_gpu == "u0" else f"placement-{task_gpu}",
     )
 
 
@@ -66,6 +80,33 @@ def _authorization(kind, ctx, placement_digest="placement-1"):
             "release-previous" if kind in {OperationKind.ADD, OperationKind.RESTORE} else None
         ),
         authorization_seq=1,
+    )
+
+
+def _window(task_session="s1"):
+    return ProductionWindow(
+        task_session=task_session,
+        epoch=3,
+        revision=9,
+        state=WindowState.CLOSED_BACKPRESSURE,
+        eligible_pending=0,
+        held_samples=0,
+        active_samples=1,
+        output_queue_size=0,
+        max_queue_size=8,
+        producer_exhausted=False,
+        policy_refresh_inflight=False,
+    )
+
+
+def _record(task_session="s1", replica_id="r1"):
+    placement = _placement() if task_session == "s1" else _placement(task_gpu="other-u0")
+    return ReplicaRecord(
+        key=ReplicaKey(task_session=task_session, replica_id=replica_id, runtime_epoch=0),
+        kind=ReplicaKind.NATIVE,
+        state=ReplicaState.ACTIVE,
+        revision=1,
+        placement=placement,
     )
 
 
@@ -181,6 +222,99 @@ def test_operation_result_keeps_phase_and_status_independent():
         phase=Phase.RECONCILE,
         phase_revision=4,
     ).phase is Phase.RECONCILE
+
+
+def test_route_entry_is_typed_and_keeps_route_fences():
+    key = ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0)
+    route = RouteEntry(
+        key=key,
+        head_server=object(),
+        state=RouteState.DRAINING,
+        replica_route_epoch=2,
+        sync_epoch=3,
+        serving_version=7,
+        commit_operation_id="op-1",
+    )
+    assert route.state is RouteState.DRAINING
+    assert route.replica_route_epoch == 2
+    with pytest.raises(ValueError, match="commit_operation_id"):
+        RouteEntry(key, object(), RouteState.ROUTABLE, 1, 0, 7, "")
+
+
+def test_capacity_record_derives_total_capacity_from_committed_active_set():
+    first = ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0)
+    second = ReplicaKey(task_session="s1", replica_id="r2", runtime_epoch=0)
+    capacity = CapacityRecord(
+        active_ids=frozenset({first, second}),
+        revision=4,
+        per_replica_limit=6,
+        last_commit_operation_id="op-4",
+    )
+    assert capacity.max_concurrent_samples == 12
+    with pytest.raises(ValueError, match="per_replica_limit"):
+        CapacityRecord(frozenset(), 0, 0, "op-1")
+
+
+def test_sync_snapshot_keeps_health_separate_from_version_and_ce_revision():
+    snapshot = SyncSnapshot(
+        version=11,
+        ce_revision=8,
+        health=SyncHealth.BLOCKED,
+        owner_operation_id="op-sync",
+    )
+    assert snapshot.health is SyncHealth.BLOCKED
+    assert snapshot.version == 11
+    with pytest.raises(ValueError, match="owner_operation_id"):
+        SyncSnapshot(11, 8, SyncHealth.HEALTHY, "")
+
+
+def test_task_snapshot_rejects_cross_session_owner_facts():
+    key = ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0)
+    capacity = CapacityRecord(
+        active_ids=frozenset({key}),
+        revision=2,
+        per_replica_limit=4,
+        last_commit_operation_id="op-2",
+    )
+    snapshot = TaskSnapshot(
+        task_session="s1",
+        production=_window(),
+        replica_records=(_record(),),
+        ce_revision=3,
+        lb_revision=4,
+        capacity=capacity,
+        sync_health=SyncHealth.HEALTHY,
+        current_operation_id=None,
+        consistency="STABLE",
+    )
+    assert snapshot.task_session == "s1"
+
+    with pytest.raises(ValueError, match="production window"):
+        TaskSnapshot(
+            task_session="s1",
+            production=_window("s2"),
+            replica_records=(_record(),),
+            ce_revision=3,
+            lb_revision=4,
+            capacity=capacity,
+            sync_health=SyncHealth.HEALTHY,
+            current_operation_id=None,
+            consistency="UNKNOWN",
+        )
+
+    foreign = ReplicaKey(task_session="s2", replica_id="r2", runtime_epoch=0)
+    with pytest.raises(ValueError, match="capacity active_ids"):
+        TaskSnapshot(
+            task_session="s1",
+            production=_window(),
+            replica_records=(_record(),),
+            ce_revision=3,
+            lb_revision=4,
+            capacity=CapacityRecord(frozenset({foreign}), 3, 4, "op-3"),
+            sync_health=SyncHealth.HEALTHY,
+            current_operation_id=None,
+            consistency="IN_PROGRESS",
+        )
 
 
 def test_published_weight_snapshot_requires_real_content_identity():
