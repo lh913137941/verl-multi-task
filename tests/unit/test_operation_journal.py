@@ -104,7 +104,15 @@ def test_conflicting_command_identity_is_rejected():
     with pytest.raises(OperationIdentityError):
         journal.begin(replace(command, target=replace(command.target, replica_id="r2")))
     with pytest.raises(OperationIdentityError):
-        journal.begin(replace(command, kind=OperationKind.REMOVE, placement=None))
+        journal.begin(
+            replace(
+                command,
+                authorization=replace(
+                    command.authorization,
+                    authorization_seq=command.authorization.authorization_seq + 1,
+                ),
+            )
+        )
 
 
 def test_operation_id_cannot_cross_lease_epoch():
