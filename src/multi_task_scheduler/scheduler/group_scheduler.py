@@ -231,10 +231,17 @@ class GroupScheduler:
     def _local_query_result(record) -> QueryResult[OperationResult]:
         if record.final_result is not None:
             result = record.final_result
-            if result.status in {OperationStatus.SUCCEEDED, OperationStatus.FAILED}:
+            if result.status is OperationStatus.SUCCEEDED:
                 outcome = Outcome.KNOWN_APPLIED
             elif result.status is OperationStatus.ACCEPTED:
                 outcome = Outcome.KNOWN_NOT_APPLIED
+            elif result.status is OperationStatus.FAILED:
+                error_outcome = getattr(result.error, "outcome", None)
+                outcome = (
+                    Outcome.UNKNOWN
+                    if error_outcome is None
+                    else Outcome(error_outcome)
+                )
             else:
                 outcome = Outcome.UNKNOWN
         else:
