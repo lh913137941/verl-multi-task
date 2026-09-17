@@ -9,15 +9,11 @@ the native transfer backend can return real WeightEvidence.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
 
 from verl.checkpoint_engine.base import CheckpointEngineManager
 
-from multi_task_scheduler.orchestration.contracts import (
-    ReceiverRef,
-    ReplicaKey,
-    ServiceAction,
-)
+from multi_task_scheduler.orchestration.contracts import ServiceAction
+from multi_task_scheduler.orchestration.effective_replica import EffectiveReplicaEntry
 from multi_task_scheduler.orchestration.receipts import (
     CommitOwner,
     CommitReceipt,
@@ -28,27 +24,6 @@ from multi_task_scheduler.orchestration.receipts import (
 def _digest(*parts: object) -> str:
     data = "|".join(repr(part) for part in parts).encode("utf-8")
     return hashlib.sha256(data).hexdigest()
-
-
-@dataclass(frozen=True)
-class EffectiveReplicaEntry:
-    """CE-only projection of one effective parameter receiver membership."""
-
-    key: ReplicaKey
-    receivers: tuple[ReceiverRef, ...]
-    loaded_version: int
-    model_signature: str
-    membership_operation_id: str
-
-    def __post_init__(self) -> None:
-        if not self.receivers:
-            raise ValueError("EffectiveReplicaEntry requires receivers")
-        if self.loaded_version < 0:
-            raise ValueError("loaded_version must be nonnegative")
-        if not self.model_signature or not self.membership_operation_id:
-            raise ValueError(
-                "model_signature and membership_operation_id must be nonempty"
-            )
 
 
 class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
@@ -68,6 +43,17 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         if not hasattr(self, "_effective_commit_receipts"):
             self._effective_commit_receipts = {}
         return self._effective_commit_receipts
+
+    def _active_transfers(self) -> set:
+        """Return CE-owned runtime keys with a parameter transfer still in flight.
+
+        The verified native transfer backend must maintain this set around actual
+        send/load work. Until that backend is wired, REMOVE is conservative:
+        any key present here is fenced from leaving E.
+        """
+        if not hasattr(self, "_effective_transfer_inflight"):
+            self._effective_transfer_inflight = set()
+        return self._effective_transfer_inflight
 
     @property
     def effective_replicas(self) -> dict:
@@ -139,13 +125,15 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         return receipt
 
     def remove_effective(self, ctx, key, exit) -> CommitReceipt:
-        """Commit E REMOVE idempotently after verified ExitEvidence."""
+        """Commit E REMOVE idempotently after exit and transfer-quiescence proof."""
         if exit.header.ctx != ctx or exit.header.key != key:
             raise ValueError("CE REMOVE exit evidence identity mismatch")
         cache_key = (ctx.identity, key, ServiceAction.REMOVE)
         cached = self._commit_cache().get(cache_key)
         if cached is not None:
             return cached
+        if key in self._active_transfers():
+            raise ValueError("cannot remove CE member while parameter transfer is in flight")
 
         members = self._effective_replicas()
         if key in members:
