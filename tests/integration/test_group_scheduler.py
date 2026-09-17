@@ -240,6 +240,22 @@ def test_gs_control_interfaces_use_current_typed_contract(isolated_ray):
             scheduler.register_resources.remote("reg-1", manifest)
         )["status"] == "READY"
 
+        # This test starts at the ADD authorization boundary. The donor release
+        # itself is covered by the pure-Python lease evidence tests.
+        opened = ray.get(
+            scheduler.open_lease.remote(
+                LeaseRecord(
+                    lease_id="l1",
+                    donor_session="donor",
+                    borrower_session="s1",
+                    state="BORROWER_PREPARING",
+                    last_release_digest="release-0",
+                    placement=_placement(),
+                )
+            )
+        )
+        assert opened["state"] == "BORROWER_PREPARING"
+
         command = _command(protocol_version, gs_epoch)
         accepted = ray.get(scheduler.submit_operation.remote(command))
         assert accepted.status is OperationStatus.ACCEPTED
@@ -273,12 +289,19 @@ def test_gs_control_interfaces_use_current_typed_contract(isolated_ray):
             "probe": "ok",
         }
 
-        opened = ray.get(
-            scheduler.open_lease.remote(LeaseRecord(lease_id="l1", donor_session="s1"))
+        second_lease = ray.get(
+            scheduler.open_lease.remote(
+                LeaseRecord(
+                    lease_id="l2",
+                    donor_session="donor",
+                    borrower_session="s1",
+                    placement=_placement(),
+                )
+            )
         )
-        assert opened["state"] == "PLANNED"
+        assert second_lease["state"] == "PLANNED"
         assert ray.get(
-            scheduler.advance_lease.remote("l1", "DONOR_DRAINING")
+            scheduler.advance_lease.remote("l2", "DONOR_DRAINING")
         )["state"] == "DONOR_DRAINING"
     finally:
         ray.kill(task, no_restart=True)
