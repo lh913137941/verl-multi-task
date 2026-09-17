@@ -1,14 +1,8 @@
-"""Cross-process/cross-component data contracts (fusion design section 3).
+"""Cross-process/cross-component data contracts for multi-task orchestration.
 
-Every type here is a frozen, pickle-safe value object: it carries identity,
-evidence, and authority fields but never a donor runtime handle or a raw
-``cuda:0`` device id. GPU ids are physical identities from a lease, not
-in-process indices.
-
-``epoch`` marks logical isolation, ``revision`` marks ordering (section 3.2):
-``gs_epoch`` bounds the GS lifetime, ``task_session`` bounds a task startup,
-``lease_epoch`` bounds an authorization generation, and ``runtime_epoch``
-distinguishes different runtime instances of one Replica.
+These value objects carry identity, evidence and authority.  Runtime handles stay
+inside one task and GPU identifiers are stable physical identities, never local
+``cuda:N`` aliases.
 """
 
 from __future__ import annotations
@@ -21,8 +15,6 @@ from .operation_journal import OperationType
 
 
 class ReleaseKind(str, Enum):
-    """Who releases a replica and whether it may be shared for sleep."""
-
     DONOR_SLEEP = "DONOR_SLEEP"
     BORROWER_RELEASE = "BORROWER_RELEASE"
 
@@ -32,15 +24,13 @@ class TransferKind(str, Enum):
     BOOTSTRAP = "BOOTSTRAP"
 
 
-# --------------------------------------------------------------------------- #
-# 3.1 task-to-task execution contracts
-# --------------------------------------------------------------------------- #
+class RecallMode(str, Enum):
+    NATURAL = "NATURAL"
+    FORCE_VERIFIED = "FORCE_VERIFIED"
 
 
 @dataclass(frozen=True)
 class OperationContext:
-    """Identity that every side-effecting step must re-verify (section 3.1)."""
-
     protocol_version: str
     gs_epoch: int
     task_id: str
@@ -66,8 +56,6 @@ class OperationContext:
 
 @dataclass(frozen=True)
 class GpuPlacement:
-    """One physical GPU inside a placement block."""
-
     gpu_uuid: str
     physical_id: int
     global_rank: int
@@ -76,16 +64,12 @@ class GpuPlacement:
 
 @dataclass(frozen=True)
 class NodeBlock:
-    """Immutable placement for one node (section 3.1)."""
-
     node_id: str
     gpus: Tuple[GpuPlacement, ...]
 
 
 @dataclass(frozen=True)
 class PlacementSpec:
-    """Ordered placement for a whole replica, with parallel layout and model."""
-
     node_blocks: Tuple[NodeBlock, ...]
     tp: int = 1
     dp: int = 1
@@ -98,19 +82,12 @@ class PlacementSpec:
 
     @property
     def gpu_uuids(self) -> Tuple[str, ...]:
-        return tuple(
-            gpu.gpu_uuid for block in self.node_blocks for gpu in block.gpus
-        )
+        return tuple(gpu.gpu_uuid for block in self.node_blocks for gpu in block.gpus)
 
 
 @dataclass(frozen=True)
 class PreparedReplica:
-    """HIDDEN runtime that is materialized but not yet published (section 3.1).
-
-    ``receiver_descriptors`` and ``head_server_descriptor`` may hold the
-    borrower's own ActorHandles (task-internal only). They never reach the GS
-    and never carry a donor runtime.
-    """
+    """A hidden runtime that has passed placement checks but is not routable."""
 
     replica_id: str
     runtime_epoch: int
@@ -123,7 +100,7 @@ class PreparedReplica:
 
     def with_receivers(
         self, receiver_ids: Sequence[str], receivers: Sequence[object], head_server: object
-    ) -> PreparedReplica:
+    ) -> "PreparedReplica":
         return PreparedReplica(
             replica_id=self.replica_id,
             runtime_epoch=self.runtime_epoch,
@@ -138,13 +115,6 @@ class PreparedReplica:
 
 @dataclass(frozen=True)
 class TransferReceipt:
-    """Evidence that receivers finished loading weights and CUDA work.
-
-    Receiver "complete" must mean weights loaded and CUDA work done, never just
-    "queued" (section 3.1). ``cleanup_state`` records communication-group /
-    bucket / socket teardown without dropping the published weight cache.
-    """
-
     transfer_id: str
     kind: TransferKind
     target_version: int
@@ -157,19 +127,12 @@ class TransferReceipt:
     def all_receivers_complete(self) -> bool:
         if not self.expected_receiver_ids:
             return False
-        return all(
-            self.receiver_states.get(r) == "complete"
-            for r in self.expected_receiver_ids
-        )
+        return all(self.receiver_states.get(r) == "complete" for r in self.expected_receiver_ids)
 
 
 @dataclass(frozen=True)
 class ReleaseReceipt:
-    """Evidence that a replica stopped holding its GPUs (section 3.1).
-
-    ``release_kind`` distinguishes a donor's shareable sleep from a borrower's
-    full release; per-GPU HBM and residual records are evidence, not a boolean.
-    """
+    """Evidence that a runtime no longer consumes the leased device resources."""
 
     replica_id: str
     runtime_epoch: int
@@ -182,15 +145,19 @@ class ReleaseReceipt:
     reserved_residual: Mapping[str, int] = field(default_factory=dict)
     release_kind: ReleaseKind = ReleaseKind.BORROWER_RELEASE
 
+    @property
+    def complete(self) -> bool:
+        return (
+            self.lb_excluded
+            and self.ce_excluded
+            and self.no_inflight_transfer
+            and self.process_cleared_or_slept
+            and bool(self.per_gpu_hbm_free)
+        )
+
 
 @dataclass(frozen=True)
 class RuntimeCapabilities:
-    """What this task's runtime can actually do (section 3.1).
-
-    A missing or unverified capability must be refused, never silently degraded
-    to fake success.
-    """
-
     placement: str
     sleep: bool = False
     full_weight_replay: bool = False
@@ -201,14 +168,7 @@ class RuntimeCapabilities:
 
     def requires(self, capability: str) -> bool:
         value = getattr(self, capability, False)
-        if isinstance(value, bool):
-            return value
-        return False
-
-
-# --------------------------------------------------------------------------- #
-# 3.2 command and result
-# --------------------------------------------------------------------------- #
+        return value if isinstance(value, bool) else False
 
 
 @dataclass(frozen=True)
@@ -237,7 +197,7 @@ class OperationResult:
     identity_fields: OperationContext
     phase: str
     phase_revision: int
-    state: str  # OperationState value
+    state: str
     actual_replica_state: str
     routing_epoch: int | None = None
     ce_revision: int | None = None
@@ -246,20 +206,37 @@ class OperationResult:
     error: str | None = None
 
 
-# --------------------------------------------------------------------------- #
-# 4.3 communication topology / published snapshot (narrow placeholder)
-# --------------------------------------------------------------------------- #
-
-
 @dataclass(frozen=True)
 class PublishedWeightSnapshot:
-    """Immutable pin of the published serving weights (Vpub snapshot).
+    """Immutable reference to the exact published weight contents.
 
-    The full NCCL transfer plan and replay live in the checkpoint binding
-    (Slice 5). This minimal value carries the version + digest that a
-    ``bootstrap_target`` transfer must reproduce onto a target replica.
+    A version number is metadata only.  ADD/RESTORE must pin a real published
+    snapshot with a stable identity and non-empty manifest digest before any
+    target bootstrap starts.
     """
 
-    serving_version: int
+    snapshot_id: str
     manifest_digest: str
-    receiver_ids: Tuple[str, ...] = ()
+    model_signature: str
+    version: int
+    byte_size: int
+    sender: object
+
+    def __post_init__(self) -> None:
+        if not self.snapshot_id:
+            raise ValueError("snapshot_id must be nonempty")
+        if not self.manifest_digest:
+            raise ValueError("manifest_digest must be nonempty")
+        if not self.model_signature:
+            raise ValueError("model_signature must be nonempty")
+        if self.version < 0:
+            raise ValueError("version must be nonnegative")
+        if self.byte_size < 0:
+            raise ValueError("byte_size must be nonnegative")
+        if self.sender is None:
+            raise ValueError("sender must reference the published snapshot backend")
+
+    @property
+    def serving_version(self) -> int:
+        """Compatibility alias for the earlier core naming."""
+        return self.version
