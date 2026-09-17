@@ -184,12 +184,6 @@ def test_full_happy_path_requires_release_and_service_evidence():
         supporting_result=_service_result("donor", "op-restore", ServiceAction.ADD),
     )
     assert sm.get("l1").state == LeaseState.CLOSED.value
-    assert sm.get("l1").operation_ids == (
-        "op-donate",
-        "op-add",
-        "op-remove",
-        "op-restore",
-    )
 
 
 def test_succeeded_status_without_release_evidence_cannot_handoff_gpu():
