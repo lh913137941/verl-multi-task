@@ -38,6 +38,7 @@ from multi_task_scheduler.orchestration.production_window import (
     ReplicaView,
     select_idle_candidates,
 )
+from multi_task_scheduler.orchestration.receipts import ReleaseEvidence, ServiceEvidence
 from multi_task_scheduler.orchestration.replica_sync_gate import (
     GateFencedError,
     GateKind,
@@ -131,7 +132,10 @@ def test_task_runner_submit_and_query_use_only_current_contract():
         OperationResult=OperationResult,
         QueryResult=QueryResult,
         OperationIdentityError=OperationIdentityError,
+        OperationStatus=OperationStatus,
         Outcome=Outcome,
+        ServiceEvidence=ServiceEvidence,
+        ReleaseEvidence=ReleaseEvidence,
     )
     runner = runner_class()
     command = _command()
