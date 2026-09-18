@@ -220,15 +220,18 @@ class OperationJournal:
                 f"{active.operation_id!r}"
             )
 
+        # command_seq is a task-session fence, not a per-replica counter. A new
+        # operation cannot target another replica to bypass an older sequence.
         prior_sequences = [
             record.command.ctx.command_seq
             for record in self._records.values()
-            if record.target == command.target
+            if record.command.ctx.task_session == command.ctx.task_session
         ]
         if prior_sequences and command.ctx.command_seq <= max(prior_sequences):
             raise OperationIdentityError(
-                f"stale command_seq {command.ctx.command_seq} for {command.target!r}; "
-                f"last accepted sequence is {max(prior_sequences)}"
+                f"stale command_seq {command.ctx.command_seq} for task_session "
+                f"{command.ctx.task_session!r}; last accepted sequence is "
+                f"{max(prior_sequences)}"
             )
 
         now = self._clock()
