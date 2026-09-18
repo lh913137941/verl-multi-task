@@ -156,6 +156,26 @@ def test_journal_owns_single_active_operation_and_command_seq_fences():
     assert journal.begin(_command(operation_id="op-2", command_seq=6)).status is OperationStatus.ACCEPTED
 
 
+def test_command_seq_is_task_session_wide_not_per_replica():
+    journal = OperationJournal()
+    first = _command(command_seq=5)
+    journal.begin(first)
+    journal.transition("op-1", Phase.DONE, status=OperationStatus.SUCCEEDED)
+
+    stale_other_replica = replace(
+        _command(operation_id="op-2", command_seq=5),
+        target=ReplicaKey(task_session="s1", replica_id="r2", runtime_epoch=0),
+    )
+    with pytest.raises(OperationIdentityError, match="stale command_seq"):
+        journal.begin(stale_other_replica)
+
+    fresh_other_replica = replace(
+        _command(operation_id="op-3", command_seq=6),
+        target=ReplicaKey(task_session="s1", replica_id="r2", runtime_epoch=0),
+    )
+    assert journal.begin(fresh_other_replica).status is OperationStatus.ACCEPTED
+
+
 def test_add_happy_path_requires_explicit_terminal_status():
     journal = OperationJournal()
     journal.begin(_command())
