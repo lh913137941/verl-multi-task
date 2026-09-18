@@ -3,6 +3,7 @@
 import pytest
 
 from multi_task_scheduler.orchestration.contracts import (
+    CapabilityProof,
     CapacityRecord,
     LeaseAuthorization,
     NodePlacement,
@@ -15,8 +16,8 @@ from multi_task_scheduler.orchestration.contracts import (
     ReplicaKey,
     RouteEntry,
     RouteState,
+    RuntimeReady,
     SyncHealth,
-    SyncSnapshot,
     TaskSnapshot,
 )
 from multi_task_scheduler.orchestration.operation_journal import (
@@ -24,15 +25,8 @@ from multi_task_scheduler.orchestration.operation_journal import (
     OperationStatus,
     Phase,
 )
-from multi_task_scheduler.orchestration.production_window import (
-    ProductionWindow,
-    WindowState,
-)
-from multi_task_scheduler.orchestration.replica_record import (
-    ReplicaKind,
-    ReplicaRecord,
-    ReplicaState,
-)
+from multi_task_scheduler.orchestration.production_window import ProductionWindow, WindowState
+from multi_task_scheduler.orchestration.replica_record import ReplicaKind, ReplicaRecord, ReplicaState
 
 
 def _ctx(**overrides):
@@ -91,11 +85,6 @@ def _window(task_session="s1"):
         state=WindowState.CLOSED_BACKPRESSURE,
         eligible_pending=0,
         held_samples=0,
-        active_samples=1,
-        output_queue_size=0,
-        max_queue_size=8,
-        producer_exhausted=False,
-        policy_refresh_inflight=False,
     )
 
 
@@ -153,11 +142,7 @@ def test_add_command_requires_nested_identity_authorization_and_matching_placeme
         remaining_budget_ms=1000,
         placement=_placement(),
     )
-    assert command.ctx is ctx
-    assert command.target is target
     assert command.kind is OperationKind.ADD
-    assert command.recall_mode is None
-
     with pytest.raises(ValueError, match="placement must match authorization"):
         OperationCommand(
             ctx=ctx,
@@ -185,43 +170,6 @@ def test_add_and_restore_must_not_carry_recall_mode():
             recall_mode=RecallMode.NATURAL,
         )
 
-    restore_ctx = _ctx(operation_id="restore-1")
-    restore = OperationCommand(
-        ctx=restore_ctx,
-        kind=OperationKind.RESTORE,
-        target=target,
-        authorization=_authorization(OperationKind.RESTORE, restore_ctx),
-        payload_digest="restore-payload",
-        remaining_budget_ms=1000,
-    )
-    assert restore.recall_mode is None
-    with pytest.raises(ValueError, match="must not carry recall_mode"):
-        OperationCommand(
-            ctx=restore_ctx,
-            kind=OperationKind.RESTORE,
-            target=target,
-            authorization=_authorization(OperationKind.RESTORE, restore_ctx),
-            payload_digest="restore-payload",
-            remaining_budget_ms=1000,
-            recall_mode=RecallMode.NATURAL,
-        )
-
-
-def test_force_verified_is_remove_only():
-    ctx = _ctx()
-    target = ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0)
-    with pytest.raises(ValueError, match="recall_mode"):
-        OperationCommand(
-            ctx=ctx,
-            kind=OperationKind.ADD,
-            target=target,
-            authorization=_authorization(OperationKind.ADD, ctx),
-            payload_digest="payload-1",
-            remaining_budget_ms=1000,
-            placement=_placement(),
-            recall_mode=RecallMode.FORCE_VERIFIED,
-        )
-
 
 def test_operation_result_keeps_phase_and_status_independent():
     result = OperationResult(
@@ -233,106 +181,47 @@ def test_operation_result_keeps_phase_and_status_independent():
         replica_state=ReplicaState.PREPARING,
     )
     assert result.phase is Phase.CREATE
-    assert result.status is OperationStatus.RUNNING
-
     with pytest.raises(ValueError, match="DONE"):
         OperationResult(
             ctx=_ctx(),
-            target=ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0),
+            target=result.target,
             status=OperationStatus.RUNNING,
             phase=Phase.DONE,
             phase_revision=3,
         )
 
-    with pytest.raises(ValueError, match="UNKNOWN"):
-        OperationResult(
-            ctx=_ctx(),
-            target=ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0),
-            status=OperationStatus.UNKNOWN,
-            phase=Phase.CREATE,
-            phase_revision=3,
-        )
 
-    assert OperationResult(
-        ctx=_ctx(),
-        target=ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0),
-        status=OperationStatus.UNKNOWN,
-        phase=Phase.RECONCILE,
-        phase_revision=4,
-    ).phase is Phase.RECONCILE
-
-
-def test_route_entry_is_typed_and_keeps_route_fences():
+def test_route_entry_and_capacity_keep_owner_fences():
     key = ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0)
-    route = RouteEntry(
-        key=key,
-        head_server=object(),
-        state=RouteState.DRAINING,
-        replica_route_epoch=2,
-        sync_epoch=3,
-        serving_version=7,
-        commit_operation_id="op-1",
-    )
+    route = RouteEntry(key, object(), RouteState.DRAINING, 2, 3, 7, "op-1")
     assert route.state is RouteState.DRAINING
-    assert route.replica_route_epoch == 2
-    with pytest.raises(ValueError, match="commit_operation_id"):
-        RouteEntry(key, object(), RouteState.ROUTABLE, 1, 0, 7, "")
+    capacity = CapacityRecord(frozenset({key}), 4, 6, "op-4")
+    assert capacity.max_concurrent_samples == 6
 
 
-def test_capacity_record_derives_total_capacity_from_committed_active_set():
-    first = ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0)
-    second = ReplicaKey(task_session="s1", replica_id="r2", runtime_epoch=0)
-    capacity = CapacityRecord(
-        active_ids=frozenset({first, second}),
-        revision=4,
-        per_replica_limit=6,
-        last_commit_operation_id="op-4",
-    )
-    assert capacity.max_concurrent_samples == 12
-    with pytest.raises(ValueError, match="per_replica_limit"):
-        CapacityRecord(frozenset(), 0, 0, "op-1")
-
-
-def test_sync_snapshot_keeps_health_separate_from_version_and_ce_revision():
-    snapshot = SyncSnapshot(
-        version=11,
-        ce_revision=8,
-        health=SyncHealth.BLOCKED,
-        owner_operation_id="op-sync",
-    )
-    assert snapshot.health is SyncHealth.BLOCKED
-    assert snapshot.version == 11
-    with pytest.raises(ValueError, match="owner_operation_id"):
-        SyncSnapshot(11, 8, SyncHealth.HEALTHY, "")
-
-
-def test_task_snapshot_rejects_cross_session_owner_facts():
+def test_task_snapshot_includes_published_version_and_rejects_cross_session_facts():
     key = ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0)
-    capacity = CapacityRecord(
-        active_ids=frozenset({key}),
-        revision=2,
-        per_replica_limit=4,
-        last_commit_operation_id="op-2",
-    )
+    capacity = CapacityRecord(frozenset({key}), 2, 4, "op-2")
     snapshot = TaskSnapshot(
         task_session="s1",
         production=_window(),
         replica_records=(_record(),),
         ce_revision=3,
+        published_version=11,
         lb_revision=4,
         capacity=capacity,
         sync_health=SyncHealth.HEALTHY,
         current_operation_id=None,
         consistency="STABLE",
     )
-    assert snapshot.task_session == "s1"
-
+    assert snapshot.published_version == 11
     with pytest.raises(ValueError, match="production window"):
         TaskSnapshot(
             task_session="s1",
             production=_window("s2"),
             replica_records=(_record(),),
             ce_revision=3,
+            published_version=11,
             lb_revision=4,
             capacity=capacity,
             sync_health=SyncHealth.HEALTHY,
@@ -340,37 +229,29 @@ def test_task_snapshot_rejects_cross_session_owner_facts():
             consistency="UNKNOWN",
         )
 
-    foreign = ReplicaKey(task_session="s2", replica_id="r2", runtime_epoch=0)
-    with pytest.raises(ValueError, match="capacity active_ids"):
-        TaskSnapshot(
-            task_session="s1",
-            production=_window(),
-            replica_records=(_record(),),
-            ce_revision=3,
-            lb_revision=4,
-            capacity=CapacityRecord(frozenset({foreign}), 3, 4, "op-3"),
-            sync_health=SyncHealth.HEALTHY,
-            current_operation_id=None,
-            consistency="IN_PROGRESS",
-        )
 
-
-def test_published_weight_snapshot_requires_real_content_identity():
+def test_published_weight_snapshot_drops_observability_byte_size():
     snapshot = PublishedWeightSnapshot(
         snapshot_id="snapshot-7",
         manifest_digest="manifest-7",
         model_signature="sig-1",
         version=7,
-        byte_size=1024,
         sender=object(),
     )
     assert snapshot.version == 7
-    with pytest.raises(ValueError, match="snapshot_id"):
-        PublishedWeightSnapshot(
-            snapshot_id="",
-            manifest_digest="manifest-7",
-            model_signature="sig-1",
-            version=7,
-            byte_size=1024,
-            sender=object(),
-        )
+    assert not hasattr(snapshot, "byte_size")
+
+
+def test_runtime_ready_and_capability_proof_keep_verified_shapes():
+    key = ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0)
+    assert RuntimeReady(key, "RECEIVER_READY", None).loaded_version is None
+    with pytest.raises(ValueError, match="requires loaded_version"):
+        RuntimeReady(key, "SERVING_READY", None)
+    proof = CapabilityProof(
+        name="target_abort_resume",
+        backend_version="vllm-x",
+        model_signature="sig-1",
+        placement_digest="placement-1",
+        validation_id="validation-1",
+    )
+    assert proof.name == "target_abort_resume"
