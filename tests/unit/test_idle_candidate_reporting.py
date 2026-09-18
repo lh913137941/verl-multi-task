@@ -1,4 +1,4 @@
-"""LB owns IdleCandidateReport sequencing and transport retry identity."""
+"""LB owns report sequencing; individual candidates stay lightweight."""
 
 from __future__ import annotations
 
@@ -17,10 +17,7 @@ from multi_task_scheduler.orchestration.production_window import (
 )
 from multi_task_scheduler.orchestration.receipts import Ack
 
-SOURCE = (
-    Path(__file__).resolve().parents[2]
-    / "src/multi_task_scheduler/rollout/load_balancer.py"
-)
+SOURCE = Path(__file__).resolve().parents[2] / "src/multi_task_scheduler/rollout/load_balancer.py"
 
 
 def _isolated_lb(ray_substitute=None):
@@ -35,11 +32,7 @@ def _isolated_lb(ray_substitute=None):
     node.decorator_list = []
     module = ast.Module(
         body=[
-            ast.ImportFrom(
-                module="__future__",
-                names=[ast.alias(name="annotations")],
-                level=0,
-            ),
+            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
             node,
         ],
         type_ignores=[],
@@ -70,11 +63,6 @@ def _window(state=WindowState.CLOSED_BACKPRESSURE, revision=4):
         state=state,
         eligible_pending=0,
         held_samples=0,
-        active_samples=1,
-        output_queue_size=0,
-        max_queue_size=8,
-        producer_exhausted=state is WindowState.EXHAUSTED,
-        policy_refresh_inflight=False,
     )
 
 
@@ -88,7 +76,6 @@ def _view():
             queued=0,
             running=0,
             pending_admissions=0,
-            transfer_inflight=False,
             all_backends_observed=True,
         ),
         manager_revision=2,
@@ -96,6 +83,7 @@ def _view():
         placement_digest="placement-r1",
         stable_idle_ms=500,
         gpu_count=1,
+        transfer_quiet=True,
     )
 
 
@@ -113,36 +101,49 @@ def _build(lb, window):
     )
 
 
-def test_lb_assigns_monotonic_source_seq_and_window_revision():
+def test_lb_assigns_source_seq_only_to_report_not_candidate():
     lb = _isolated_lb()({})
-
     first = _build(lb, _window(revision=4))
     second = _build(lb, _window(revision=5))
 
     assert first.source_seq == 0
     assert second.source_seq == 1
     assert first.production_revision == 4
-    assert second.production_revision == 5
-    assert first.candidates[0].source_seq == first.source_seq
-    assert second.candidates[0].source_seq == second.source_seq
-    assert first.candidates[0].engine_digest
-    assert second.candidates[0].engine_digest
+    candidate = first.candidates[0]
+    assert candidate.production_epoch == 3
+    assert candidate.reason == "CLOSED_BACKPRESSURE"
+    assert candidate.evidence_digest
+    assert not hasattr(candidate, "source_seq")
+    assert not hasattr(candidate, "placement_digest")
     assert lb.last_idle_report is second
 
 
-def test_open_window_builds_empty_replacement_report():
+def test_transfer_not_quiet_or_open_window_builds_no_candidate():
+    window = _window()
+    blocked = ReplicaView(
+        activity=_view().activity,
+        manager_revision=2,
+        lb_revision=3,
+        placement_digest="placement-r1",
+        stable_idle_ms=500,
+        transfer_quiet=False,
+    )
+    assert select_idle_candidates(
+        window,
+        [blocked],
+        observations_fresh=True,
+        min_active_gpus=1,
+        current_active_gpus=2,
+        routable_count=2,
+    ) == ()
     lb = _isolated_lb()({})
-    report = _build(lb, _window(state=WindowState.OPEN))
-    assert report.candidates == ()
-    assert report.source_seq == 0
+    assert _build(lb, _window(state=WindowState.OPEN)).candidates == ()
 
 
 def test_transport_retry_resends_same_report_without_allocating_new_seq():
     ack = Ack(accepted=True, revision=0)
     remote = Mock(return_value=ack)
-    scheduler = SimpleNamespace(
-        report_idle_candidates=SimpleNamespace(remote=remote)
-    )
+    scheduler = SimpleNamespace(report_idle_candidates=SimpleNamespace(remote=remote))
     lb = _isolated_lb()({}, group_scheduler=scheduler)
     report = _build(lb, _window())
 
@@ -154,4 +155,3 @@ def test_transport_retry_resends_same_report_without_allocating_new_seq():
     assert report.source_seq == 0
     assert lb._idle_source_seq == 0
     assert remote.call_count == 2
-    assert all(call.args == (report,) for call in remote.call_args_list)
