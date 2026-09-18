@@ -1,14 +1,12 @@
-"""Canonical lifecycle evidence validation for the current design."""
+"""Canonical lifecycle evidence validation for the 0918 design."""
 
 from dataclasses import FrozenInstanceError
-from types import SimpleNamespace
 
 import pytest
 
 from multi_task_scheduler.orchestration.contracts import (
     OperationContext,
     RecallMode,
-    ReleaseKind,
     ReplicaKey,
     ServiceAction,
 )
@@ -17,10 +15,9 @@ from multi_task_scheduler.orchestration.receipts import (
     AdmissionSnapshot,
     CommitOwner,
     CommitReceipt,
-    ContinuationRecord,
     EvidenceHeader,
     ExitEvidence,
-    GPURelease,
+    NeverPublishedProof,
     ReleaseEvidence,
     ServiceEvidence,
     WeightEvidence,
@@ -61,29 +58,18 @@ def test_evidence_header_is_frozen_and_fenced_to_task_session():
         )
 
 
-def test_weight_evidence_requires_all_receivers_at_same_version_and_device_completion():
+def test_weight_evidence_is_compact_owner_verified_proof():
     evidence = WeightEvidence(
         header=_header("weight-1"),
-        transfer_id="transfer-1",
-        snapshot_id="snapshot-1",
-        manifest_digest="manifest-1",
         version=7,
-        receiver_versions={"w0": 7, "w1": 7},
-        device_complete=True,
-        temporary_topology_clean=True,
+        manifest_digest="manifest-1",
+        receivers_digest="receivers-1",
     )
     assert evidence.version == 7
-    with pytest.raises(ValueError, match="every receiver"):
-        WeightEvidence(
-            header=_header("weight-2"),
-            transfer_id="transfer-2",
-            snapshot_id="snapshot-1",
-            manifest_digest="manifest-1",
-            version=7,
-            receiver_versions={"w0": 6},
-            device_complete=True,
-            temporary_topology_clean=True,
-        )
+    assert not hasattr(evidence, "receiver_versions")
+    assert not hasattr(evidence, "transfer_id")
+    with pytest.raises(ValueError, match="receivers_digest"):
+        WeightEvidence(_header("bad"), 7, "manifest-1", "")
 
 
 def test_commit_receipt_owner_action_shape_is_strict():
@@ -106,168 +92,61 @@ def test_commit_receipt_owner_action_shape_is_strict():
     assert ce.owner is CommitOwner.CE
     assert lb.route_epoch == 4
     with pytest.raises(ValueError, match="CE commit"):
-        CommitReceipt(
-            header=_header("bad-ce"),
-            owner=CommitOwner.CE,
-            action=ServiceAction.ADD,
-            revision=1,
-            version=7,
-            route_epoch=1,
-        )
+        CommitReceipt(_header("bad-ce"), CommitOwner.CE, ServiceAction.ADD, 1, 7, 1)
 
 
-def test_natural_exit_requires_zero_counts_closed_admission_and_no_continuations():
+def test_exit_evidence_keeps_only_final_drain_digests():
     evidence = ExitEvidence(
         header=_header("exit-1"),
         drain_id="drain-1",
         recall_mode=RecallMode.NATURAL,
-        inflight=0,
-        admitting=0,
-        queued=0,
-        running=0,
-        pending_admissions=0,
-        closed_admission=True,
-        all_backends_confirmed=True,
-        lb_revision=5,
-        observed_age_ms=10,
-        engine_digest="engine-1",
-        continuations=(),
-        unresolved_count=0,
+        quiescence_digest="quiet-1",
+        attempts_digest="attempts-1",
     )
     assert evidence.recall_mode is RecallMode.NATURAL
-    with pytest.raises(ValueError, match="counters"):
-        ExitEvidence(
-            header=_header("exit-bad"),
-            drain_id="drain-1",
-            recall_mode=RecallMode.NATURAL,
-            inflight=1,
-            admitting=0,
-            queued=0,
-            running=0,
-            pending_admissions=0,
-            closed_admission=True,
-            all_backends_confirmed=True,
-            lb_revision=5,
-            observed_age_ms=10,
-            engine_digest="engine-1",
-            continuations=(),
-            unresolved_count=0,
-        )
+    assert not hasattr(evidence, "inflight")
+    assert not hasattr(evidence, "continuations")
 
 
-def test_force_continuation_requires_explicit_device_finished_true():
-    common = dict(
-        ctx=_ctx(),
-        key=_key(),
-        drain_id="drain-1",
-        old_attempt_id="attempt-1",
-        client_session="client-1",
-        prefix_digest="prefix-1",
-        old_release_acked=True,
-        new_acceptance=object(),
-        completed_turn=None,
-    )
-    with pytest.raises(ValueError, match="explicitly finished"):
-        ContinuationRecord(old_terminal=SimpleNamespace(), **common)
-    record = ContinuationRecord(
-        old_terminal=SimpleNamespace(device_finished=True),
-        **common,
-    )
-    force = ExitEvidence(
-        header=_header("force-exit"),
-        drain_id="drain-1",
-        recall_mode=RecallMode.FORCE_VERIFIED,
-        inflight=0,
-        admitting=0,
-        queued=0,
-        running=0,
-        pending_admissions=0,
-        closed_admission=True,
-        all_backends_confirmed=True,
-        lb_revision=5,
-        observed_age_ms=10,
-        engine_digest="engine-1",
-        continuations=(record,),
-        unresolved_count=0,
-    )
-    assert force.continuations == (record,)
-
-
-def test_service_evidence_distinguishes_add_and_remove_prerequisites():
-    add = ServiceEvidence(
+def test_service_evidence_is_combined_digest_not_duplicate_owner_revisions():
+    service = ServiceEvidence(
         header=_header("service-add"),
         action=ServiceAction.ADD,
-        version=7,
-        ce_revision=2,
-        lb_revision=3,
-        route_epoch=4,
-        capacity_revision=5,
-        manager_revision=6,
-        ce_commit_digest="ce-add",
-        lb_commit_digest="lb-add",
         prerequisite_digest="weight-1",
+        service_digest="service-state-1",
     )
-    remove = ServiceEvidence(
-        header=_header("service-remove"),
-        action=ServiceAction.REMOVE,
-        version=None,
-        ce_revision=7,
-        lb_revision=8,
-        route_epoch=9,
-        capacity_revision=10,
-        manager_revision=11,
-        ce_commit_digest="ce-remove",
-        lb_commit_digest="lb-remove",
-        prerequisite_digest="exit-1",
-    )
-    assert add.version == 7
-    assert remove.version is None
-    with pytest.raises(ValueError, match="REMOVE"):
-        ServiceEvidence(
-            header=_header("bad-remove"),
-            action=ServiceAction.REMOVE,
-            version=7,
-            ce_revision=1,
-            lb_revision=1,
-            route_epoch=1,
-            capacity_revision=1,
-            manager_revision=1,
-            ce_commit_digest="ce",
-            lb_commit_digest="lb",
-            prerequisite_digest="exit",
-        )
+    assert service.action is ServiceAction.ADD
+    assert not hasattr(service, "ce_revision")
+    assert not hasattr(service, "version")
 
 
-def test_release_evidence_requires_per_gpu_backend_confirmation_and_destroy_has_no_owned_processes():
-    gpu = GPURelease(
-        gpu_uuid="u0",
-        free_hbm_bytes=1024,
-        residual_hbm_bytes=0,
-        owned_processes=(),
-        unknown_processes=(),
-        device_work_complete=True,
-        meets_release_budget=True,
-    )
+def test_release_evidence_exposes_only_exact_released_gpu_set():
     release = ReleaseEvidence(
         header=_header("release-1"),
-        release_kind=ReleaseKind.BORROWER_RUNTIME_DESTROYED,
+        release_kind="BORROWER_RUNTIME_DESTROYED",
         permit_digest="service-remove",
         inventory_digest="inventory-1",
-        per_gpu=(gpu,),
-        all_backends_confirmed=True,
-        observation_interval_ms=100,
+        released_gpu_uuids=("u0", "u1"),
     )
-    assert release.release_kind is ReleaseKind.BORROWER_RUNTIME_DESTROYED
-    with pytest.raises(ValueError, match="per-GPU"):
+    assert release.released_gpu_uuids == ("u0", "u1")
+    assert not hasattr(release, "per_gpu")
+    with pytest.raises(ValueError, match="duplicates"):
         ReleaseEvidence(
-            header=_header("release-empty"),
-            release_kind=ReleaseKind.DONOR_SLEEP_RELEASED,
+            header=_header("release-dup"),
+            release_kind="DONOR_SLEEP_RELEASED",
             permit_digest="service-remove",
             inventory_digest="inventory-1",
-            per_gpu=(),
-            all_backends_confirmed=True,
-            observation_interval_ms=100,
+            released_gpu_uuids=("u0", "u0"),
         )
+
+
+def test_never_published_proof_does_not_expose_cleanup_inventory():
+    proof = NeverPublishedProof(
+        header=_header("never-published"),
+        publication_fence_digest="publication-fence-1",
+    )
+    assert proof.publication_fence_digest
+    assert not hasattr(proof, "inventory")
 
 
 def test_ack_and_admission_snapshot_are_local_results_not_lifecycle_evidence():
