@@ -1,4 +1,4 @@
-"""Experimental Fully Async Rollouter with the simplified lifecycle surface.
+"""Experimental Fully Async Rollouter with the current lifecycle surface.
 
 Native generation/queue behavior stays inherited. Device/runtime actions remain
 explicit failures until a verified native backend is available. Rollouter owns
@@ -14,6 +14,7 @@ from verl.experimental.fully_async_policy.fully_async_rollouter import (
 from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
 
 from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
+from multi_task_scheduler.orchestration.contracts import ServiceAction
 from multi_task_scheduler.orchestration.production_window import ProductionWindow
 
 from .llm_server_manager import MultiTaskLLMServerManager
@@ -83,17 +84,23 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         """Unified DONATE/REMOVE drain and verified continuation coordinator."""
         raise NotImplementedError("prepare_exit requires verified native backend")
 
-    def revalidate_exit(self, ctx, proof):
-        """Revalidate exit evidence while Trainer owns G."""
-        raise NotImplementedError("revalidate_exit requires owner-side drain evidence wiring")
+    def commit_service_change(
+        self,
+        ctx,
+        action: ServiceAction,
+        prerequisite,
+        ce_commit,
+        prepared=None,
+    ):
+        """Canonical ADD/REMOVE service commit; caller must hold Trainer G.
 
-    def commit_service(self, ctx, prepared, weight, ce_commit):
-        """Commit LB route then C/M after a valid CE ADD receipt."""
-        raise NotImplementedError("commit_service requires verified owner commit wiring")
-
-    def commit_removal(self, ctx, proof, ce_commit):
-        """Commit LB removal then C/M after a valid CE REMOVE receipt."""
-        raise NotImplementedError("commit_removal requires verified owner commit wiring")
+        REMOVE performs the required owner-side exit revalidation internally;
+        it is intentionally not exposed as a second coordination API.
+        """
+        action = ServiceAction(action)
+        raise NotImplementedError(
+            f"commit_service_change({action.value}) requires verified owner commit wiring"
+        )
 
     def finalize_release(self, ctx, service):
         """Sleep native or destroy borrowed only after ServiceEvidence(REMOVE)."""
