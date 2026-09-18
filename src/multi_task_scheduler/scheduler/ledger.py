@@ -1,4 +1,4 @@
-"""GS global ledger aligned with simplified design §6 and §8.
+"""GS global ledger aligned with the current simplified design.
 
 The ledger stores GS intent separately from task-observed results. Replays are
 accepted only for the same immutable business operation; result merging is
@@ -14,13 +14,13 @@ from dataclasses import dataclass, field
 from typing import Any, Tuple
 
 from multi_task_scheduler.orchestration.contracts import (
+    CapabilityProof,
     IdleCandidate,
     IdleCandidateReport,
     OperationCommand,
     OperationResult,
     PlacementSpec,
     ReplicaKey,
-    RuntimeCapabilities,
 )
 from multi_task_scheduler.orchestration.operation_journal import Phase, command_identity
 
@@ -30,7 +30,7 @@ class TaskRecord:
     task_id: str
     task_session: str
     status: str = "INITIALIZING"
-    capabilities: RuntimeCapabilities | None = None
+    verified_capabilities: tuple[CapabilityProof, ...] = ()
     initial_gpus: int = 0
     task_runner: Any = None
 
@@ -145,7 +145,7 @@ class Ledger:
         task_id: str,
         task_session: str,
         *,
-        capabilities: RuntimeCapabilities | None = None,
+        verified_capabilities: tuple[CapabilityProof, ...] = (),
         task_runner: Any = None,
     ) -> TaskRecord:
         key = (task_id, task_session)
@@ -153,8 +153,8 @@ class Ledger:
         if record is None:
             record = TaskRecord(task_id=task_id, task_session=task_session)
             self.tasks[key] = record
-        if capabilities is not None:
-            record.capabilities = capabilities
+        if verified_capabilities:
+            record.verified_capabilities = tuple(verified_capabilities)
         if task_runner is not None:
             record.task_runner = task_runner
         return record
@@ -218,12 +218,6 @@ class Ledger:
     def _lease_gpu_records(
         self, lease: LeaseRecord
     ) -> Tuple[Tuple[Tuple[str, str, str], GpuRecord], ...]:
-        """Resolve a lease placement to registered GS GPU records.
-
-        ``current_user is None`` means the registered native owner retains the
-        implicit authorization. A borrower authorization is always explicit and
-        carries the matching lease identity on every GPU record.
-        """
         if lease.placement is None:
             raise ValueError("lease placement is required for GPU authorization")
         node = lease.placement.node
@@ -244,7 +238,6 @@ class Ledger:
     def validate_borrower_gpu_authorization(
         self, lease: LeaseRecord
     ) -> Tuple[Tuple[str, str, str], ...]:
-        """Preflight donor->borrower authorization without mutating GS state."""
         if lease.borrower_session is None:
             raise ValueError("borrower_session is required for borrower authorization")
         records = self._lease_gpu_records(lease)
@@ -260,7 +253,6 @@ class Ledger:
         lease: LeaseRecord,
         gpu_keys: Tuple[Tuple[str, str, str], ...],
     ) -> None:
-        """Commit a previously validated donor->borrower authorization."""
         if lease.borrower_session is None:
             raise ValueError("borrower_session is required for borrower authorization")
         for gpu_key in gpu_keys:
@@ -274,7 +266,6 @@ class Ledger:
     def validate_native_gpu_restoration(
         self, lease: LeaseRecord
     ) -> Tuple[Tuple[str, str, str], ...]:
-        """Preflight borrower->native authorization without mutating GS state."""
         if lease.borrower_session is None:
             raise ValueError("borrower_session is required for native restoration")
         records = self._lease_gpu_records(lease)
@@ -294,7 +285,6 @@ class Ledger:
         lease: LeaseRecord,
         gpu_keys: Tuple[Tuple[str, str, str], ...],
     ) -> None:
-        """Commit a previously validated borrower->native authorization."""
         for gpu_key in gpu_keys:
             self.clear_current_user(gpu_key)
 

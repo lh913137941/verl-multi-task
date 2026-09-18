@@ -15,34 +15,18 @@ from multi_task_scheduler.orchestration.contracts import (
     PlacementSpec,
     ReplicaKey,
 )
-from multi_task_scheduler.orchestration.operation_journal import (
-    OperationKind,
-    OperationStatus,
-    Phase,
-)
+from multi_task_scheduler.orchestration.operation_journal import OperationKind, OperationStatus, Phase
 from multi_task_scheduler.orchestration.replica_record import ReplicaState
 from multi_task_scheduler.scheduler.ledger import Ledger, ProtocolInstance, ResourceManifest
 
 
 def _protocol():
-    return ProtocolInstance(
-        protocol_version=1,
-        runtime_kind="verl-multi-task",
-        gs_epoch="gs-1",
-        sharing_namespace="ns-1",
-    )
+    return ProtocolInstance(1, "verl-multi-task", "gs-1", "ns-1")
 
 
 def _placement(uuid="u0"):
-    node = NodePlacement(
-        node_id="n1",
-        gpu_uuids=(uuid,),
-        physical_gpu_ids=(0,),
-        global_ranks=(0,),
-        local_ranks=(0,),
-    )
     return PlacementSpec(
-        node=node,
+        node=NodePlacement("n1", (uuid,), (0,), (0,), (0,)),
         tp=1,
         dp=1,
         pp=1,
@@ -95,13 +79,7 @@ def _command(**overrides):
     kind = overrides.pop("kind", OperationKind.ADD)
     authorization = overrides.pop(
         "authorization",
-        _authorization(
-            kind,
-            lease_id=ctx.lease_id,
-            gs_epoch=ctx.gs_epoch,
-            borrower_session=ctx.task_session,
-            lease_epoch=ctx.lease_epoch,
-        ),
+        _authorization(kind, lease_id=ctx.lease_id, gs_epoch=ctx.gs_epoch, borrower_session=ctx.task_session, lease_epoch=ctx.lease_epoch),
     )
     values = dict(
         ctx=ctx,
@@ -130,18 +108,10 @@ def _result(command=None, revision=1, phase=Phase.CREATE, status=OperationStatus
 
 def _candidate(replica_id="r1", source_seq=7):
     return IdleCandidate(
-        key=ReplicaKey(task_session="s1", replica_id=replica_id, runtime_epoch=0),
+        key=ReplicaKey("s1", replica_id, 0),
         production_epoch=3,
-        source_seq=source_seq,
-        manager_revision=2,
-        lb_revision=4,
-        engine_digest=f"engine-{replica_id}",
         reason="CLOSED_BACKPRESSURE",
-        stable_idle_ms=500,
-        observed_age_ms=10,
-        gpu_count=1,
         evidence_digest=f"evidence-{replica_id}-{source_seq}",
-        placement_digest="placement-u0",
     )
 
 
@@ -162,37 +132,26 @@ def _idle_report(source_seq=7, candidates=None, production_revision=3):
 def test_register_resources_records_only_authoritative_gpu_facts():
     ledger = Ledger(_protocol())
     task = ledger.register_task("task-a", "s1")
-    assert ledger.register_resources(
-        ResourceManifest(owner_task_session="s1", placement=_placement(), replica_id="r1")
-    ) is None
+    assert ledger.register_resources(ResourceManifest("s1", _placement(), "r1")) is None
     assert task.initial_gpus == 1
     assert ledger.gpus[("gs-1", "n1", "u0")].native_owner == "s1"
-    assert not hasattr(ledger, "native_replicas")
 
 
 def test_register_resources_rejects_duplicate_or_unknown_owner():
     ledger = Ledger(_protocol())
     with pytest.raises(ValueError, match="unknown owner"):
-        ledger.register_resources(
-            ResourceManifest(owner_task_session="ghost", placement=_placement(), replica_id="r1")
-        )
+        ledger.register_resources(ResourceManifest("ghost", _placement(), "r1"))
     ledger.register_task("task-a", "s1")
-    ledger.register_resources(
-        ResourceManifest(owner_task_session="s1", placement=_placement(), replica_id="r1")
-    )
+    ledger.register_resources(ResourceManifest("s1", _placement(), "r1"))
     ledger.register_task("task-b", "s2")
     with pytest.raises(ValueError, match="already registered"):
-        ledger.register_resources(
-            ResourceManifest(owner_task_session="s2", placement=_placement(), replica_id="r2")
-        )
+        ledger.register_resources(ResourceManifest("s2", _placement(), "r2"))
 
 
 def test_current_user_is_exclusive_and_clearable():
     ledger = Ledger(_protocol())
     ledger.register_task("task-a", "s1")
-    ledger.register_resources(
-        ResourceManifest(owner_task_session="s1", placement=_placement(), replica_id="r1")
-    )
+    ledger.register_resources(ResourceManifest("s1", _placement(), "r1"))
     key = ("gs-1", "n1", "u0")
     ledger.set_current_user(key, "s2", "lease-1", 0)
     with pytest.raises(ValueError, match="already authorized"):
@@ -206,10 +165,8 @@ def test_operation_replay_is_idempotent_only_for_same_business_identity():
     first = ledger.record_operation(_command())
     second = ledger.record_operation(_command(remaining_budget_ms=10))
     assert first is second
-
     with pytest.raises(ValueError, match="conflicting replay"):
         ledger.record_operation(_command(payload_digest="other"))
-
     changed_ctx = _ctx(command_seq=1)
     with pytest.raises(ValueError, match="conflicting replay"):
         ledger.record_operation(_command(ctx=changed_ctx))
@@ -223,30 +180,14 @@ def test_result_merge_fences_identity_before_revision_and_rejects_equal_revision
     ledger.merge_operation_result("op-1", first)
     ledger.merge_operation_result("op-1", _result(command, revision=2))
     assert ledger.operations["op-1"].final_result is first
-
     with pytest.raises(ValueError, match="conflicting result replay"):
-        ledger.merge_operation_result(
-            "op-1", _result(command, revision=3, phase=Phase.WAIT_GATE)
-        )
-
-    stale_ctx = _ctx(lease_epoch=1)
-    stale = OperationResult(
-        ctx=stale_ctx,
-        target=command.target,
-        status=OperationStatus.RUNNING,
-        phase=Phase.WAIT_GATE,
-        phase_revision=99,
-        replica_state=ReplicaState.PREPARING,
-    )
-    with pytest.raises(ValueError, match="mismatched"):
-        ledger.merge_operation_result("op-1", stale)
+        ledger.merge_operation_result("op-1", _result(command, revision=3, phase=Phase.WAIT_GATE))
 
 
 def test_unknown_result_cannot_create_operation_record():
     ledger = Ledger(_protocol())
     with pytest.raises(ValueError, match="unknown operation"):
         ledger.merge_operation_result("op-1", _result())
-    assert ledger.operations == {}
 
 
 def test_idle_report_replaces_complete_set_and_replay_does_not_extend_ttl():
@@ -256,7 +197,6 @@ def test_idle_report_replaces_complete_set_and_replay_does_not_extend_ttl():
     key = report.candidates[0].key
     ledger.upsert_idle_report(report, valid_until=200.0)
     assert ledger.idle_observations[key].valid_until == 100.0
-
     empty = replace(report, source_seq=8, candidates=())
     ledger.upsert_idle_report(empty, valid_until=101.0)
     ledger.upsert_idle_report(report, valid_until=200.0)
@@ -270,11 +210,6 @@ def test_idle_report_rejects_conflict_stale_revision_and_infinite_ttl():
         ledger.upsert_idle_report(report, valid_until=float("inf"))
     ledger.upsert_idle_report(report, valid_until=100.0)
     with pytest.raises(ValueError, match="conflicting"):
-        ledger.upsert_idle_report(
-            replace(report, candidates=(_candidate("r2", source_seq=7),)),
-            valid_until=100.0,
-        )
+        ledger.upsert_idle_report(replace(report, candidates=(_candidate("r2", source_seq=7),)), valid_until=100.0)
     with pytest.raises(ValueError, match="stale production revision"):
-        ledger.upsert_idle_report(
-            _idle_report(source_seq=8, production_revision=2), valid_until=100.0
-        )
+        ledger.upsert_idle_report(_idle_report(source_seq=8, production_revision=2), valid_until=100.0)

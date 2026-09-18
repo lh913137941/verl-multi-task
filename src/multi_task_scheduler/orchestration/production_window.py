@@ -1,9 +1,9 @@
-"""Idle-bubble sensing aligned with the simplified fusion design §6.6.
+"""Idle-bubble sensing for the current simplified fusion contract.
 
-ProductionWindow is the Rollouter-owned task production fact. ServerActivity is
-the per-runtime engine observation. LB combines those facts with Manager/LB
-revisions and capacity/sync checks to freeze an IdleCandidate. ``source_seq``
-is intentionally supplied by LB and is not a ProductionWindow field.
+ProductionWindow is the compact Rollouter-owned public fact. Detailed native
+queue/producer inputs stay inside Rollouter. ServerActivity is the Server-owned
+request observation, while CE transfer quiescence is supplied separately by the
+LB-local ReplicaView used to freeze an IdleCandidate.
 """
 
 from __future__ import annotations
@@ -16,8 +16,8 @@ from typing import Sequence
 from .contracts import IdleCandidate, ReplicaKey
 
 
-def _digest(*parts: object) -> str:
-    payload = "|".join(repr(part) for part in parts).encode("utf-8")
+def _digest(domain: str, *parts: object) -> str:
+    payload = "|".join((domain, *(repr(part) for part in parts))).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -31,7 +31,7 @@ class WindowState(str, Enum):
 
 @dataclass(frozen=True)
 class ProductionWindow:
-    """Rollouter-owned versioned production facts for one task session."""
+    """Compact public production fact; native algorithm inputs are not copied."""
 
     task_session: str
     epoch: int
@@ -39,11 +39,6 @@ class ProductionWindow:
     state: WindowState
     eligible_pending: int | None
     held_samples: int | None
-    active_samples: int
-    output_queue_size: int
-    max_queue_size: int
-    producer_exhausted: bool
-    policy_refresh_inflight: bool
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "state", WindowState(self.state))
@@ -54,15 +49,6 @@ class ProductionWindow:
         for value in (self.eligible_pending, self.held_samples):
             if value is not None and value < 0:
                 raise ValueError("P/H must be nonnegative when observed")
-        for value in (
-            self.active_samples,
-            self.output_queue_size,
-            self.max_queue_size,
-        ):
-            if value < 0:
-                raise ValueError("production counters must be nonnegative")
-        if self.output_queue_size > self.max_queue_size:
-            raise ValueError("output_queue_size cannot exceed max_queue_size")
 
     @property
     def idle(self) -> bool:
@@ -75,7 +61,6 @@ class ProductionWindow:
             }
             and self.eligible_pending == 0
             and self.held_samples == 0
-            and not self.policy_refresh_inflight
         )
 
     @property
@@ -85,7 +70,7 @@ class ProductionWindow:
 
 @dataclass(frozen=True)
 class ServerActivity:
-    """All-backend activity observation for one exact runtime."""
+    """All-backend request activity observation for one exact runtime."""
 
     key: ReplicaKey
     engine_seq: int
@@ -94,7 +79,6 @@ class ServerActivity:
     queued: int | None
     running: int | None
     pending_admissions: int | None
-    transfer_inflight: bool
     all_backends_observed: bool
 
     def __post_init__(self) -> None:
@@ -117,7 +101,6 @@ class ServerActivity:
             and self.queued == 0
             and self.running == 0
             and self.pending_admissions == 0
-            and not self.transfer_inflight
         )
 
 
@@ -133,6 +116,7 @@ class ReplicaView:
     gpu_count: int = 1
     active_native: bool = True
     sync_healthy: bool = True
+    transfer_quiet: bool = True
     attempts_settled: bool = True
     lifecycle_conflict: bool = False
 
@@ -152,15 +136,12 @@ def select_idle_candidates(
     window: ProductionWindow,
     replicas: Sequence[ReplicaView],
     *,
-    source_seq: int,
     observations_fresh: bool,
     min_active_gpus: int,
     current_active_gpus: int,
     routable_count: int,
 ) -> tuple[IdleCandidate, ...]:
-    """Freeze one complete candidate set using the LB-owned observation seq."""
-    if source_seq < 0:
-        raise ValueError("source_seq must be nonnegative")
+    """Freeze one complete candidate set from real owner observations."""
     if min_active_gpus < 0 or current_active_gpus < 0 or routable_count < 0:
         raise ValueError("capacity counts must be nonnegative")
     if not observations_fresh or not window.idle or routable_count <= 1:
@@ -175,6 +156,7 @@ def select_idle_candidates(
         if (
             not view.active_native
             or not view.sync_healthy
+            or not view.transfer_quiet
             or not view.attempts_settled
             or view.lifecycle_conflict
         ):
@@ -182,56 +164,36 @@ def select_idle_candidates(
         if current_active_gpus - view.gpu_count < min_active_gpus:
             continue
 
-        engine_digest = _digest(
-            "SERVER_ACTIVITY",
-            activity.key,
+        evidence_digest = _digest(
+            "IDLE_CANDIDATE_V1",
+            activity.key.task_session,
+            activity.key.replica_id,
+            activity.key.runtime_epoch,
+            window.epoch,
+            window.revision,
+            window.state.value,
+            window.eligible_pending,
+            window.held_samples,
+            view.manager_revision,
+            view.lb_revision,
             activity.engine_seq,
             activity.observed_age_ms,
             activity.admitting,
             activity.queued,
             activity.running,
             activity.pending_admissions,
-            activity.transfer_inflight,
             activity.all_backends_observed,
-        )
-        evidence_digest = _digest(
-            activity.key,
-            window.task_session,
-            window.epoch,
-            window.revision,
-            window.state,
-            window.eligible_pending,
-            window.held_samples,
-            window.active_samples,
-            window.output_queue_size,
-            window.max_queue_size,
-            window.producer_exhausted,
-            window.policy_refresh_inflight,
-            source_seq,
-            view.manager_revision,
-            view.lb_revision,
-            activity.engine_seq,
-            engine_digest,
-            reason,
             view.stable_idle_ms,
-            activity.observed_age_ms,
             view.gpu_count,
             view.placement_digest,
+            reason,
         )
         result.append(
             IdleCandidate(
                 key=activity.key,
                 production_epoch=window.epoch,
-                source_seq=source_seq,
-                manager_revision=view.manager_revision,
-                lb_revision=view.lb_revision,
-                engine_digest=engine_digest,
                 reason=reason,
-                stable_idle_ms=view.stable_idle_ms,
-                observed_age_ms=activity.observed_age_ms,
-                gpu_count=view.gpu_count,
                 evidence_digest=evidence_digest,
-                placement_digest=view.placement_digest,
             )
         )
     return tuple(result)

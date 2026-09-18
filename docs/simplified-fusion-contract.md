@@ -1,185 +1,171 @@
-# Dynamic orchestration simplified fusion contract
+# Simplified fusion contract (0918 current)
 
-This document is the repository-local implementation contract for the current
-fusion design. It intentionally contains **only the current protocol**. The
-older `docs/verl-5.3-dynamic-orchestration-design.md` remains historical design
-background and must not be used to restore superseded signatures or evidence
-shapes.
+This file is the repository-facing implementation contract for the current
+multi-RL-task resource-sharing integration. It intentionally contains only the
+hard boundaries needed by code and tests. The detailed review design remains
+the source for full flows and rationale.
 
-## 1. Scope and verification boundary
+Older aliases, wire shapes, and helper APIs are historical only and must not be
+reintroduced for compatibility.
 
-The first release targets experimental Fully Async + standalone vLLM (non-PD).
-The orchestration core, GS metadata/lease state, and binding surfaces may be
-implemented in pure Python. Device/runtime primitives that have not been
-verified against the real backend must raise `NotImplementedError`; tests or
-mock objects must never be presented as CUDA/NCCL/runtime proof.
+## Supported first-release profile
 
-## 2. One protocol, no compatibility aliases
+- experimental Fully Async
+- pure STANDALONE, non-PD vLLM
+- single node, whole-GPU lending, DP=1, PP=1, verified TP only
+- native replicas keep their original runtime/resource anchor across DONATE and RESTORE
+- borrowed replicas are created for the borrower and destroyed on REMOVE
+- FORCE_VERIFIED reclaim is a first-release requirement, but may be advertised only for a runtime/model/placement combination with a concrete capability proof
+- Python/mock/AST tests prove control-plane contracts only; unverified CUDA/NCCL/vLLM primitives must raise `NotImplementedError`
 
-The protocol is migrated as a unit. Do not reintroduce old names or wire forms
-such as `Command`, `OperationType`, `OperationState`, `NodeBlock`,
-`TransferReceipt`, `ReadyReceipt`, `RemovedReceipt`, `ReleaseReceipt`,
-`begin_operation`, `begin_drain`, version-only bootstrap evidence, or bool/int
-owner commit results.
+## Existing component mapping
 
-Canonical operation types are:
+| Contract name | Repository implementation |
+|---|---|
+| GS | `GroupScheduler` / global scheduler role |
+| TaskRunner | `MultiTaskFullyAsyncTaskRunner` |
+| Trainer | `MultiTaskFullyAsyncTrainer` |
+| Rollouter | `MultiTaskFullyAsyncRollouter` |
+| Manager | `MultiTaskLLMServerManager` |
+| CE Manager | `MultiTaskCheckpointEngineManager` |
+| LB | `MultiTaskGlobalRequestLoadBalancer` |
+| RuntimeBackend | task-local Manager/backend boundary |
 
-- `OperationKind`: ADD / DONATE / REMOVE / RESTORE
-- `RecallMode`: NATURAL / FORCE_VERIFIED
-- `OperationStatus`: ACCEPTED / RUNNING / SUCCEEDED / FAILED / UNKNOWN
-- `Phase`: VALIDATE, CREATE, DRAIN, ABORT_TARGET, WAIT_CONTINUATION,
-  WAIT_GATE, WAKE_WEIGHTS, LOAD_WEIGHTS, JOIN_CE, COMMIT_SERVICE, LEAVE_CE,
-  COMMIT_REMOVAL, SLEEP, DESTROY, RECONCILE, DONE
-- `Outcome`: KNOWN_NOT_APPLIED / KNOWN_APPLIED / UNKNOWN
+Do not add a parallel set of orchestration actors merely to mirror the design names. `OperationCoordinator`, gate helpers, drain policy, runtime factory and lease binder may remain ordinary local helpers.
 
-`OperationStatus`, `Phase`, and `Outcome` are separate facts. `DONE` does not
-imply success. Unknown side effects must remain UNKNOWN and be reconciled.
+## State ownership
 
-## 3. Identity, replay budget, and placement
+There are four business views plus two control states:
 
-`ReplicaKey(task_session, replica_id, runtime_epoch)` is the runtime identity.
-Rebuild changes `runtime_epoch`; sleep/wake does not.
+- **M** — Manager owns `ReplicaRecord` lifecycle state.
+- **E** — CE Manager owns effective parameter receivers.
+- **R** — LB owns routes and attempt records.
+- **C** — Rollouter owns committed active capacity.
+- Rollouter owns `ProductionWindow`.
+- Trainer owns the single replica-sync gate G; CE owns the immutable current `PublishedWeightSnapshot` projection used through Trainer.
 
-`OperationContext` carries protocol version, GS epoch, task/session,
-operation_id, lease identity/epoch, command sequence and expected revision.
+No component may duplicate another owner's mutable truth merely for convenience.
 
-`OperationCommand` contains the complete nested context, target,
-`LeaseAuthorization`, payload digest, remaining budget, and operation-specific
-placement/candidate/recall data. `operation_id` replay is valid only when the
-immutable business identity is identical. `remaining_budget_ms` is transport
-budget and is deliberately excluded from that business identity. The first
-accepted operation owns the operation deadline; a same-ID retry returns existing
-progress and must not create a new deadline or reset the total time budget.
+## Public lifecycle states
 
-The first release permits **one unfinished lifecycle operation per task**.
-Same-operation replay is always allowed because it does not create a second
-execution. A different `operation_id` is accepted only after the current
-operation reaches `DONE`; it must then also pass the monotonic `command_seq`
-fence. Native parameter synchronization is serialized with lifecycle critical
-commit sections by the task-local gate G rather than by starting a second
-lifecycle operation.
+`PREPARING`, `ACTIVE`, `DRAINING`, `DETACHED`, `DORMANT`, `RESTORING`, `DESTROYED`, `QUARANTINED`.
 
-First-release `PlacementSpec` is single-node (`NodePlacement`) with `dp=1`,
-`pp=1`, and `world_size == tp`.
+Terminal native/borrowed records remain in M; they are not replaced by a second "deleted" ledger.
 
-## 4. Public lifecycle
+## Current public wire shapes
 
-Manager exposes exactly eight lifecycle states:
+### Idle observation
 
-`PREPARING -> ACTIVE -> DRAINING -> DETACHED`, followed by:
+```text
+ProductionWindow(task_session, epoch, revision, state, eligible_pending, held_samples)
+ServerActivity(key, engine_seq, observed_age_ms, admitting, queued, running, pending_admissions, all_backends_observed)
+IdleCandidate(key, production_epoch, reason, evidence_digest)
+IdleCandidateReport(task_session, gs_epoch, lb_session, source_seq, production_revision, valid_for_ms, candidates)
+```
 
-- native: `DORMANT -> RESTORING -> ACTIVE`
-- borrowed: `DESTROYED`
-- uncertain paths: `QUARANTINED`
+`source_seq` and TTL belong only to the complete report. A candidate does not copy report sequencing, placement, Manager/LB revisions, engine counters, or stable-idle timings. Those facts remain owner-local and are bound into `evidence_digest` after real validation.
 
-Detailed bootstrap, CE, route, sleep and destroy progress belongs in the
-operation journal/evidence, not additional public lifecycle states.
+### Parameter/runtime material
 
-## 5. M / E / R / C ownership
+```text
+PreparedReplica(key, model_signature, receivers, head_server, prepared_digest)
+PublishedWeightSnapshot(snapshot_id, manifest_digest, model_signature, version, sender)
+EffectiveReplicaEntry(key, receivers, loaded_version, membership_operation_id)
+```
 
-- **M**: Manager owns `ReplicaRecord` lifecycle.
-- **E**: Checkpoint Engine Manager owns effective synchronization membership.
-- **R**: Load Balancer owns routing and attempt records.
-- **C**: Rollouter owns committed active capacity.
+Snapshot byte size is observability, not public correctness state. Task-level model/layout compatibility is checked before CE membership and is not repeated in every `EffectiveReplicaEntry`.
 
-Each owner has one writer. Revisions from different owners are not comparable.
-CE/LB commits return typed `CommitReceipt`, never bool/int shortcuts.
+### Lifecycle evidence
 
-## 6. Four lifecycle evidence classes
+```text
+WeightEvidence(header, version, manifest_digest, receivers_digest)
+ExitEvidence(header, drain_id, recall_mode, quiescence_digest, attempts_digest)
+ServiceEvidence(header, action, prerequisite_digest, service_digest)
+ReleaseEvidence(header, release_kind, permit_digest, inventory_digest, released_gpu_uuids)
+NeverPublishedProof(header, publication_fence_digest)
+```
 
-The only cross-stage lifecycle proofs are:
+`release_kind` is exactly `DONOR_SLEEP_RELEASED` or `BORROWER_RUNTIME_DESTROYED`.
 
-1. `WeightEvidence`: exact immutable published weights are installed on all
-   receivers and temporary transfer topology is clean.
-2. `ExitEvidence`: old requests have left the target. NATURAL has no
-   continuations; FORCE_VERIFIED requires verified continuation disposition.
-3. `ServiceEvidence`: CE/LB/Capacity/Manager service ADD or REMOVE is committed.
-   REMOVE proves DETACHED only; it does not prove device release.
-4. `ReleaseEvidence`: physical sleep/destroy release is verified per GPU and by
-   all required backends.
+Receiver-by-receiver transfer results, drain counters, continuation details, per-GPU HBM/process diagnostics, `ProcessIdentity`, and cleanup inventories are not public lifecycle records. They stay in the real owner/backend journal. A RuntimeBackend keeps its cleanup inventory internally by full `ReplicaKey`.
 
-`CommitReceipt`, `AdmissionSnapshot`, `Ack`, `DrainTicket`, `PreparedReplica`
-and `NeverPublishedProof` are phase/local results, not substitutes for the four
-lifecycle proofs.
+`released_gpu_uuids` must contain no duplicates and its set must equal the lease `PlacementSpec.node.gpu_uuids` exactly before GS can transfer usage rights.
 
-## 7. Published weights and G
+### Aggregate task observation
 
-A version number is not weight evidence. ADD/RESTORE pin an immutable
-`PublishedWeightSnapshot(snapshot_id, manifest_digest, model_signature,
-version, byte_size, sender)` and require returned `WeightEvidence` to match it.
+```text
+TaskSnapshot(task_session, production, replica_records, ce_revision, published_version, lb_revision, capacity, sync_health, current_operation_id, consistency)
+```
 
-The task-local replica sync gate **G** serializes native parameter sync with
-membership/service commit critical sections. Long hidden-create and drain waits
-stay outside G. Unknown/cancelled native sync outcomes block ordinary future G
-owners until reconciliation.
+The old `SyncSnapshot` query is removed. `probe_task()` may return a `TaskSnapshot` only when it can gather real owner facts. Otherwise it must fail explicitly; it must never synthesize default zeros or a fake `STABLE` snapshot.
 
-## 8. Canonical control interfaces
+### Capability evidence
 
-GS -> TaskRunner:
+A capability flag is not verification. Runtime support is represented by `CapabilityProof(name, backend_version, model_signature, placement_digest, validation_id)` and must match the actual combination being executed.
 
-- `submit_operation(command: OperationCommand) -> OperationResult`
-- `query_operation(task_session, operation_id) -> QueryResult[OperationResult]`
-- `probe_task(task_session) -> TaskSnapshot`
+## Canonical coordination interfaces
 
-LB -> GS:
+```text
+TaskRunner.submit_operation(OperationCommand) -> OperationResult
+TaskRunner.query_operation(task_session, operation_id) -> QueryResult[OperationResult]
+TaskRunner.probe_task(task_session) -> TaskSnapshot
 
-- `report_idle_candidates(report: IdleCandidateReport) -> Ack`
+Trainer.bootstrap_and_publish(ctx, PreparedReplica) -> ServiceEvidence
+Trainer.remove_and_commit(ctx, ExitEvidence) -> ServiceEvidence
+Trainer.restore_and_publish(ctx, ReplicaKey) -> ServiceEvidence
 
-TaskRunner/Trainer/Rollouter internal lifecycle entries:
+Rollouter.prepare_replica(ctx, key, placement) -> PreparedReplica
+Rollouter.prepare_exit(OperationCommand) -> ExitEvidence
+Rollouter.commit_service_change(ctx, action, prerequisite, ce_commit, prepared?) -> ServiceEvidence
+Rollouter.finalize_release(ctx, ServiceEvidence(REMOVE)) -> ReleaseEvidence
 
-- `prepare_replica(ctx, key, placement) -> PreparedReplica`
-- `prepare_exit(command) -> ExitEvidence`
-- `bootstrap_and_publish(ctx, prepared) -> ServiceEvidence(ADD)`
-- `remove_and_commit(ctx, proof) -> ServiceEvidence(REMOVE)`
-- `restore_and_publish(ctx, key) -> ServiceEvidence(ADD)`
-- `finalize_release(ctx, service) -> ReleaseEvidence`
-- owner-side `query_phase(...)` for reconciliation
+RuntimeBackend.create_hidden(ctx, key, placement) -> PreparedReplica
+RuntimeBackend.sleep(ctx, key, ServiceEvidence(REMOVE)) -> ReleaseEvidence
+RuntimeBackend.wake_weights(ctx, key) -> RuntimeReady
+RuntimeBackend.wake_kv_and_validate(ctx, key, WeightEvidence) -> RuntimeReady
+RuntimeBackend.destroy(ctx, key, CleanupPermit) -> ReleaseEvidence
 
-Do not restore `begin_drain`, `begin_operation`, or free boolean restore fences.
+LB.commit_routable(ctx, prepared, weight, ce_commit) -> CommitReceipt
+LB.finish_remove(ctx, exit, ce_commit) -> CommitReceipt
+LB.set_sync_barrier(token, direction, version?) -> AdmissionSnapshot
+```
 
-## 9. Idle candidates
+`prepare_exit()` owns the long drain/abort/continuation workflow internally. `remove_and_commit()` reacquires G and performs a fresh owner-side exit revalidation before CE REMOVE. There is no public `revalidate_exit()`.
 
-Missing activity counts are UNKNOWN (`None`), never assumed zero. An
-`IdleCandidate` is emitted only from complete, fresh, stable production +
-Manager + LB + engine facts and contains the exact `ReplicaKey`, production
-and source revisions, Manager/LB revisions, engine digest, reason, idle
-stability, observation age, GPU count, evidence digest and placement digest.
+ADD and REMOVE share `commit_service_change()`. There are no separate public `commit_service()` and `commit_removal()` orchestration entries.
 
-`IdleCandidateReport` is complete-set replacement. An empty candidate tuple
-revokes previous candidates; replaying the same `source_seq` does not renew its
-TTL. A DONATE command carries the exact chosen `IdleCandidate` and must
-revalidate it before side effects.
+## Operation and authorization fencing
 
-## 10. Request/sample exactly-once boundary
+- one unfinished lifecycle operation per task session
+- same `operation_id` + same immutable business identity is replay/idempotency
+- a different `operation_id` requires a strictly greater task-session `command_seq`; switching target replicas does not bypass this fence
+- lease `authorization_seq` is monotonic per lease; replay of the same operation may reuse the original sequence
+- the first TaskRunner acceptance freezes the operation deadline; retry budget cannot extend it
+- timeout is not proof that a side effect did not execute; query the real owner and reconcile UNKNOWN
 
-A completed sample is keyed by `(task_session, logical_sample_id)`, not by turn
-or attempt. First completion stores `CompletionEvidence`; same key + same digest
-returns that first evidence without enqueueing again; same key + different
-digest is a conflict. Native queue-full/drop-oldest return behavior is recorded
-separately from deduplication.
+## Resource handoff closure
 
-## 11. Release and authorization
+GS changes GPU usage rights only after a full chain is validated:
 
-GS may transfer GPU authorization only after a `SUCCEEDED` operation carries a
-matching `ServiceEvidence(REMOVE)` and `ReleaseEvidence`. The release evidence
-must match the operation/lease/runtime identity and reference the service-removal
-proof through `permit_digest`.
+```text
+ExitEvidence
+  -> ServiceEvidence(action=REMOVE)
+  -> ReleaseEvidence(exact GPU set)
+  -> GS stores last_release_digest
+  -> next ADD/RESTORE authorization.prior_release_digest matches it
+```
 
-After GS confirms that release, its digest becomes the next authorization
-fence: ADD/RESTORE `LeaseAuthorization.prior_release_digest` must match the
-last release digest already confirmed for that lease. Native sleep may retain
-verified native processes; borrowed destroy must not retain borrower-owned or
-unknown processes. A string state, success status alone, or service-detached
-proof cannot substitute for physical release evidence.
+A bare successful status, health check, ACK, process disappearance, or memory observation is not a release proof.
 
-## 12. Document corrections incorporated here
+## Native-runtime safety boundary
 
-The full fusion design had two editorial defects that do not change protocol
-semantics:
+The repository may implement and test orchestration/control-plane invariants in pure Python. The following remain explicit failures until validated on the supported VERL/vLLM/CUDA/NCCL combination:
 
-- the duplicated heading `### 6.8### 6.8` is `### 6.8`;
-- the sample queue text means removing the redundant **CompletionRecord**
-  wrapper because `CompletionEvidence` already contains key + payload digest;
-  it does **not** mean deleting `CompletionEvidence` itself.
+- borrowed hidden runtime creation/device binding
+- real native sleep/release
+- target-only parameter bootstrap/replay
+- wake/restore inference resources
+- targeted abort + continuation for FORCE_VERIFIED
+- runtime cleanup/release evidence generation from actual device/process facts
 
-These corrections are reflected in the supplied corrected fusion-design file.
+Do not replace those failures with dummy handles or synthetic success evidence.

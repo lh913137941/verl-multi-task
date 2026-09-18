@@ -92,7 +92,7 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
         )
 
     async def remove_and_commit(self, ctx, proof):
-        """Exit coordinator: revalidate -> CE REMOVE -> RO service removal."""
+        """Exit coordinator: internal revalidation -> CE REMOVE -> service removal."""
         raise NotImplementedError(
             "remove_and_commit requires verified native runtime/CE evidence wiring"
         )
@@ -102,6 +102,3 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
         raise NotImplementedError(
             "restore_and_publish requires verified native wake/bootstrap wiring"
         )
-
-    def query_sync_state(self):
-        raise NotImplementedError("query_sync_state requires real CE/sync owner observations")
