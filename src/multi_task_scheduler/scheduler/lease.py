@@ -13,7 +13,6 @@ from enum import Enum
 
 from multi_task_scheduler.orchestration.contracts import (
     OperationResult,
-    ReleaseKind,
     ServiceAction,
 )
 from multi_task_scheduler.orchestration.operation_journal import OperationStatus
@@ -65,11 +64,11 @@ _ALLOWED = {
 _RELEASE_REQUIREMENTS = {
     (LeaseState.DONOR_DRAINING, LeaseState.DONOR_RELEASED): (
         "donor",
-        ReleaseKind.DONOR_SLEEP_RELEASED,
+        "DONOR_SLEEP_RELEASED",
     ),
     (LeaseState.RECALLING, LeaseState.BORROWER_RELEASED): (
         "borrower",
-        ReleaseKind.BORROWER_RUNTIME_DESTROYED,
+        "BORROWER_RUNTIME_DESTROYED",
     ),
 }
 
@@ -183,7 +182,7 @@ class LeaseStateMachine:
         lease: LeaseRecord,
         result: OperationResult | None,
         role: str,
-        release_kind: ReleaseKind,
+        release_kind: str,
     ) -> OperationResult:
         expected_session = self._expected_session(lease, role)
         result = self._require_result_identity(lease, result, expected_session)
@@ -193,9 +192,9 @@ class LeaseStateMachine:
             raise MissingEvidenceError("resource handoff requires ReleaseEvidence")
         if release.header.ctx != result.ctx or release.header.key != result.target:
             raise MissingEvidenceError("release evidence identity does not match operation result")
-        if release.release_kind is not release_kind:
+        if release.release_kind != release_kind:
             raise MissingEvidenceError(
-                f"release kind {release.release_kind.value} does not match lease edge"
+                f"release kind {release.release_kind} does not match lease edge"
             )
         if release.permit_digest != service.header.digest:
             raise MissingEvidenceError(
@@ -204,7 +203,7 @@ class LeaseStateMachine:
         if lease.placement is None:
             raise MissingEvidenceError("lease placement is required to verify per-GPU release")
         expected_gpu_uuids = set(lease.placement.node.gpu_uuids)
-        released_gpu_uuids = {gpu.gpu_uuid for gpu in release.per_gpu}
+        released_gpu_uuids = set(release.released_gpu_uuids)
         if released_gpu_uuids != expected_gpu_uuids:
             raise MissingEvidenceError(
                 "release evidence must exactly cover every GPU in the lease placement"
