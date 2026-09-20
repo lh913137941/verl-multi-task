@@ -23,6 +23,7 @@ from multi_task_scheduler.orchestration.contracts import (
     PlacementSpec,
     QueryResult,
     ReplicaKey,
+    ServiceAction,
 )
 from multi_task_scheduler.orchestration.operation_journal import (
     OperationIdentityError,
@@ -33,10 +34,7 @@ from multi_task_scheduler.orchestration.operation_journal import (
     Phase,
     operation_outcome,
 )
-from multi_task_scheduler.orchestration.production_window import (
-    ProductionWindow,
-    WindowState,
-)
+from multi_task_scheduler.orchestration.production_window import ProductionWindow, WindowState
 from multi_task_scheduler.orchestration.receipts import ReleaseEvidence, ServiceEvidence
 from multi_task_scheduler.orchestration.replica_sync_gate import (
     GateFencedError,
@@ -125,11 +123,6 @@ def _window(revision=9):
         state=WindowState.EXHAUSTED,
         eligible_pending=0,
         held_samples=0,
-        active_samples=1,
-        output_queue_size=0,
-        max_queue_size=8,
-        producer_exhausted=True,
-        policy_refresh_inflight=False,
     )
 
 
@@ -245,6 +238,7 @@ def test_rollouter_owns_production_window_but_not_idle_reporting():
         FullyAsyncAgentLoopManager=SimpleNamespace(),
         FullyAsyncLLMServerClient=object(),
         ProductionWindow=ProductionWindow,
+        ServiceAction=ServiceAction,
     )
     rollouter = rollouter_class(object(), object(), None, "cuda")
     assert rollouter.production_window is None
@@ -259,7 +253,7 @@ def test_rollouter_owns_production_window_but_not_idle_reporting():
         rollouter.set_production_window(_window(revision=8))
 
 
-def test_rollouter_lifecycle_runtime_actions_stay_explicitly_unimplemented():
+def test_rollouter_exposes_only_canonical_lifecycle_surface_and_real_actions_fail_closed():
     class Parent:
         def __init__(self, *args, **kwargs):
             pass
@@ -272,14 +266,17 @@ def test_rollouter_lifecycle_runtime_actions_stay_explicitly_unimplemented():
         FullyAsyncAgentLoopManager=SimpleNamespace(),
         FullyAsyncLLMServerClient=object(),
         ProductionWindow=ProductionWindow,
+        ServiceAction=ServiceAction,
     )
     rollouter = rollouter_class(object(), object(), None, "cuda")
+
+    assert not hasattr(rollouter, "revalidate_exit")
+    assert not hasattr(rollouter, "commit_service")
+    assert not hasattr(rollouter, "commit_removal")
     for method, args in (
         (rollouter.prepare_replica, (None, None, None)),
         (rollouter.prepare_exit, (None,)),
-        (rollouter.revalidate_exit, (None, None)),
-        (rollouter.commit_service, (None, None, None, None)),
-        (rollouter.commit_removal, (None, None, None)),
+        (rollouter.commit_service_change, (None, ServiceAction.ADD, None, None)),
         (rollouter.finalize_release, (None, None)),
     ):
         with pytest.raises(NotImplementedError):
@@ -332,6 +329,7 @@ def test_trainer_exposes_only_snapshot_based_current_entry_points():
     trainer = trainer_class()
     assert trainer.current_snapshot() is None
     assert not hasattr(trainer, "publish_serving_version")
+    assert not hasattr(trainer, "query_sync_state")
     with pytest.raises(NotImplementedError):
         asyncio.run(trainer.bootstrap_and_publish(None, None))
     with pytest.raises(NotImplementedError):

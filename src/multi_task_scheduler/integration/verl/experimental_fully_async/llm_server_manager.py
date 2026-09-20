@@ -1,7 +1,8 @@
 """Select rollout subclasses and own the Manager lifecycle view (M).
 
-Native server creation/routing stays inherited. Real create/sleep/destroy GPU
-primitives remain explicit failures until their backend is verified.
+Native server creation/routing stays inherited. RuntimeBackend primitives are
+kept on this task-local manager boundary for the first release and fail
+explicitly until their real CUDA/NCCL/vLLM implementation is verified.
 """
 
 import ray
@@ -23,6 +24,10 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         super().__init__(config, worker_group, rollout_resource_pool)
         self._load_balancer_cls = MultiTaskGlobalRequestLoadBalancer
         self._lifecycle = {}
+        # RuntimeBackend implementation details stay private and are keyed by
+        # full ReplicaKey. A verified backend may store process/actor/port/IPC
+        # identities here; none of those are public protocol records.
+        self._runtime_inventory = {}
 
     async def _init_global_load_balancer(self) -> None:
         self.global_load_balancer = ray.remote(self._load_balancer_cls).remote(
@@ -41,17 +46,32 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         """Read-only lifecycle lookup by ReplicaKey; never returns a donor handle."""
         return self._lifecycle.get(key)
 
-    def materialize_hidden(self, ctx, key, placement):
+    def create_hidden(self, ctx, key, placement):
         raise NotImplementedError(
             "RuntimeBackend.create_hidden requires verified native backend"
         )
 
-    def sleep_runtime(self, ctx, key, proof):
+    def sleep(self, ctx, key, proof):
         raise NotImplementedError(
             "RuntimeBackend.sleep requires verified native backend"
         )
 
-    def destroy_runtime(self, ctx, key, proof):
+    def wake_weights(self, ctx, key):
+        raise NotImplementedError(
+            "RuntimeBackend.wake_weights requires verified native backend"
+        )
+
+    def wake_kv_and_validate(self, ctx, key, weight):
+        raise NotImplementedError(
+            "RuntimeBackend.wake_kv_and_validate requires verified native backend"
+        )
+
+    def destroy(self, ctx, key, proof):
         raise NotImplementedError(
             "RuntimeBackend.destroy requires verified native backend"
+        )
+
+    def query_phase(self, ctx, phase):
+        raise NotImplementedError(
+            "RuntimeBackend.query_phase requires owner-side journal wiring"
         )

@@ -1,22 +1,20 @@
-"""Canonical lifecycle evidence for the simplified orchestration contract.
+"""Canonical lifecycle evidence for the current simplified orchestration contract.
 
-Evidence objects represent facts already established by their state owner. There
-are no legacy success receipts or boolean shortcuts in this module.
+Lifecycle evidence is deliberately compact: detailed receiver, request, engine,
+and GPU cleanup observations remain with their authoritative owner. Public
+objects bind those already-verified facts by stable digests.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Tuple
+from typing import Literal, TypeAlias
 
 from .contracts import (
-    CleanupInventory,
     OperationContext,
     OperationError,
-    ProcessIdentity,
     RecallMode,
-    ReleaseKind,
     ReplicaKey,
     ServiceAction,
 )
@@ -59,28 +57,18 @@ class DrainTicket:
 
 @dataclass(frozen=True)
 class WeightEvidence:
+    """Proof that the complete target receiver set loaded one published version."""
+
     header: EvidenceHeader
-    transfer_id: str
-    snapshot_id: str
-    manifest_digest: str
     version: int
-    receiver_versions: dict[str, int]
-    device_complete: bool
-    temporary_topology_clean: bool
+    manifest_digest: str
+    receivers_digest: str
 
     def __post_init__(self) -> None:
-        if not self.transfer_id or not self.snapshot_id or not self.manifest_digest:
-            raise ValueError("weight evidence identifiers must be nonempty")
         if self.version < 0:
             raise ValueError("weight version must be nonnegative")
-        if not self.receiver_versions:
-            raise ValueError("successful WeightEvidence requires receiver results")
-        if any(not receiver_id for receiver_id in self.receiver_versions):
-            raise ValueError("receiver ids must be nonempty")
-        if any(version != self.version for version in self.receiver_versions.values()):
-            raise ValueError("every receiver must load the evidence version")
-        if not self.device_complete or not self.temporary_topology_clean:
-            raise ValueError("WeightEvidence exists only after device/topology completion")
+        if not self.manifest_digest or not self.receivers_digest:
+            raise ValueError("manifest_digest and receivers_digest must be nonempty")
 
 
 @dataclass(frozen=True)
@@ -111,162 +99,62 @@ class CommitReceipt:
 
 
 @dataclass(frozen=True)
-class ContinuationRecord:
-    ctx: OperationContext
-    key: ReplicaKey
-    drain_id: str
-    old_attempt_id: str
-    client_session: str
-    prefix_digest: str
-    old_terminal: object
-    old_release_acked: bool
-    new_acceptance: object | None
-    completed_turn: object | None
-
-    def __post_init__(self) -> None:
-        if self.key.task_session != self.ctx.task_session:
-            raise ValueError("continuation key must match operation task_session")
-        for name in ("drain_id", "old_attempt_id", "client_session", "prefix_digest"):
-            if not getattr(self, name):
-                raise ValueError(f"{name} must be nonempty")
-        if self.old_terminal is None or not self.old_release_acked:
-            raise ValueError("continuation requires terminal and release acknowledgement")
-        if getattr(self.old_terminal, "device_finished", False) is not True:
-            raise ValueError("old attempt device work must be explicitly finished")
-        if (self.new_acceptance is None) == (self.completed_turn is None):
-            raise ValueError("exactly one of new_acceptance/completed_turn must be present")
-
-
-@dataclass(frozen=True)
 class ExitEvidence:
+    """Proof that one drain is quiet and every old attempt has a legal outcome."""
+
     header: EvidenceHeader
     drain_id: str
     recall_mode: RecallMode
-    inflight: int
-    admitting: int
-    queued: int
-    running: int
-    pending_admissions: int
-    closed_admission: bool
-    all_backends_confirmed: bool
-    lb_revision: int
-    observed_age_ms: int
-    engine_digest: str
-    continuations: Tuple[ContinuationRecord, ...]
-    unresolved_count: int
+    quiescence_digest: str
+    attempts_digest: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "recall_mode", RecallMode(self.recall_mode))
-        if not self.drain_id or not self.engine_digest:
-            raise ValueError("drain_id and engine_digest must be nonempty")
-        counts = (
-            self.inflight,
-            self.admitting,
-            self.queued,
-            self.running,
-            self.pending_admissions,
-            self.unresolved_count,
-        )
-        if any(value < 0 for value in counts):
-            raise ValueError("exit counters must be nonnegative")
-        if self.lb_revision < 0 or self.observed_age_ms < 0:
-            raise ValueError("lb_revision and observed_age_ms must be nonnegative")
-        if any(value != 0 for value in counts):
-            raise ValueError("successful ExitEvidence requires all request counters to be zero")
-        if not self.closed_admission or not self.all_backends_confirmed:
-            raise ValueError("successful ExitEvidence requires closed admission and backend confirmation")
-        if self.recall_mode is RecallMode.NATURAL and self.continuations:
-            raise ValueError("NATURAL ExitEvidence must not contain continuations")
-        if self.recall_mode is RecallMode.FORCE_VERIFIED:
-            for record in self.continuations:
-                if record.ctx != self.header.ctx or record.key != self.header.key:
-                    raise ValueError("continuation identity must match exit evidence")
-                if record.drain_id != self.drain_id:
-                    raise ValueError("continuation drain_id must match exit evidence")
+        if not self.drain_id:
+            raise ValueError("drain_id must be nonempty")
+        if not self.quiescence_digest or not self.attempts_digest:
+            raise ValueError("quiescence_digest and attempts_digest must be nonempty")
 
 
 @dataclass(frozen=True)
 class ServiceEvidence:
+    """Combined proof that E/R/C/M committed one ADD or REMOVE service change."""
+
     header: EvidenceHeader
     action: ServiceAction
-    version: int | None
-    ce_revision: int
-    lb_revision: int
-    route_epoch: int
-    capacity_revision: int
-    manager_revision: int
-    ce_commit_digest: str
-    lb_commit_digest: str
     prerequisite_digest: str
+    service_digest: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "action", ServiceAction(self.action))
-        for value in (
-            self.ce_revision,
-            self.lb_revision,
-            self.route_epoch,
-            self.capacity_revision,
-            self.manager_revision,
-        ):
-            if value < 0:
-                raise ValueError("service revisions/epoch must be nonnegative")
-        for name in ("ce_commit_digest", "lb_commit_digest", "prerequisite_digest"):
-            if not getattr(self, name):
-                raise ValueError(f"{name} must be nonempty")
-        if self.action is ServiceAction.ADD:
-            if self.version is None or self.version < 0:
-                raise ValueError("ADD ServiceEvidence requires version")
-        elif self.version is not None:
-            raise ValueError("REMOVE ServiceEvidence requires version=None")
-
-
-@dataclass(frozen=True)
-class GPURelease:
-    gpu_uuid: str
-    free_hbm_bytes: int
-    residual_hbm_bytes: int
-    owned_processes: Tuple[ProcessIdentity, ...]
-    unknown_processes: Tuple[ProcessIdentity, ...]
-    device_work_complete: bool
-    meets_release_budget: bool
-
-    def __post_init__(self) -> None:
-        if not self.gpu_uuid:
-            raise ValueError("gpu_uuid must be nonempty")
-        if self.free_hbm_bytes < 0 or self.residual_hbm_bytes < 0:
-            raise ValueError("HBM byte counts must be nonnegative")
-        if self.unknown_processes:
-            raise ValueError("successful GPURelease cannot contain unknown processes")
-        if not self.device_work_complete or not self.meets_release_budget:
-            raise ValueError("successful GPURelease requires completed device work and budget")
+        if not self.prerequisite_digest or not self.service_digest:
+            raise ValueError("prerequisite_digest and service_digest must be nonempty")
 
 
 @dataclass(frozen=True)
 class ReleaseEvidence:
+    """Proof that every GPU in the lease placement passed backend release checks."""
+
     header: EvidenceHeader
-    release_kind: ReleaseKind
+    release_kind: Literal["DONOR_SLEEP_RELEASED", "BORROWER_RUNTIME_DESTROYED"]
     permit_digest: str
     inventory_digest: str
-    per_gpu: Tuple[GPURelease, ...]
-    all_backends_confirmed: bool
-    observation_interval_ms: int
+    released_gpu_uuids: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "release_kind", ReleaseKind(self.release_kind))
+        if self.release_kind not in {
+            "DONOR_SLEEP_RELEASED",
+            "BORROWER_RUNTIME_DESTROYED",
+        }:
+            raise ValueError("invalid release_kind")
         if not self.permit_digest or not self.inventory_digest:
             raise ValueError("permit_digest and inventory_digest must be nonempty")
-        if not self.per_gpu:
-            raise ValueError("ReleaseEvidence requires per-GPU proof")
-        gpu_uuids = tuple(gpu.gpu_uuid for gpu in self.per_gpu)
-        if len(set(gpu_uuids)) != len(gpu_uuids):
-            raise ValueError("ReleaseEvidence requires exactly one proof per GPU")
-        if not self.all_backends_confirmed:
-            raise ValueError("ReleaseEvidence requires all backend confirmations")
-        if self.observation_interval_ms < 0:
-            raise ValueError("observation_interval_ms must be nonnegative")
-        if self.release_kind is ReleaseKind.BORROWER_RUNTIME_DESTROYED:
-            if any(gpu.owned_processes for gpu in self.per_gpu):
-                raise ValueError("borrowed destroy cannot leave owned processes")
+        if not self.released_gpu_uuids:
+            raise ValueError("ReleaseEvidence requires released_gpu_uuids")
+        if any(not gpu_uuid for gpu_uuid in self.released_gpu_uuids):
+            raise ValueError("released_gpu_uuids must be nonempty strings")
+        if len(set(self.released_gpu_uuids)) != len(self.released_gpu_uuids):
+            raise ValueError("released_gpu_uuids must not contain duplicates")
 
 
 @dataclass(frozen=True)
@@ -302,12 +190,14 @@ class Ack:
 
 @dataclass(frozen=True)
 class NeverPublishedProof:
+    """Permit for destroying a failed ADD after CE/LB absence is fenced."""
+
     header: EvidenceHeader
-    no_route_commit: bool
-    no_ce_membership: bool
-    fenced: bool
-    inventory: CleanupInventory
+    publication_fence_digest: str
 
     def __post_init__(self) -> None:
-        if not (self.no_route_commit and self.no_ce_membership and self.fenced):
-            raise ValueError("NeverPublishedProof requires queried absence and a commit fence")
+        if not self.publication_fence_digest:
+            raise ValueError("publication_fence_digest must be nonempty")
+
+
+CleanupPermit: TypeAlias = ServiceEvidence | NeverPublishedProof

@@ -1,9 +1,8 @@
 """Native routing subclass plus the simplified R-view commit protocol.
 
 Dynamic service commits use full ReplicaKey identity and typed RouteEntry state.
-LB also owns idle-candidate observation sequencing/reporting, as required by the
-simplified fusion contract. Native request selection remains inherited until
-dynamic routing is wired end-to-end.
+LB owns IdleCandidateReport sequencing; a candidate itself deliberately carries
+no report-level source_seq/TTL or detailed owner observations.
 """
 
 from __future__ import annotations
@@ -88,7 +87,6 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         candidates = select_idle_candidates(
             window,
             replicas,
-            source_seq=source_seq,
             observations_fresh=observations_fresh,
             min_active_gpus=min_active_gpus,
             current_active_gpus=current_active_gpus,
@@ -108,12 +106,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         return report
 
     def report_idle_candidates(self, report: IdleCandidateReport) -> Ack:
-        """Send one already-frozen report to GS; retries reuse the same object.
-
-        Constructing and sending are intentionally separate. If an ACK is lost,
-        callers resend the original report and therefore the same source_seq;
-        they must not construct a new report merely to retry transport.
-        """
+        """Send one already-frozen report to GS; retries reuse the same object."""
         if not isinstance(report, IdleCandidateReport):
             raise TypeError("report_idle_candidates requires IdleCandidateReport")
         if self.group_scheduler is None:
@@ -178,7 +171,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
     def commit_routable(self, ctx, prepared, weight, ce_commit) -> CommitReceipt:
         """Commit R=ROUTABLE after valid weight and CE ADD evidence."""
         key = prepared.key
-        if prepared.ctx != ctx or weight.header.ctx != ctx or weight.header.key != key:
+        if key.task_session != ctx.task_session or weight.header.ctx != ctx or weight.header.key != key:
             raise ValueError("LB ADD evidence identity mismatch")
         if (
             ce_commit.header.ctx != ctx
@@ -330,6 +323,12 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         )
         self._commit_receipts[cache_key] = receipt
         return receipt
+
+    def set_sync_barrier(self, token, direction, version=None):
+        """Canonical PAUSE/RESUME entry; requires real Server barrier wiring."""
+        raise NotImplementedError(
+            "LB.set_sync_barrier requires verified task-wide admission barrier wiring"
+        )
 
     def query_phase(self, ctx, phase):
         """Owner-side query must be backed by a real phase journal before use."""

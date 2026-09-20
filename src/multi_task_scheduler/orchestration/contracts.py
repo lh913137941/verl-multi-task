@@ -1,7 +1,8 @@
-"""Cross-component value contracts aligned with simplified fusion design §6.
+"""Cross-component value contracts for the current simplified fusion design.
 
-This module exposes only the current contract. Superseded aliases and wire
-shapes are intentionally not retained: callers must migrate as one protocol.
+Only the current wire shapes live here. Detailed execution observations belong
+with their owner (Manager/CE/LB/Rollouter/RuntimeBackend) and are referenced by
+stable digests instead of being copied into public lifecycle objects.
 """
 
 from __future__ import annotations
@@ -23,11 +24,6 @@ _T = TypeVar("_T")
 class RecallMode(str, Enum):
     NATURAL = "NATURAL"
     FORCE_VERIFIED = "FORCE_VERIFIED"
-
-
-class ReleaseKind(str, Enum):
-    DONOR_SLEEP_RELEASED = "DONOR_SLEEP_RELEASED"
-    BORROWER_RUNTIME_DESTROYED = "BORROWER_RUNTIME_DESTROYED"
 
 
 class ServiceAction(str, Enum):
@@ -184,35 +180,20 @@ class LeaseAuthorization:
 
 @dataclass(frozen=True)
 class IdleCandidate:
+    """Lightweight GS selection token; detailed observations stay owner-local."""
+
     key: ReplicaKey
     production_epoch: int
-    source_seq: int
-    manager_revision: int
-    lb_revision: int
-    engine_digest: str
-    reason: str
-    stable_idle_ms: int
-    observed_age_ms: int
-    gpu_count: int
+    reason: Literal["CLOSED_STALENESS", "CLOSED_BACKPRESSURE", "EXHAUSTED"]
     evidence_digest: str
-    placement_digest: str
 
     def __post_init__(self) -> None:
+        if self.production_epoch < 0:
+            raise ValueError("production_epoch must be nonnegative")
         if self.reason not in {"CLOSED_STALENESS", "CLOSED_BACKPRESSURE", "EXHAUSTED"}:
             raise ValueError("invalid idle-candidate reason")
-        numeric = (
-            self.production_epoch,
-            self.source_seq,
-            self.manager_revision,
-            self.lb_revision,
-            self.stable_idle_ms,
-            self.observed_age_ms,
-        )
-        if any(value < 0 for value in numeric) or self.gpu_count <= 0:
-            raise ValueError("idle candidate revisions/ages must be nonnegative and gpu_count positive")
-        for name in ("engine_digest", "evidence_digest", "placement_digest"):
-            if not getattr(self, name):
-                raise ValueError(f"{name} must be nonempty")
+        if not self.evidence_digest:
+            raise ValueError("evidence_digest must be nonempty")
 
 
 @dataclass(frozen=True)
@@ -278,21 +259,6 @@ class CapacityRecord:
 
 
 @dataclass(frozen=True)
-class SyncSnapshot:
-    version: int
-    ce_revision: int
-    health: SyncHealth
-    owner_operation_id: str | None
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "health", SyncHealth(self.health))
-        if self.version < 0 or self.ce_revision < 0:
-            raise ValueError("sync version and ce_revision must be nonnegative")
-        if self.owner_operation_id is not None and not self.owner_operation_id:
-            raise ValueError("owner_operation_id must be nonempty when present")
-
-
-@dataclass(frozen=True)
 class ReceiverRef:
     receiver_id: str
     node_id: str
@@ -311,25 +277,21 @@ class ReceiverRef:
 
 @dataclass(frozen=True)
 class PreparedReplica:
+    """Hidden-created runtime handles plus a digest of placement/revision facts."""
+
     key: ReplicaKey
-    ctx: OperationContext
-    placement_digest: str
     model_signature: str
     receivers: Tuple[ReceiverRef, ...]
     head_server: object
-    manager_revision: int
+    prepared_digest: str
 
     def __post_init__(self) -> None:
-        if self.key.task_session != self.ctx.task_session:
-            raise ValueError("prepared runtime task_session must match operation context")
-        if not self.placement_digest or not self.model_signature:
-            raise ValueError("placement_digest and model_signature must be nonempty")
+        if not self.model_signature or not self.prepared_digest:
+            raise ValueError("model_signature and prepared_digest must be nonempty")
         if not self.receivers:
             raise ValueError("PreparedReplica requires at least one receiver")
         if self.head_server is None:
             raise ValueError("head_server must be present")
-        if self.manager_revision < 0:
-            raise ValueError("manager_revision must be nonnegative")
 
 
 @dataclass(frozen=True)
@@ -338,45 +300,63 @@ class PublishedWeightSnapshot:
     manifest_digest: str
     model_signature: str
     version: int
-    byte_size: int
     sender: object
 
     def __post_init__(self) -> None:
         if not self.snapshot_id or not self.manifest_digest or not self.model_signature:
             raise ValueError("snapshot_id, manifest_digest and model_signature must be nonempty")
-        if self.version < 0 or self.byte_size < 0:
-            raise ValueError("version and byte_size must be nonnegative")
+        if self.version < 0:
+            raise ValueError("version must be nonnegative")
         if self.sender is None:
             raise ValueError("sender must reference the published snapshot backend")
 
 
 @dataclass(frozen=True)
-class ProcessIdentity:
-    node_id: str
-    process_start_id: str
-    role: str
-    pid: int
+class RuntimeReady:
+    key: ReplicaKey
+    stage: Literal["RECEIVER_READY", "SERVING_READY"]
+    loaded_version: int | None
 
     def __post_init__(self) -> None:
-        if not self.node_id or not self.process_start_id or not self.role:
-            raise ValueError("process identity fields must be nonempty")
-        if self.pid < 0:
-            raise ValueError("pid must be nonnegative")
+        if self.stage not in {"RECEIVER_READY", "SERVING_READY"}:
+            raise ValueError("invalid RuntimeReady stage")
+        if self.loaded_version is not None and self.loaded_version < 0:
+            raise ValueError("loaded_version must be nonnegative when present")
+        if self.stage == "SERVING_READY" and self.loaded_version is None:
+            raise ValueError("SERVING_READY requires loaded_version")
 
 
 @dataclass(frozen=True)
-class CleanupInventory:
-    processes: Tuple[ProcessIdentity, ...] = ()
-    actor_ids: Tuple[str, ...] = ()
-    endpoint_ids: Tuple[str, ...] = ()
-    ipc_paths: Tuple[str, ...] = ()
-    transfer_ids: Tuple[str, ...] = ()
-    ports: Tuple[int, ...] = ()
-    inventory_revision: int = 0
+class SyncToken:
+    task_session: str
+    sync_epoch: int
+    target_version: int
 
     def __post_init__(self) -> None:
-        if self.inventory_revision < 0 or any(port < 0 for port in self.ports):
-            raise ValueError("inventory_revision and ports must be nonnegative")
+        if not self.task_session:
+            raise ValueError("task_session must be nonempty")
+        if self.sync_epoch < 0 or self.target_version < 0:
+            raise ValueError("sync_epoch and target_version must be nonnegative")
+
+
+@dataclass(frozen=True)
+class CapabilityProof:
+    name: str
+    backend_version: str
+    model_signature: str
+    placement_digest: str
+    validation_id: str
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "name",
+            "backend_version",
+            "model_signature",
+            "placement_digest",
+            "validation_id",
+        ):
+            if not getattr(self, field_name):
+                raise ValueError(f"{field_name} must be nonempty")
 
 
 @dataclass(frozen=True)
@@ -386,7 +366,7 @@ class OperationError:
     phase: Phase
     outcome: Outcome
     retryable: bool
-    cleanup_state: str
+    cleanup_state: Literal["NOT_REQUIRED", "COMPLETE", "IN_PROGRESS", "UNKNOWN"]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "phase", Phase(self.phase))
@@ -441,8 +421,6 @@ class OperationCommand:
                 raise ValueError("DONATE requires an IdleCandidate")
             if self.candidate.key != self.target:
                 raise ValueError("DONATE candidate must match target")
-            if self.candidate.placement_digest != self.authorization.placement_digest:
-                raise ValueError("DONATE candidate placement must match authorization")
 
 
 @dataclass(frozen=True)
@@ -500,6 +478,7 @@ class TaskSnapshot:
     production: ProductionWindow
     replica_records: Tuple[ReplicaRecord, ...]
     ce_revision: int
+    published_version: int
     lb_revision: int
     capacity: CapacityRecord
     sync_health: SyncHealth
@@ -510,8 +489,8 @@ class TaskSnapshot:
         object.__setattr__(self, "sync_health", SyncHealth(self.sync_health))
         if not self.task_session:
             raise ValueError("task_session must be nonempty")
-        if self.ce_revision < 0 or self.lb_revision < 0:
-            raise ValueError("CE/LB revisions must be nonnegative")
+        if self.ce_revision < 0 or self.published_version < 0 or self.lb_revision < 0:
+            raise ValueError("CE/published/LB revisions must be nonnegative")
         if getattr(self.production, "task_session", None) != self.task_session:
             raise ValueError("production window must belong to TaskSnapshot task_session")
         if any(record.key.task_session != self.task_session for record in self.replica_records):
@@ -522,18 +501,3 @@ class TaskSnapshot:
             raise ValueError("current_operation_id must be nonempty when present")
         if self.consistency not in {"STABLE", "IN_PROGRESS", "UNKNOWN"}:
             raise ValueError("invalid TaskSnapshot consistency")
-
-
-@dataclass(frozen=True)
-class RuntimeCapabilities:
-    placement: str
-    sleep: bool = False
-    full_weight_replay: bool = False
-    target_abort_resume: bool = False
-    transport_rebuild: bool = False
-    applicable_versions: Tuple[str, ...] = ()
-    topology: str = "standalone"
-
-    def requires(self, capability: str) -> bool:
-        value = getattr(self, capability, False)
-        return value if isinstance(value, bool) else False

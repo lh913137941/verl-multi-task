@@ -1,9 +1,8 @@
 """Checkpoint Engine owner for the simplified E view.
 
 E membership is keyed by ReplicaKey and stores only the receiver projection
-needed for normal parameter synchronization. Every committed mutation returns
-an idempotent CommitReceipt. Target-only bootstrap remains unavailable until
-the native transfer backend can return real WeightEvidence.
+needed for normal parameter synchronization. Detailed target-bootstrap results
+remain CE-owned and are compressed into WeightEvidence only after verification.
 """
 
 from __future__ import annotations
@@ -45,12 +44,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         return self._effective_commit_receipts
 
     def _active_transfers(self) -> set:
-        """Return CE-owned runtime keys with a parameter transfer still in flight.
-
-        The verified native transfer backend must maintain this set around actual
-        send/load work. Until that backend is wired, REMOVE is conservative:
-        any key present here is fenced from leaving E.
-        """
+        """Return CE-owned runtime keys with a parameter transfer still in flight."""
         if not hasattr(self, "_effective_transfer_inflight"):
             self._effective_transfer_inflight = set()
         return self._effective_transfer_inflight
@@ -65,15 +59,10 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
 
     def add_effective(self, ctx, prepared, weight) -> CommitReceipt:
         """Commit E ADD idempotently after verified WeightEvidence."""
-        if prepared.ctx != ctx or weight.header.ctx != ctx:
+        if prepared.key.task_session != ctx.task_session or weight.header.ctx != ctx:
             raise ValueError("CE ADD evidence belongs to a different operation")
         if prepared.key != weight.header.key:
             raise ValueError("CE ADD runtime identity mismatch")
-        expected_receivers = {receiver.receiver_id for receiver in prepared.receivers}
-        if set(weight.receiver_versions) != expected_receivers:
-            raise ValueError("WeightEvidence does not cover prepared receivers")
-        if any(version != weight.version for version in weight.receiver_versions.values()):
-            raise ValueError("WeightEvidence receiver versions must match loaded version")
 
         cache_key = (ctx.identity, prepared.key, ServiceAction.ADD)
         cached = self._commit_cache().get(cache_key)
@@ -81,15 +70,10 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             return cached
 
         members = self._effective_replicas()
-        known_signatures = {entry.model_signature for entry in members.values()}
-        if known_signatures and prepared.model_signature not in known_signatures:
-            raise ValueError("prepared target model signature conflicts with effective CE set")
-
         entry = EffectiveReplicaEntry(
             key=prepared.key,
             receivers=prepared.receivers,
             loaded_version=weight.version,
-            model_signature=prepared.model_signature,
             membership_operation_id=ctx.operation_id,
         )
         existing = members.get(prepared.key)
@@ -160,8 +144,8 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
 
     def bootstrap_target(self, ctx, prepared, snapshot):
         """Load one immutable published snapshot and return real WeightEvidence."""
-        if prepared.ctx != ctx:
-            raise ValueError("PreparedReplica belongs to a different operation")
+        if prepared.key.task_session != ctx.task_session:
+            raise ValueError("PreparedReplica belongs to a different task session")
         if not snapshot.snapshot_id or not snapshot.manifest_digest:
             raise ValueError("bootstrap_target requires immutable published snapshot evidence")
         if snapshot.model_signature != prepared.model_signature:
