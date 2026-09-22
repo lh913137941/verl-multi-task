@@ -4,6 +4,7 @@
 """TaskRunner binding for the single experimental Fully Async profile."""
 
 import logging
+import threading
 import ray
 from verl.experimental.fully_async_policy.fully_async_main import FullyAsyncTaskRunner
 from verl.experimental.separation.utils import create_resource_pool_manager
@@ -18,12 +19,15 @@ from .trainer import MultiTaskFullyAsyncTrainer
 logger = logging.getLogger(__name__)
 
 
-@ray.remote(num_cpus=1)
+@ray.remote(num_cpus=1, max_concurrency=8)
 class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunner)):
+    """Native run thread plus a small concurrent control surface for GS commands."""
+
     def __init__(self):
         super().__init__()
         self.group_scheduler = None
         self.task_session = None
+        self._journal_lock = threading.RLock()
 
     def _ensure_journal(self) -> OperationJournal:
         if not hasattr(self, "_operation_journal"):
@@ -33,16 +37,20 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
     def submit_operation(self, command: OperationCommand) -> OperationRecord:
         if not isinstance(command, OperationCommand):
             raise TypeError("submit_operation requires OperationCommand")
-        if self.task_session is not None and command.target.task_session != self.task_session:
-            raise ValueError("operation targets another task session")
-        return self._ensure_journal().begin(command)
+        with self._journal_lock:
+            if self.task_session is None:
+                raise RuntimeError("TaskRunner has not attached to GroupScheduler yet")
+            if command.target.task_session != self.task_session:
+                raise ValueError("operation targets another task session")
+            return self._ensure_journal().begin(command)
 
     def query_operation(self, operation_id: str) -> OperationRecord:
         if not isinstance(operation_id, str) or not operation_id:
             raise ValueError("operation_id must be a nonempty string")
-        record = self._ensure_journal().query(operation_id)
-        if record is not None:
-            return record
+        with self._journal_lock:
+            record = self._ensure_journal().query(operation_id)
+            if record is not None:
+                return record
         return OperationRecord(operation_id=operation_id, status=OperationStatus.UNKNOWN, result="operation not found in TaskRunner journal")
 
     def run(self, config):
