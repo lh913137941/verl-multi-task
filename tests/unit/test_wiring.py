@@ -144,10 +144,12 @@ def test_taskrunner_executes_add_and_commits_terminal_record():
     assert record.result == EvidenceType.SERVICE_COMMITTED.value
 
 
-def test_manager_owns_state_and_kind_maps_without_replica_record():
+def test_manager_owns_state_kind_and_runtime_inventory_separately():
     class Parent:
         def __init__(self, *args):
-            pass
+            self.rollout_replicas = []
+            self.server_addresses = []
+            self.server_handles = []
 
     allowed = {
         ReplicaState.CREATING: {
@@ -182,15 +184,18 @@ def test_manager_owns_state_and_kind_maps_without_replica_record():
     )
     manager = cls(object())
     key = ReplicaKey("task-a", "r0")
-    manager.register_replica(key, ReplicaKind.BORROWED)
-    manager.transition_replica(key, ReplicaState.ACTIVE)
+    runtime = type("Runtime", (), {"_server_address": "s0", "_server_handle": "h0"})()
+    manager.register_replica(key, ReplicaKind.NATIVE, state=ReplicaState.ACTIVE, runtime=runtime)
+    manager.rollout_replicas.append(runtime)
+    manager.server_addresses.append("s0")
+    manager.server_handles.append("h0")
+
     manager.transition_replica(key, ReplicaState.DRAINING)
-    manager.transition_replica(key, ReplicaState.RELEASED)
-    assert manager.replica_meta(key) == (
-        ReplicaKind.BORROWED,
-        ReplicaState.RELEASED,
-    )
-    assert not hasattr(manager, "_lifecycle")
+    assert manager.deactivate_service(key) is runtime
+    assert manager.inspect_runtime(key) is runtime
+    assert manager.rollout_replicas == []
+    assert manager.server_addresses == []
+    assert manager.server_handles == []
 
 
 def rollouter_class():
@@ -231,7 +236,7 @@ def test_rollouter_idle_detection_does_not_read_lb():
     assert rollouter.collect_idle_candidates() == ()
 
 
-def test_rollouter_natural_exit_closes_admission_then_returns_exit_ready():
+def test_rollouter_natural_exit_separates_drain_from_service_commit():
     cls = rollouter_class()
     rollouter = cls(object(), object())
     key = ReplicaKey("task-a", "r0")
@@ -240,6 +245,8 @@ def test_rollouter_natural_exit_closes_admission_then_returns_exit_ready():
     class LB:
         begin_drain = RemoteMethod(lambda target: calls.append(("begin", target)) or "s0")
         has_unsettled_requests = RemoteMethod(lambda server_id: False)
+        server_for_replica = RemoteMethod(lambda target: "s0")
+        finish_remove = RemoteMethod(lambda target: calls.append(("finish", target)))
 
     class Manager:
         global_load_balancer = LB()
@@ -255,22 +262,31 @@ def test_rollouter_natural_exit_closes_admission_then_returns_exit_ready():
             self.replica_state[target] = state
             calls.append(("state", state))
 
+        def deactivate_service(self, target):
+            calls.append(("deactivate", target))
+
     manager = Manager()
     rollouter.llm_server_manager = manager
-    evidence = rollouter.prepare_exit(key, operation_id="op")
+    rollouter._update_max_concurrent_samples = lambda: calls.append(("capacity",))
 
-    assert evidence.type is EvidenceType.EXIT_READY
-    assert evidence.operation_id == "op"
-    assert manager.replica_state[key] is ReplicaState.DRAINING
+    exit_evidence = rollouter.prepare_exit(key, operation_id="op")
+    assert exit_evidence.type is EvidenceType.EXIT_READY
     assert calls == [
         ("state", ReplicaState.DRAINING),
         ("begin", key),
     ]
+    assert rollouter.get_pending_target("op") == key
 
-    calls.clear()
-    retry = rollouter.prepare_exit(key, operation_id="op-retry")
-    assert retry.type is EvidenceType.EXIT_READY
-    assert calls == [("begin", key)]
+    service_evidence = rollouter.commit_service_change(
+        OperationRecord("op", OperationStatus.RUNNING)
+    )
+    assert service_evidence.type is EvidenceType.SERVICE_COMMITTED
+    assert manager.replica_state[key] is ReplicaState.DRAINING
+    assert calls[-3:] == [
+        ("finish", key),
+        ("deactivate", key),
+        ("capacity",),
+    ]
 
 
 def test_rollouter_force_fails_before_mutating_m_without_verified_backend():
