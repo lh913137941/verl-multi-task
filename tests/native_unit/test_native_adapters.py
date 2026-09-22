@@ -1,5 +1,3 @@
-import inspect
-
 import pytest
 
 from verl.experimental.fully_async_policy.fully_async_main import FullyAsyncTaskRunner
@@ -23,7 +21,7 @@ from multi_task_scheduler.integration.verl.experimental_fully_async.trainer impo
     MultiTaskFullyAsyncTrainer,
 )
 from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
-from multi_task_scheduler.orchestration.contracts import AttemptState
+from multi_task_scheduler.orchestration.contracts import AttemptState, ReplicaKey
 from multi_task_scheduler.rollout.load_balancer import MultiTaskGlobalRequestLoadBalancer
 
 pytestmark = pytest.mark.native
@@ -60,6 +58,32 @@ def test_late_release_does_not_erase_verified_continuation_terminal_state():
     server = object()
     lb = MultiTaskGlobalRequestLoadBalancer({"s": server}, full_determinism=True)
     lb.acquire_server("r")
-    assert lb.confirm_continuation("r", "client-1", "prefix-1") is AttemptState.TERMINATED
+    assert (
+        lb.confirm_continuation("r", "client-1", "prefix-1")
+        is AttemptState.TERMINATED
+    )
     lb.release_server("s", request_id="r")
     assert lb.query_attempt("r") is AttemptState.TERMINATED
+
+
+def test_initial_native_route_and_drain_keep_exact_request_facts():
+    server = object()
+    key = ReplicaKey("task-a", "native-0")
+    lb = MultiTaskGlobalRequestLoadBalancer(
+        {"s": server},
+        full_determinism=True,
+        initial_routes={key: "s"},
+    )
+    assert lb.routes[key] == "s"
+    lb.acquire_server("r")
+
+    assert lb.begin_drain(key) == "s"
+    assert "s" not in lb.get_all_servers()
+    assert lb.requests_for_server("s") == ("r",)
+    with pytest.raises(ValueError, match="requests remain unsettled"):
+        lb.finish_remove(key)
+
+    lb.release_server("s", request_id="r")
+    assert lb.query_attempt("r") is AttemptState.SETTLED
+    lb.finish_remove(key)
+    assert key not in lb.routes
