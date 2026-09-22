@@ -8,6 +8,7 @@ import threading
 
 import ray
 from verl.experimental.fully_async_policy.fully_async_main import FullyAsyncTaskRunner
+from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.separation.utils import create_resource_pool_manager
 from verl.trainer.ppo.utils import Role
 
@@ -23,6 +24,7 @@ from multi_task_scheduler.orchestration.contracts import (
 from multi_task_scheduler.orchestration.operation_journal import OperationJournal
 from multi_task_scheduler.scheduler.discovery import get_or_create_group_scheduler
 
+from .message_queue import MultiTaskMessageQueue
 from .rollouter import MultiTaskFullyAsyncRollouter
 from .trainer import MultiTaskFullyAsyncTrainer
 
@@ -258,8 +260,42 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                     )
                 self._attached_to_gs = False
 
+    def _replace_message_queue(self, config) -> None:
+        """Swap the native empty startup queue for the queue-owned idempotent variant."""
+        old_queue = self.components["message_queue"]
+        old_size = ray.get(old_queue.get_queue_size.remote(), timeout=30)
+        if old_size != 0:
+            raise RuntimeError(
+                "cannot replace native MessageQueue after samples have been enqueued"
+            )
+
+        max_queue_size = ray.get(
+            self.components["rollouter"].get_max_queue_size.remote(),
+            timeout=30,
+        )
+        ray.kill(old_queue, no_restart=True)
+
+        queue = MultiTaskMessageQueue.remote(
+            config,
+            max_queue_size,
+            task_session=self.task_session,
+        )
+        client = MessageQueueClient(queue)
+        self.components["message_queue"] = queue
+        self.components["message_queue_client"] = client
+        ray.get(
+            [
+                self.components["rollouter"].set_message_queue_client.remote(client),
+                self.components["trainer"].set_message_queue_client.remote(client),
+            ]
+        )
+
     def _initialize_components(self, config) -> None:
         super()._initialize_components(config)
+        # Parent initialization performs checkpoint restore, initial weight sync and
+        # optional validation before training starts. At this point the training
+        # sample queue must still be empty, so replacing it cannot lose samples.
+        self._replace_message_queue(config)
         ray.get(
             self.group_scheduler.attach_task.remote(
                 self.task_session,
