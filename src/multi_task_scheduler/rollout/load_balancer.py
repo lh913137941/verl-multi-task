@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from verl.workers.rollout.llm_server import DEFAULT_ROUTING_CACHE_SIZE, GlobalRequestLoadBalancer
+from verl.workers.rollout.router import DEFAULT_ROUTING_CACHE_SIZE, GlobalRequestLoadBalancer
 
 from multi_task_scheduler.orchestration.contracts import AttemptState, ReplicaKey
 
@@ -10,9 +10,20 @@ from multi_task_scheduler.orchestration.contracts import AttemptState, ReplicaKe
 class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
     """Reuse native routing/counters and add only exact per-request exit facts."""
 
-    def __init__(self, servers, max_cache_size=DEFAULT_ROUTING_CACHE_SIZE, full_determinism=False, *, group_scheduler=None):
+    def __init__(
+        self,
+        servers,
+        max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
+        full_determinism=False,
+        *,
+        group_scheduler=None,
+    ):
         self.group_scheduler = group_scheduler
-        super().__init__(servers, max_cache_size=max_cache_size, full_determinism=full_determinism)
+        super().__init__(
+            servers,
+            max_cache_size=max_cache_size,
+            full_determinism=full_determinism,
+        )
         self.routes: dict[ReplicaKey, str] = {}
         self.active_request_server: dict[str, str] = {}
         self.attempt_state: dict[str, AttemptState] = {}
@@ -23,7 +34,9 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
     def acquire_server(self, request_id: str, **extra):
         state = self.attempt_state.get(request_id)
         if state in {AttemptState.ADMITTED, AttemptState.TERMINATED}:
-            raise RuntimeError("first release allows at most one unsettled generation per request_id")
+            raise RuntimeError(
+                "first release allows at most one unsettled generation per request_id"
+            )
         server_id, handle = super().acquire_server(request_id, **extra)
         self.active_request_server[request_id] = server_id
         self.attempt_state[request_id] = AttemptState.ADMITTED
@@ -36,33 +49,51 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         owner = self.active_request_server.get(request_id)
         if owner is not None and owner != server_id:
             raise ValueError("request_id release belongs to another server")
-        if request_id in self.attempt_state:
+        state = self.attempt_state.get(request_id)
+        if state is None:
+            return
+        # Natural completion settles the request. A FORCE path may already have
+        # recorded TERMINATED from verified continuation; a late native release
+        # must not erase that stronger terminal fact.
+        if state is AttemptState.ADMITTED:
             self.attempt_state[request_id] = AttemptState.SETTLED
-            self.active_request_server.pop(request_id, None)
+        self.active_request_server.pop(request_id, None)
 
     def query_attempt(self, request_id: str) -> AttemptState | None:
         return self.attempt_state.get(request_id)
 
-    def confirm_continuation(self, request_id: str, client_id: str, prefix_digest: str) -> AttemptState:
+    def confirm_continuation(
+        self,
+        request_id: str,
+        client_id: str,
+        prefix_digest: str,
+    ) -> AttemptState:
         if not request_id or not client_id or not prefix_digest:
             raise ValueError("request_id, client_id and prefix_digest must be nonempty")
         state = self.attempt_state.get(request_id)
         if state is None:
             raise KeyError(f"unknown request_id {request_id!r}")
-        if state is AttemptState.SETTLED:
-            return state
-        if state is AttemptState.TERMINATED:
+        if state in {AttemptState.SETTLED, AttemptState.TERMINATED}:
             return state
         if state is not AttemptState.ADMITTED:
-            raise ValueError(f"request {request_id!r} is not eligible for continuation handoff")
+            raise ValueError(
+                f"request {request_id!r} is not eligible for continuation handoff"
+            )
         self.attempt_state[request_id] = AttemptState.TERMINATED
         return AttemptState.TERMINATED
 
     def requests_for_server(self, server_id: str) -> tuple[str, ...]:
-        return tuple(request_id for request_id, current_server in self.active_request_server.items() if current_server == server_id)
+        return tuple(
+            request_id
+            for request_id, current_server in self.active_request_server.items()
+            if current_server == server_id
+        )
 
     def has_unsettled_requests(self, server_id: str) -> bool:
-        return any(self.attempt_state.get(request_id) is not AttemptState.SETTLED for request_id in self.requests_for_server(server_id))
+        return any(
+            self.attempt_state.get(request_id) is not AttemptState.SETTLED
+            for request_id in self.requests_for_server(server_id)
+        )
 
     def commit_routable(self, key: ReplicaKey, server_id: str, handle) -> None:
         if not isinstance(key, ReplicaKey):
