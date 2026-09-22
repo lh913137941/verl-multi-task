@@ -164,6 +164,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                 exit_evidence = ray.get(
                     rollouter.prepare_exit.remote(
                         command.target,
+                        operation_id=operation_id,
                         force=bool(command.force),
                     )
                 )
