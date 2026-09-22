@@ -127,7 +127,10 @@ class OperationEvidence:
             raise ValueError("timestamp must be a nonnegative integer")
         if len(set(self.released_gpu_uuids)) != len(self.released_gpu_uuids):
             raise ValueError("released_gpu_uuids must not contain duplicates")
-        if any(not isinstance(value, str) or not value for value in self.released_gpu_uuids):
+        if any(
+            not isinstance(value, str) or not value
+            for value in self.released_gpu_uuids
+        ):
             raise ValueError("released_gpu_uuids must contain nonempty strings")
         if self.type is not EvidenceType.RELEASED and self.released_gpu_uuids:
             raise ValueError("released_gpu_uuids are valid only for RELEASED evidence")
@@ -162,16 +165,41 @@ class Lease:
         claims = tuple(dict(claim) for claim in self.claims)
         if not claims:
             raise ValueError("Lease requires at least one claim")
+
         for claim in claims:
             if not claim:
                 raise ValueError("lease claims must be nonempty")
-            gpu_uuid = claim.get("gpu_uuid")
-            if not isinstance(gpu_uuid, str) or not gpu_uuid:
-                raise ValueError("each claim requires a nonempty gpu_uuid")
+            for field_name in ("pg_id", "node_id", "gpu_uuid"):
+                value = claim.get(field_name)
+                if not isinstance(value, str) or not value:
+                    raise ValueError(
+                        f"each claim requires a nonempty {field_name}"
+                    )
+            bundle_index = claim.get("bundle_index")
+            if type(bundle_index) is not int or bundle_index < 0:
+                raise ValueError(
+                    "each claim requires a nonnegative integer bundle_index"
+                )
+            gpu_fraction = claim.get("gpu_fraction", 1.0)
+            if type(gpu_fraction) not in (int, float) or float(gpu_fraction) != 1.0:
+                raise ValueError("first release requires whole-GPU claims")
+            cpu_request = claim.get("cpu_request", 0.0)
+            if type(cpu_request) not in (int, float) or float(cpu_request) < 0:
+                raise ValueError("cpu_request must be nonnegative")
+
         uuids = [claim["gpu_uuid"] for claim in claims]
         if len(set(uuids)) != len(uuids):
             raise ValueError("lease claims must not repeat gpu_uuid")
-        if not isinstance(self.expires_at, (int, float)) or not math.isfinite(float(self.expires_at)):
+        bundle_keys = [
+            (claim["pg_id"], claim["bundle_index"])
+            for claim in claims
+        ]
+        if len(set(bundle_keys)) != len(bundle_keys):
+            raise ValueError("lease claims must not repeat a PG bundle")
+
+        if type(self.expires_at) not in (int, float) or not math.isfinite(
+            float(self.expires_at)
+        ):
             raise ValueError("expires_at must be finite")
         if self.expires_at < 0:
             raise ValueError("expires_at must be >= 0 (0 means no fixed expiry)")
