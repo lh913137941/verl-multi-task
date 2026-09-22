@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import time
+import asyncio
 
 import ray
 from verl.experimental.fully_async_policy.fully_async_rollouter import (
@@ -126,7 +126,7 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             "prepare_replica requires verified borrowed-runtime backend"
         )
 
-    def prepare_exit(
+    async def prepare_exit(
         self,
         replica_key: ReplicaKey,
         *,
@@ -170,10 +170,10 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             )
 
         lb = manager.global_load_balancer
-        server_id = ray.get(lb.begin_drain.remote(replica_key), timeout=30)
+        server_id = await lb.begin_drain.remote(replica_key)
 
-        while ray.get(lb.has_unsettled_requests.remote(server_id), timeout=30):
-            time.sleep(0.1)
+        while await lb.has_unsettled_requests.remote(server_id):
+            await asyncio.sleep(0.1)
 
         return OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
 
@@ -185,7 +185,7 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         except KeyError as exc:
             raise KeyError(f"no pending lifecycle target for {operation_id!r}") from exc
 
-    def commit_service_change(self, operation: OperationRecord) -> OperationEvidence:
+    async def commit_service_change(self, operation: OperationRecord) -> OperationEvidence:
         """Commit the R/C part of a drained exit while Manager keeps M=DRAINING."""
         if not isinstance(operation, OperationRecord):
             raise TypeError("commit_service_change requires OperationRecord")
@@ -199,12 +199,10 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
 
         lb = manager.global_load_balancer
         try:
-            server_id = ray.get(lb.server_for_replica.remote(target), timeout=30)
-            if server_id is not None and ray.get(
-                lb.has_unsettled_requests.remote(server_id), timeout=30
-            ):
+            server_id = await lb.server_for_replica.remote(target)
+            if server_id is not None and await lb.has_unsettled_requests.remote(server_id):
                 raise ValueError("cannot commit service exit while requests remain unsettled")
-            ray.get(lb.finish_remove.remote(target), timeout=30)
+            await lb.finish_remove.remote(target)
             manager.deactivate_service(target)
             self._update_max_concurrent_samples()
         except BaseException:
