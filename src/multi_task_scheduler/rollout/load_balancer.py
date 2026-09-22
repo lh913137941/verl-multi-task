@@ -19,6 +19,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         full_determinism=False,
         *,
         group_scheduler=None,
+        initial_routes=None,
     ):
         self.group_scheduler = group_scheduler
         super().__init__(
@@ -29,6 +30,13 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         self.routes: dict[ReplicaKey, str] = {}
         self.active_request_server: dict[str, str] = {}
         self.attempt_state: dict[str, AttemptState] = {}
+
+        for key, server_id in dict(initial_routes or {}).items():
+            if not isinstance(key, ReplicaKey):
+                raise TypeError("initial route key must be ReplicaKey")
+            if server_id not in self._servers:
+                raise ValueError("initial route references an unknown server")
+            self.routes[key] = server_id
 
     def require_release_fields(self) -> list[str]:
         return ["request_id"]
@@ -107,13 +115,25 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             self.add_servers({server_id: handle})
         self.routes[key] = server_id
 
+    def begin_drain(self, key: ReplicaKey) -> str:
+        """Close new admission for one replica while retaining request facts."""
+        if not isinstance(key, ReplicaKey):
+            raise TypeError("key must be ReplicaKey")
+        server_id = self.routes.get(key)
+        if server_id is None:
+            raise KeyError(key)
+        if server_id in self._servers:
+            self.remove_servers([server_id])
+        return server_id
+
     def finish_remove(self, key: ReplicaKey) -> None:
         server_id = self.routes.get(key)
         if server_id is None:
             return
         if self.has_unsettled_requests(server_id):
             raise ValueError("cannot remove route while requests remain unsettled")
-        self.remove_servers([server_id])
+        if server_id in self._servers:
+            self.remove_servers([server_id])
         self.routes.pop(key, None)
 
     def gc_settled_requests(self, request_ids) -> None:
