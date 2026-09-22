@@ -62,9 +62,6 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         state = self.attempt_state.get(request_id)
         if state is None:
             return
-        # Natural completion settles the request. A FORCE path may already have
-        # recorded TERMINATED from verified continuation; a late native release
-        # must not erase that stronger terminal fact.
         if state is AttemptState.ADMITTED:
             self.attempt_state[request_id] = AttemptState.SETTLED
         self.active_request_server.pop(request_id, None)
@@ -104,6 +101,11 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             self.attempt_state.get(request_id) not in _TERMINAL_ATTEMPT_STATES
             for request_id in self.requests_for_server(server_id)
         )
+
+    def server_for_replica(self, key: ReplicaKey) -> str | None:
+        if not isinstance(key, ReplicaKey):
+            raise TypeError("key must be ReplicaKey")
+        return self.routes.get(key)
 
     def commit_routable(self, key: ReplicaKey, server_id: str, handle) -> None:
         if not isinstance(key, ReplicaKey):
