@@ -20,7 +20,6 @@ from multi_task_scheduler.orchestration.contracts import (
 
 RUNTIME_KIND = "verl-multi-task:experimental_fully_async_standalone:092203"
 _RELEASE_KINDS = {OperationKind.DONATE, OperationKind.REMOVE}
-_EXPIRY_BLOCKED_KINDS = {OperationKind.ADD, OperationKind.RESTORE}
 
 
 @ray.remote(num_cpus=0)
@@ -97,16 +96,16 @@ class GroupScheduler:
         lease = self.leases.get(command.lease_id)
         if lease is None:
             raise ValueError(f"unknown lease {command.lease_id!r}")
-        expired = bool(lease.expires_at and time.time() >= lease.expires_at)
-        if expired and command.kind in _EXPIRY_BLOCKED_KINDS:
-            raise ValueError(
-                f"expired lease {command.lease_id!r} cannot start {command.kind.value}"
-            )
 
         previous = self.operation_commands.get(command.operation_id)
         if previous is not None and previous != command:
             raise ValueError("conflicting operation replay at GroupScheduler")
         if previous is None:
+            expired = bool(lease.expires_at and time.time() >= lease.expires_at)
+            if expired and command.kind is OperationKind.ADD:
+                raise ValueError(
+                    f"expired lease {command.lease_id!r} cannot start ADD"
+                )
             self.operation_commands[command.operation_id] = command
 
         task_runner = self.task_runners.get(command.target.task_session)
