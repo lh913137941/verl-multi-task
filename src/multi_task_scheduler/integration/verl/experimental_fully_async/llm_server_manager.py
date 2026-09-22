@@ -22,14 +22,24 @@ _ALLOWED = {
 class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
     """Ordinary Rollouter-owned object; only this object writes M."""
 
-    def __init__(self, config, worker_group=None, rollout_resource_pool=None, *, group_scheduler=None):
+    def __init__(self, config, worker_group=None, rollout_resource_pool=None, *, group_scheduler=None, task_session=None):
         self.group_scheduler = group_scheduler
+        self.task_session = task_session
         self.rollout_replica_class = MultiTaskvLLMReplica
         super().__init__(config, worker_group, rollout_resource_pool)
         self._load_balancer_cls = MultiTaskGlobalRequestLoadBalancer
         self.replica_state: dict[ReplicaKey, ReplicaState] = {}
         self.replica_kind: dict[ReplicaKey, ReplicaKind] = {}
         self._runtime_inventory: dict[ReplicaKey, object] = {}
+
+    async def _initialize_llm_servers(self, start_rank: int = 0):
+        await super()._initialize_llm_servers(start_rank=start_rank)
+        if not self.task_session:
+            raise RuntimeError("Manager requires task_session before replica initialization")
+        for index, replica in enumerate(self.rollout_replicas):
+            rank = getattr(replica, "replica_rank", index)
+            key = ReplicaKey(self.task_session, f"native-{rank}", 0)
+            self.register_replica(key, ReplicaKind.NATIVE, state=ReplicaState.ACTIVE, runtime=replica)
 
     async def _init_global_load_balancer(self) -> None:
         self.global_load_balancer = ray.remote(self._load_balancer_cls).remote(
@@ -47,6 +57,8 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         if key in self.replica_state:
             if self.replica_kind[key] is not kind or self.replica_state[key] is not state:
                 raise ValueError("conflicting lifecycle registration")
+            if runtime is not None:
+                self._runtime_inventory.setdefault(key, runtime)
             return
         self._validate_kind_state(kind, state)
         self.replica_kind[key] = kind
