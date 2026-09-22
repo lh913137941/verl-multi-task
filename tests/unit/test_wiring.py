@@ -1,6 +1,6 @@
 import ast
+import asyncio
 import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -53,6 +53,14 @@ class RemoteMethod:
         self.fn = fn
 
     def remote(self, *args, **kwargs):
+        return self.fn(*args, **kwargs)
+
+
+class AsyncRemoteMethod:
+    def __init__(self, fn):
+        self.fn = fn
+
+    async def remote(self, *args, **kwargs):
         return self.fn(*args, **kwargs)
 
 
@@ -214,8 +222,8 @@ def rollouter_class():
         OperationRecord=OperationRecord,
         OperationEvidence=OperationEvidence,
         EvidenceType=EvidenceType,
+        asyncio=asyncio,
         ray=FakeRay,
-        time=time,
     )
 
 
@@ -243,10 +251,10 @@ def test_rollouter_natural_exit_separates_drain_from_service_commit():
     calls = []
 
     class LB:
-        begin_drain = RemoteMethod(lambda target: calls.append(("begin", target)) or "s0")
-        has_unsettled_requests = RemoteMethod(lambda server_id: False)
-        server_for_replica = RemoteMethod(lambda target: "s0")
-        finish_remove = RemoteMethod(lambda target: calls.append(("finish", target)))
+        begin_drain = AsyncRemoteMethod(lambda target: calls.append(("begin", target)) or "s0")
+        has_unsettled_requests = AsyncRemoteMethod(lambda server_id: False)
+        server_for_replica = AsyncRemoteMethod(lambda target: "s0")
+        finish_remove = AsyncRemoteMethod(lambda target: calls.append(("finish", target)))
 
     class Manager:
         global_load_balancer = LB()
@@ -269,7 +277,7 @@ def test_rollouter_natural_exit_separates_drain_from_service_commit():
     rollouter.llm_server_manager = manager
     rollouter._update_max_concurrent_samples = lambda: calls.append(("capacity",))
 
-    exit_evidence = rollouter.prepare_exit(key, operation_id="op")
+    exit_evidence = asyncio.run(rollouter.prepare_exit(key, operation_id="op"))
     assert exit_evidence.type is EvidenceType.EXIT_READY
     assert calls == [
         ("state", ReplicaState.DRAINING),
@@ -277,8 +285,8 @@ def test_rollouter_natural_exit_separates_drain_from_service_commit():
     ]
     assert rollouter.get_pending_target("op") == key
 
-    service_evidence = rollouter.commit_service_change(
-        OperationRecord("op", OperationStatus.RUNNING)
+    service_evidence = asyncio.run(
+        rollouter.commit_service_change(OperationRecord("op", OperationStatus.RUNNING))
     )
     assert service_evidence.type is EvidenceType.SERVICE_COMMITTED
     assert manager.replica_state[key] is ReplicaState.DRAINING
@@ -308,5 +316,5 @@ def test_rollouter_force_fails_before_mutating_m_without_verified_backend():
     manager = Manager()
     rollouter.llm_server_manager = manager
     with pytest.raises(NotImplementedError, match="targeted abort"):
-        rollouter.prepare_exit(key, operation_id="op", force=True)
+        asyncio.run(rollouter.prepare_exit(key, operation_id="op", force=True))
     assert manager.replica_state[key] is ReplicaState.ACTIVE
