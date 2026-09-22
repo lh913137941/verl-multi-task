@@ -12,8 +12,9 @@ from .llm_server_manager import MultiTaskLLMServerManager
 
 @ray.remote(num_cpus=10, max_concurrency=100)
 class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter)):
-    def __init__(self, config, tokenizer, processor=None, device_name=None, *, group_scheduler=None):
+    def __init__(self, config, tokenizer, processor=None, device_name=None, *, group_scheduler=None, task_session=None):
         self.group_scheduler = group_scheduler
+        self.task_session = task_session
         super().__init__(config, tokenizer, processor=processor, device_name=device_name)
 
     async def _init_async_rollout_manager(self):
@@ -21,7 +22,12 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
         assert self.config.actor_rollout_ref.rollout.mode == "async"
         self.async_rollout_mode = True
-        self.llm_server_manager = await MultiTaskLLMServerManager.create(config=self.config, worker_group=self.get_hybrid_worker_group(), group_scheduler=self.group_scheduler)
+        self.llm_server_manager = await MultiTaskLLMServerManager.create(
+            config=self.config,
+            worker_group=self.get_hybrid_worker_group(),
+            group_scheduler=self.group_scheduler,
+            task_session=self.task_session,
+        )
         self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
             config=self.config,
             llm_client=self.llm_server_manager.get_client(client_cls=FullyAsyncLLMServerClient),
