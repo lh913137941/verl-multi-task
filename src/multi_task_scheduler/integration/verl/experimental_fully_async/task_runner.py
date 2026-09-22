@@ -5,14 +5,24 @@
 
 import logging
 import threading
+
 import ray
 from verl.experimental.fully_async_policy.fully_async_main import FullyAsyncTaskRunner
 from verl.experimental.separation.utils import create_resource_pool_manager
 from verl.trainer.ppo.utils import Role
+
 from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
-from multi_task_scheduler.orchestration.contracts import OperationCommand, OperationRecord, OperationStatus
+from multi_task_scheduler.orchestration.contracts import (
+    EvidenceType,
+    OperationCommand,
+    OperationEvidence,
+    OperationKind,
+    OperationRecord,
+    OperationStatus,
+)
 from multi_task_scheduler.orchestration.operation_journal import OperationJournal
 from multi_task_scheduler.scheduler.discovery import get_or_create_group_scheduler
+
 from .rollouter import MultiTaskFullyAsyncRollouter
 from .trainer import MultiTaskFullyAsyncTrainer
 
@@ -27,22 +37,95 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         super().__init__()
         self.group_scheduler = None
         self.task_session = None
+        self._actor_handle = None
+        self._control_ready = False
+        self._attached_to_gs = False
         self._journal_lock = threading.RLock()
+        self._operation_threads: dict[str, threading.Thread] = {}
 
     def _ensure_journal(self) -> OperationJournal:
         if not hasattr(self, "_operation_journal"):
             self._operation_journal = OperationJournal()
         return self._operation_journal
 
+    @staticmethod
+    def _snapshot_record(record: OperationRecord) -> OperationRecord:
+        return OperationRecord(
+            operation_id=record.operation_id,
+            status=record.status,
+            result=record.result,
+        )
+
+    @staticmethod
+    def _require_evidence(
+        value,
+        *,
+        operation_id: str,
+        expected: EvidenceType,
+    ) -> OperationEvidence:
+        if not isinstance(value, OperationEvidence):
+            raise TypeError(f"expected OperationEvidence({expected.value})")
+        if value.operation_id != operation_id:
+            raise ValueError("operation evidence belongs to another operation")
+        if value.type is not expected:
+            raise ValueError(
+                f"expected {expected.value} evidence, got {value.type.value}"
+            )
+        return value
+
+    @staticmethod
+    def _failure_status(exc: BaseException) -> OperationStatus:
+        unknown_types = tuple(
+            error_type
+            for error_type in (
+                getattr(ray.exceptions, "GetTimeoutError", None),
+                getattr(ray.exceptions, "RayActorError", None),
+            )
+            if isinstance(error_type, type)
+        )
+        if unknown_types and isinstance(exc, unknown_types):
+            return OperationStatus.UNKNOWN
+        return OperationStatus.FAILED
+
+    def _launch_operation(self, operation_id: str) -> None:
+        worker = threading.Thread(
+            target=self._execute_operation,
+            args=(operation_id,),
+            name=f"multitask-operation-{operation_id}",
+            daemon=True,
+        )
+        self._operation_threads[operation_id] = worker
+        worker.start()
+
     def submit_operation(self, command: OperationCommand) -> OperationRecord:
         if not isinstance(command, OperationCommand):
             raise TypeError("submit_operation requires OperationCommand")
+
+        launch = False
         with self._journal_lock:
-            if self.task_session is None:
-                raise RuntimeError("TaskRunner has not attached to GroupScheduler yet")
+            if not self._control_ready or self.task_session is None:
+                raise RuntimeError("TaskRunner control plane is not ready")
             if command.target.task_session != self.task_session:
                 raise ValueError("operation targets another task session")
-            return self._ensure_journal().begin(command)
+
+            journal = self._ensure_journal()
+            existing = journal.query(command.operation_id)
+            record = journal.begin(command)
+            snapshot = self._snapshot_record(record)
+            launch = existing is None
+
+        if launch:
+            try:
+                self._launch_operation(command.operation_id)
+            except BaseException as exc:
+                with self._journal_lock:
+                    self._ensure_journal().finish(
+                        command.operation_id,
+                        OperationStatus.FAILED,
+                        f"failed to launch lifecycle worker: {type(exc).__name__}: {exc}",
+                    )
+                raise
+        return snapshot
 
     def query_operation(self, operation_id: str) -> OperationRecord:
         if not isinstance(operation_id, str) or not operation_id:
@@ -50,21 +133,144 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         with self._journal_lock:
             record = self._ensure_journal().query(operation_id)
             if record is not None:
-                return record
-        return OperationRecord(operation_id=operation_id, status=OperationStatus.UNKNOWN, result="operation not found in TaskRunner journal")
+                return self._snapshot_record(record)
+        return OperationRecord(
+            operation_id=operation_id,
+            status=OperationStatus.UNKNOWN,
+            result="operation not found in TaskRunner journal",
+        )
+
+    def _execute_operation(self, operation_id: str) -> None:
+        with self._journal_lock:
+            journal = self._ensure_journal()
+            command = journal.command(operation_id)
+            record = journal.mark_running(operation_id)
+            operation = self._snapshot_record(record)
+
+        try:
+            trainer = self.components["trainer"]
+            rollouter = self.components["rollouter"]
+
+            if command.kind is OperationKind.ADD:
+                ray.get(rollouter.prepare_replica.remote(command.target))
+                evidence = ray.get(trainer.bootstrap_and_publish.remote(operation))
+                final_evidence = self._require_evidence(
+                    evidence,
+                    operation_id=operation_id,
+                    expected=EvidenceType.SERVICE_COMMITTED,
+                )
+
+            elif command.kind in {OperationKind.DONATE, OperationKind.REMOVE}:
+                exit_evidence = ray.get(
+                    rollouter.prepare_exit.remote(
+                        command.target,
+                        force=bool(command.force),
+                    )
+                )
+                self._require_evidence(
+                    exit_evidence,
+                    operation_id=operation_id,
+                    expected=EvidenceType.EXIT_READY,
+                )
+
+                service_evidence = ray.get(trainer.remove_and_commit.remote(operation))
+                self._require_evidence(
+                    service_evidence,
+                    operation_id=operation_id,
+                    expected=EvidenceType.SERVICE_COMMITTED,
+                )
+
+                release_evidence = ray.get(rollouter.finalize_release.remote(operation))
+                final_evidence = self._require_evidence(
+                    release_evidence,
+                    operation_id=operation_id,
+                    expected=EvidenceType.RELEASED,
+                )
+                ray.get(
+                    self.group_scheduler.advance_lease.remote(
+                        command.lease_id,
+                        final_evidence,
+                    ),
+                    timeout=30,
+                )
+
+            elif command.kind is OperationKind.RESTORE:
+                evidence = ray.get(trainer.restore_and_publish.remote(operation))
+                final_evidence = self._require_evidence(
+                    evidence,
+                    operation_id=operation_id,
+                    expected=EvidenceType.SERVICE_COMMITTED,
+                )
+
+            else:  # pragma: no cover - OperationKind construction already fences this.
+                raise ValueError(f"unsupported operation kind: {command.kind!r}")
+
+            with self._journal_lock:
+                self._ensure_journal().finish(
+                    operation_id,
+                    OperationStatus.SUCCEEDED,
+                    final_evidence.type.value,
+                )
+
+        except BaseException as exc:
+            status = self._failure_status(exc)
+            with self._journal_lock:
+                current = self._ensure_journal().query(operation_id)
+                if current is not None and current.status not in {
+                    OperationStatus.SUCCEEDED,
+                    OperationStatus.FAILED,
+                    OperationStatus.UNKNOWN,
+                }:
+                    self._ensure_journal().finish(
+                        operation_id,
+                        status,
+                        f"{type(exc).__name__}: {exc}",
+                    )
+            logger.exception(
+                "Lifecycle operation %s failed with %s",
+                operation_id,
+                status.value,
+            )
+        finally:
+            self._operation_threads.pop(operation_id, None)
 
     def run(self, config):
         self.group_scheduler = get_or_create_group_scheduler()
         context = ray.get_runtime_context()
         self.task_session = str(context.get_actor_id())
+        self._actor_handle = context.current_actor
         try:
-            ray.get(self.group_scheduler.attach_task.remote(self.task_session, context.current_actor), timeout=30)
             return super().run(config)
         finally:
-            try:
-                ray.get(self.group_scheduler.detach_task.remote(self.task_session), timeout=30)
-            except Exception:
-                logger.warning("Could not detach TaskRunner %s from GroupScheduler", self.task_session, exc_info=True)
+            self._control_ready = False
+            if self._attached_to_gs:
+                try:
+                    ray.get(
+                        self.group_scheduler.detach_task.remote(self.task_session),
+                        timeout=30,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not detach TaskRunner %s from GroupScheduler",
+                        self.task_session,
+                        exc_info=True,
+                    )
+                self._attached_to_gs = False
+
+    def _initialize_components(self, config) -> None:
+        # The task becomes schedulable only after native initialization, initial
+        # checkpoint load/sync and validation have completed. This prevents GS
+        # from issuing lifecycle commands against half-built owner objects.
+        super()._initialize_components(config)
+        ray.get(
+            self.group_scheduler.attach_task.remote(
+                self.task_session,
+                self._actor_handle,
+            ),
+            timeout=30,
+        )
+        self._attached_to_gs = True
+        self._control_ready = True
 
     def _create_rollouter(self, config) -> None:
         print("[ASYNC MAIN] Starting create rollouter...")
@@ -77,7 +283,11 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             task_session=self.task_session,
         )
         if "hybrid_worker_group" in self.components:
-            ray.get(rollouter.set_hybrid_worker_group.remote(self.components["hybrid_worker_group"]))
+            ray.get(
+                rollouter.set_hybrid_worker_group.remote(
+                    self.components["hybrid_worker_group"]
+                )
+            )
             print("[ASYNC MAIN] Hybrid worker group injected into rollouter")
         ray.get(rollouter.init_workers.remote())
         ray.get(rollouter.set_max_required_samples.remote())
@@ -86,12 +296,19 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
 
     def _create_trainer(self, config) -> None:
         print("[ASYNC MAIN] Starting create trainer...")
-        trainer_role_mapping = {role: worker_cls for role, worker_cls in self.components["role_worker_mapping"].items() if role != Role.Rollout}
+        trainer_role_mapping = {
+            role: worker_cls
+            for role, worker_cls in self.components["role_worker_mapping"].items()
+            if role != Role.Rollout
+        }
         trainer = MultiTaskFullyAsyncTrainer.remote(
             config=config,
             tokenizer=self.components["tokenizer"],
             role_worker_mapping=trainer_role_mapping,
-            resource_pool_manager=create_resource_pool_manager(config, roles=list(trainer_role_mapping.keys())),
+            resource_pool_manager=create_resource_pool_manager(
+                config,
+                roles=list(trainer_role_mapping.keys()),
+            ),
             ray_worker_group_cls=self.components["ray_worker_group_cls"],
             device_name=config.trainer.device,
         )
