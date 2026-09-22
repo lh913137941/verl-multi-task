@@ -3,7 +3,7 @@
 import ray
 
 from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncLLMServerManager
-from verl.workers.rollout.llm_server import DEFAULT_ROUTING_CACHE_SIZE
+from verl.workers.rollout.router import DEFAULT_ROUTING_CACHE_SIZE
 
 from multi_task_scheduler.orchestration.contracts import ReplicaKey, ReplicaKind, ReplicaState
 from multi_task_scheduler.rollout.load_balancer import MultiTaskGlobalRequestLoadBalancer
@@ -12,7 +12,12 @@ from multi_task_scheduler.rollout.replica import MultiTaskvLLMReplica
 _ALLOWED = {
     ReplicaState.CREATING: {ReplicaState.ACTIVE, ReplicaState.RELEASED, ReplicaState.QUARANTINED},
     ReplicaState.ACTIVE: {ReplicaState.DRAINING},
-    ReplicaState.DRAINING: {ReplicaState.ACTIVE, ReplicaState.DORMANT, ReplicaState.RELEASED, ReplicaState.QUARANTINED},
+    ReplicaState.DRAINING: {
+        ReplicaState.ACTIVE,
+        ReplicaState.DORMANT,
+        ReplicaState.RELEASED,
+        ReplicaState.QUARANTINED,
+    },
     ReplicaState.DORMANT: {ReplicaState.ACTIVE, ReplicaState.QUARANTINED},
     ReplicaState.RELEASED: set(),
     ReplicaState.QUARANTINED: set(),
@@ -22,7 +27,15 @@ _ALLOWED = {
 class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
     """Ordinary Rollouter-owned object; only this object writes M."""
 
-    def __init__(self, config, worker_group=None, rollout_resource_pool=None, *, group_scheduler=None, task_session=None):
+    def __init__(
+        self,
+        config,
+        worker_group=None,
+        rollout_resource_pool=None,
+        *,
+        group_scheduler=None,
+        task_session=None,
+    ):
         self.group_scheduler = group_scheduler
         self.task_session = task_session
         self.rollout_replica_class = MultiTaskvLLMReplica
@@ -39,7 +52,12 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         for index, replica in enumerate(self.rollout_replicas):
             rank = getattr(replica, "replica_rank", index)
             key = ReplicaKey(self.task_session, f"native-{rank}", 0)
-            self.register_replica(key, ReplicaKind.NATIVE, state=ReplicaState.ACTIVE, runtime=replica)
+            self.register_replica(
+                key,
+                ReplicaKind.NATIVE,
+                state=ReplicaState.ACTIVE,
+                runtime=replica,
+            )
 
     async def _init_global_load_balancer(self) -> None:
         self.global_load_balancer = ray.remote(self._load_balancer_cls).remote(
@@ -49,7 +67,14 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             group_scheduler=self.group_scheduler,
         )
 
-    def register_replica(self, key: ReplicaKey, kind: ReplicaKind, *, state: ReplicaState = ReplicaState.CREATING, runtime=None) -> None:
+    def register_replica(
+        self,
+        key: ReplicaKey,
+        kind: ReplicaKind,
+        *,
+        state: ReplicaState = ReplicaState.CREATING,
+        runtime=None,
+    ) -> None:
         if not isinstance(key, ReplicaKey):
             raise TypeError("key must be ReplicaKey")
         kind = ReplicaKind(kind)
