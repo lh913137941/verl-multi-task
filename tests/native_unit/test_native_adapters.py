@@ -1,4 +1,8 @@
+import asyncio
+from types import SimpleNamespace
+
 import pytest
+import ray
 
 from verl.experimental.fully_async_policy.fully_async_main import FullyAsyncTaskRunner
 from verl.experimental.fully_async_policy.fully_async_rollouter import (
@@ -11,6 +15,9 @@ from verl.workers.rollout.router import GlobalRequestLoadBalancer
 from multi_task_scheduler.integration.verl.experimental_fully_async.llm_server_manager import (
     MultiTaskLLMServerManager,
 )
+from multi_task_scheduler.integration.verl.experimental_fully_async.message_queue import (
+    MultiTaskMessageQueue,
+)
 from multi_task_scheduler.integration.verl.experimental_fully_async.rollouter import (
     MultiTaskFullyAsyncRollouter,
 )
@@ -22,6 +29,7 @@ from multi_task_scheduler.integration.verl.experimental_fully_async.trainer impo
 )
 from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
 from multi_task_scheduler.orchestration.contracts import AttemptState, ReplicaKey
+from multi_task_scheduler.orchestration.exactly_once import DuplicateCompletionError
 from multi_task_scheduler.rollout.load_balancer import MultiTaskGlobalRequestLoadBalancer
 
 pytestmark = pytest.mark.native
@@ -87,3 +95,20 @@ def test_initial_native_route_and_drain_keep_exact_request_facts():
     assert lb.query_attempt("r") is AttemptState.SETTLED
     lb.finish_remove(key)
     assert key not in lb.routes
+
+
+def test_message_queue_deduplicates_completed_native_samples():
+    queue_cls = unwrap_native_actor_class(MultiTaskMessageQueue)
+    queue = queue_cls({}, max_queue_size=8, task_session="task-a")
+    first_payload = ray.cloudpickle.dumps(SimpleNamespace(sample_id="s1", value=1))
+    replay_payload = bytes(first_payload)
+
+    first = asyncio.run(queue.put_sample_once(first_payload))
+    replay = asyncio.run(queue.put_sample_once(replay_payload))
+    assert replay is first
+    assert asyncio.run(queue.get_queue_size()) == 1
+
+    conflicting = ray.cloudpickle.dumps(SimpleNamespace(sample_id="s1", value=2))
+    with pytest.raises(DuplicateCompletionError):
+        asyncio.run(queue.put_sample_once(conflicting))
+    assert asyncio.run(queue.get_queue_size()) == 1
