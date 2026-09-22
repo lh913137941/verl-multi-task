@@ -60,11 +60,17 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             )
 
     async def _init_global_load_balancer(self) -> None:
+        initial_routes = {
+            key: runtime._server_address
+            for key, runtime in self._runtime_inventory.items()
+            if getattr(runtime, "_server_address", None)
+        }
         self.global_load_balancer = ray.remote(self._load_balancer_cls).remote(
             servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
             max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
             full_determinism=getattr(self.rollout_config, "full_determinism", False),
             group_scheduler=self.group_scheduler,
+            initial_routes=initial_routes,
         )
 
     def register_replica(
