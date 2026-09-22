@@ -38,6 +38,7 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
     ):
         self.group_scheduler = group_scheduler
         self.task_session = task_session
+        self._pending_operation_targets: dict[str, ReplicaKey] = {}
         super().__init__(
             config,
             tokenizer,
@@ -152,11 +153,14 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                 raise ValueError(
                     f"FORCE prepare_exit requires ACTIVE replica, got {state.value}"
                 )
-            # Do not close admission or mutate M before the validated continuation
-            # backend exists. A placeholder must never strand a live replica.
             raise NotImplementedError(
                 "FORCE prepare_exit requires verified targeted abort/continuation backend"
             )
+
+        previous_target = self._pending_operation_targets.get(operation_id)
+        if previous_target is not None and previous_target != replica_key:
+            raise ValueError("operation_id is already bound to another replica")
+        self._pending_operation_targets[operation_id] = replica_key
 
         if state is ReplicaState.ACTIVE:
             manager.transition_replica(replica_key, ReplicaState.DRAINING)
@@ -168,19 +172,49 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         lb = manager.global_load_balancer
         server_id = ray.get(lb.begin_drain.remote(replica_key), timeout=30)
 
-        # Natural draining has no success-by-timeout rule. Keep waiting until every
-        # request admitted on the target reaches a legal terminal state. Final route
-        # deletion belongs to the later service commit under Trainer G.
         while ray.get(lb.has_unsettled_requests.remote(server_id), timeout=30):
             time.sleep(0.1)
 
         return OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
 
-    def commit_service_change(self, operation: OperationRecord):
+    def get_pending_target(self, operation_id: str) -> ReplicaKey:
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("operation_id must be a nonempty string")
+        try:
+            return self._pending_operation_targets[operation_id]
+        except KeyError as exc:
+            raise KeyError(f"no pending lifecycle target for {operation_id!r}") from exc
+
+    def commit_service_change(self, operation: OperationRecord) -> OperationEvidence:
+        """Commit the R/C part of a drained exit while Manager keeps M=DRAINING."""
         if not isinstance(operation, OperationRecord):
             raise TypeError("commit_service_change requires OperationRecord")
-        raise NotImplementedError(
-            "commit_service_change requires verified R/C/M commit wiring"
+        target = self.get_pending_target(operation.operation_id)
+        manager = self.llm_server_manager
+        _kind, state = manager.replica_meta(target)
+        if state is not ReplicaState.DRAINING:
+            raise ValueError(
+                f"service exit commit requires DRAINING replica, got {state.value}"
+            )
+
+        lb = manager.global_load_balancer
+        try:
+            server_id = ray.get(lb.server_for_replica.remote(target), timeout=30)
+            if server_id is not None and ray.get(
+                lb.has_unsettled_requests.remote(server_id), timeout=30
+            ):
+                raise ValueError("cannot commit service exit while requests remain unsettled")
+            ray.get(lb.finish_remove.remote(target), timeout=30)
+            manager.deactivate_service(target)
+            self._update_max_concurrent_samples()
+        except BaseException:
+            if manager.replica_state.get(target) is ReplicaState.DRAINING:
+                manager.transition_replica(target, ReplicaState.QUARANTINED)
+            raise
+
+        return OperationEvidence.now(
+            operation.operation_id,
+            EvidenceType.SERVICE_COMMITTED,
         )
 
     def finalize_release(self, operation: OperationRecord):
