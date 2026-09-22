@@ -23,6 +23,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
     def __init__(self):
         super().__init__()
         self.group_scheduler = None
+        self.task_session = None
 
     def _ensure_journal(self) -> OperationJournal:
         if not hasattr(self, "_operation_journal"):
@@ -32,6 +33,8 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
     def submit_operation(self, command: OperationCommand) -> OperationRecord:
         if not isinstance(command, OperationCommand):
             raise TypeError("submit_operation requires OperationCommand")
+        if self.task_session is not None and command.target.task_session != self.task_session:
+            raise ValueError("operation targets another task session")
         return self._ensure_journal().begin(command)
 
     def query_operation(self, operation_id: str) -> OperationRecord:
@@ -45,19 +48,26 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
     def run(self, config):
         self.group_scheduler = get_or_create_group_scheduler()
         context = ray.get_runtime_context()
-        task_id = str(context.get_actor_id())
+        self.task_session = str(context.get_actor_id())
         try:
-            ray.get(self.group_scheduler.attach_task.remote(task_id, context.current_actor), timeout=30)
+            ray.get(self.group_scheduler.attach_task.remote(self.task_session, context.current_actor), timeout=30)
             return super().run(config)
         finally:
             try:
-                ray.get(self.group_scheduler.detach_task.remote(task_id), timeout=30)
+                ray.get(self.group_scheduler.detach_task.remote(self.task_session), timeout=30)
             except Exception:
-                logger.warning("Could not detach TaskRunner %s from GroupScheduler", task_id, exc_info=True)
+                logger.warning("Could not detach TaskRunner %s from GroupScheduler", self.task_session, exc_info=True)
 
     def _create_rollouter(self, config) -> None:
         print("[ASYNC MAIN] Starting create rollouter...")
-        rollouter = MultiTaskFullyAsyncRollouter.remote(config=config, tokenizer=self.components["tokenizer"], processor=self.components["processor"], device_name=config.trainer.device, group_scheduler=self.group_scheduler)
+        rollouter = MultiTaskFullyAsyncRollouter.remote(
+            config=config,
+            tokenizer=self.components["tokenizer"],
+            processor=self.components["processor"],
+            device_name=config.trainer.device,
+            group_scheduler=self.group_scheduler,
+            task_session=self.task_session,
+        )
         if "hybrid_worker_group" in self.components:
             ray.get(rollouter.set_hybrid_worker_group.remote(self.components["hybrid_worker_group"]))
             print("[ASYNC MAIN] Hybrid worker group injected into rollouter")
@@ -69,7 +79,14 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
     def _create_trainer(self, config) -> None:
         print("[ASYNC MAIN] Starting create trainer...")
         trainer_role_mapping = {role: worker_cls for role, worker_cls in self.components["role_worker_mapping"].items() if role != Role.Rollout}
-        trainer = MultiTaskFullyAsyncTrainer.remote(config=config, tokenizer=self.components["tokenizer"], role_worker_mapping=trainer_role_mapping, resource_pool_manager=create_resource_pool_manager(config, roles=list(trainer_role_mapping.keys())), ray_worker_group_cls=self.components["ray_worker_group_cls"], device_name=config.trainer.device)
+        trainer = MultiTaskFullyAsyncTrainer.remote(
+            config=config,
+            tokenizer=self.components["tokenizer"],
+            role_worker_mapping=trainer_role_mapping,
+            resource_pool_manager=create_resource_pool_manager(config, roles=list(trainer_role_mapping.keys())),
+            ray_worker_group_cls=self.components["ray_worker_group_cls"],
+            device_name=config.trainer.device,
+        )
         ray.get(trainer.init_workers.remote())
         self.components["trainer"] = trainer
         print("[ASYNC MAIN] FullyAsyncTrainer created and initialized successfully")
