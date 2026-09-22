@@ -1,111 +1,78 @@
-"""Experimental Fully Async Rollouter with the current lifecycle surface.
+"""Experimental Fully Async Rollouter aligned with the 092203 owner boundaries."""
 
-Native generation/queue behavior stays inherited. Device/runtime actions remain
-explicit failures until a verified native backend is available. Rollouter owns
-ProductionWindow facts; LB owns idle-candidate construction and reporting.
-"""
+from __future__ import annotations
 
 import ray
-
-from verl.experimental.fully_async_policy.fully_async_rollouter import (
-    FullyAsyncAgentLoopManager,
-    FullyAsyncRollouter,
-)
+from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncAgentLoopManager, FullyAsyncRollouter
 from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
-
 from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
-from multi_task_scheduler.orchestration.contracts import ServiceAction
-from multi_task_scheduler.orchestration.production_window import ProductionWindow
-
+from multi_task_scheduler.orchestration.contracts import OperationRecord, ReplicaKey, ReplicaKind, ReplicaState
 from .llm_server_manager import MultiTaskLLMServerManager
 
 
 @ray.remote(num_cpus=10, max_concurrency=100)
 class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter)):
-    """Own production/capacity/lifecycle coordination for the task."""
-
     def __init__(self, config, tokenizer, processor=None, device_name=None, *, group_scheduler=None):
         self.group_scheduler = group_scheduler
-        self._production_window = None
         super().__init__(config, tokenizer, processor=processor, device_name=device_name)
 
     async def _init_async_rollout_manager(self):
-        enable_agent_reward_loop = (
-            not self.use_rm or self.config.reward.reward_model.enable_resource_pool
-        )
-        reward_loop_worker_handles = (
-            self.reward_loop_manager.reward_loop_workers
-            if enable_agent_reward_loop
-            else None
-        )
+        enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
+        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
         assert self.config.actor_rollout_ref.rollout.mode == "async"
         self.async_rollout_mode = True
-        self.llm_server_manager = await MultiTaskLLMServerManager.create(
-            config=self.config,
-            worker_group=self.get_hybrid_worker_group(),
-            group_scheduler=self.group_scheduler,
-        )
+        self.llm_server_manager = await MultiTaskLLMServerManager.create(config=self.config, worker_group=self.get_hybrid_worker_group(), group_scheduler=self.group_scheduler)
         self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
             config=self.config,
-            llm_client=self.llm_server_manager.get_client(
-                client_cls=FullyAsyncLLMServerClient
-            ),
+            llm_client=self.llm_server_manager.get_client(client_cls=FullyAsyncLLMServerClient),
             reward_loop_worker_handles=reward_loop_worker_handles,
-            teacher_client=(
-                self.teacher_model_manager.get_client()
-                if self.teacher_model_manager
-                else None
-            ),
+            teacher_client=(self.teacher_model_manager.get_client() if self.teacher_model_manager else None),
         )
 
     @property
-    def production_window(self) -> ProductionWindow | None:
-        """Return the latest task-session production fact, if one is established."""
-        return self._production_window
+    def committed_capacity(self) -> int:
+        return int(getattr(self, "max_concurrent_samples", 0))
 
-    def set_production_window(self, window: ProductionWindow) -> None:
-        if not isinstance(window, ProductionWindow):
-            raise TypeError("set_production_window requires ProductionWindow")
-        current = self._production_window
-        if current is not None:
-            if window.task_session != current.task_session:
-                raise ValueError("production window task_session cannot change in-place")
-            if window.epoch < current.epoch:
-                raise ValueError("production window epoch cannot move backwards")
-            if window.epoch == current.epoch and window.revision < current.revision:
-                raise ValueError("production window revision cannot move backwards")
-        self._production_window = window
+    @property
+    def production_window_open(self) -> bool:
+        return not bool(getattr(self, "paused", False))
 
-    def prepare_replica(self, ctx, key, placement):
-        """Hidden-create one borrowed runtime without publishing service."""
-        raise NotImplementedError("prepare_replica requires verified native backend")
+    def collect_idle_candidates(self) -> tuple[tuple[ReplicaKey, ReplicaKind], ...]:
+        if self.production_window_open or self.committed_capacity <= 0:
+            return ()
+        manager = getattr(self, "llm_server_manager", None)
+        if manager is None:
+            return ()
+        return tuple((key, manager.replica_kind[key]) for key, state in manager.replica_state.items() if state is ReplicaState.ACTIVE)
 
-    def prepare_exit(self, command):
-        """Unified DONATE/REMOVE drain and verified continuation coordinator."""
-        raise NotImplementedError("prepare_exit requires verified native backend")
+    def submit_idle_report(self):
+        if self.group_scheduler is None:
+            raise RuntimeError("GroupScheduler handle is required for idle reporting")
+        candidates = self.collect_idle_candidates()
+        if not candidates:
+            return None
+        task_sessions = {key.task_session for key, _ in candidates}
+        if len(task_sessions) != 1:
+            raise ValueError("one Rollouter may report candidates for only one task_session")
+        report = {"task_session": next(iter(task_sessions)), "candidates": tuple({"replica_key": key, "kind": kind.value} for key, kind in candidates)}
+        return ray.get(self.group_scheduler.submit_idle_report.remote(report), timeout=30)
 
-    def commit_service_change(
-        self,
-        ctx,
-        action: ServiceAction,
-        prerequisite,
-        ce_commit,
-        prepared=None,
-    ):
-        """Canonical ADD/REMOVE service commit; caller must hold Trainer G.
+    def prepare_replica(self, replica_key: ReplicaKey):
+        if not isinstance(replica_key, ReplicaKey):
+            raise TypeError("prepare_replica requires ReplicaKey")
+        raise NotImplementedError("prepare_replica requires verified borrowed-runtime backend")
 
-        REMOVE performs the required owner-side exit revalidation internally;
-        it is intentionally not exposed as a second coordination API.
-        """
-        action = ServiceAction(action)
-        raise NotImplementedError(
-            f"commit_service_change({action.value}) requires verified owner commit wiring"
-        )
+    def prepare_exit(self, replica_key: ReplicaKey):
+        if not isinstance(replica_key, ReplicaKey):
+            raise TypeError("prepare_exit requires ReplicaKey")
+        raise NotImplementedError("prepare_exit requires verified drain/continuation backend; timeout is not success")
 
-    def finalize_release(self, ctx, service):
-        """Sleep native or destroy borrowed only after ServiceEvidence(REMOVE)."""
-        raise NotImplementedError("finalize_release requires verified runtime release backend")
+    def commit_service_change(self, operation: OperationRecord):
+        if not isinstance(operation, OperationRecord):
+            raise TypeError("commit_service_change requires OperationRecord")
+        raise NotImplementedError("commit_service_change requires verified R/C/M commit wiring")
 
-    def query_phase(self, ctx, phase):
-        """Return owner-backed phase facts once owner-side journals are wired."""
-        raise NotImplementedError("query_phase requires owner-side journal wiring")
+    def finalize_release(self, operation: OperationRecord):
+        if not isinstance(operation, OperationRecord):
+            raise TypeError("finalize_release requires OperationRecord")
+        raise NotImplementedError("finalize_release requires verified sleep/destroy and exact GPU release evidence")

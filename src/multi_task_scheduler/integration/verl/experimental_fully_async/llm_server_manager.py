@@ -1,33 +1,35 @@
-"""Select rollout subclasses and own the Manager lifecycle view (M).
-
-Native server creation/routing stays inherited. RuntimeBackend primitives are
-kept on this task-local manager boundary for the first release and fail
-explicitly until their real CUDA/NCCL/vLLM implementation is verified.
-"""
+"""Native Fully Async server manager plus the Manager-owned M view."""
 
 import ray
 
 from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncLLMServerManager
 from verl.workers.rollout.llm_server import DEFAULT_ROUTING_CACHE_SIZE
 
-from multi_task_scheduler.orchestration.replica_record import ReplicaRecord
+from multi_task_scheduler.orchestration.contracts import ReplicaKey, ReplicaKind, ReplicaState
 from multi_task_scheduler.rollout.load_balancer import MultiTaskGlobalRequestLoadBalancer
 from multi_task_scheduler.rollout.replica import MultiTaskvLLMReplica
 
+_ALLOWED = {
+    ReplicaState.CREATING: {ReplicaState.ACTIVE, ReplicaState.RELEASED, ReplicaState.QUARANTINED},
+    ReplicaState.ACTIVE: {ReplicaState.DRAINING},
+    ReplicaState.DRAINING: {ReplicaState.ACTIVE, ReplicaState.DORMANT, ReplicaState.RELEASED, ReplicaState.QUARANTINED},
+    ReplicaState.DORMANT: {ReplicaState.ACTIVE, ReplicaState.QUARANTINED},
+    ReplicaState.RELEASED: set(),
+    ReplicaState.QUARANTINED: set(),
+}
+
 
 class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
-    """Ordinary object owned by Rollouter; Manager is the M-view owner."""
+    """Ordinary Rollouter-owned object; only this object writes M."""
 
     def __init__(self, config, worker_group=None, rollout_resource_pool=None, *, group_scheduler=None):
         self.group_scheduler = group_scheduler
         self.rollout_replica_class = MultiTaskvLLMReplica
         super().__init__(config, worker_group, rollout_resource_pool)
         self._load_balancer_cls = MultiTaskGlobalRequestLoadBalancer
-        self._lifecycle = {}
-        # RuntimeBackend implementation details stay private and are keyed by
-        # full ReplicaKey. A verified backend may store process/actor/port/IPC
-        # identities here; none of those are public protocol records.
-        self._runtime_inventory = {}
+        self.replica_state: dict[ReplicaKey, ReplicaState] = {}
+        self.replica_kind: dict[ReplicaKey, ReplicaKind] = {}
+        self._runtime_inventory: dict[ReplicaKey, object] = {}
 
     async def _init_global_load_balancer(self) -> None:
         self.global_load_balancer = ray.remote(self._load_balancer_cls).remote(
@@ -37,41 +39,60 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             group_scheduler=self.group_scheduler,
         )
 
-    def record_lifecycle(self, record: ReplicaRecord) -> ReplicaRecord:
-        """Store one Manager lifecycle record by full runtime identity."""
-        self._lifecycle[record.key] = record
-        return record
+    def register_replica(self, key: ReplicaKey, kind: ReplicaKind, *, state: ReplicaState = ReplicaState.CREATING, runtime=None) -> None:
+        if not isinstance(key, ReplicaKey):
+            raise TypeError("key must be ReplicaKey")
+        kind = ReplicaKind(kind)
+        state = ReplicaState(state)
+        if key in self.replica_state:
+            if self.replica_kind[key] is not kind or self.replica_state[key] is not state:
+                raise ValueError("conflicting lifecycle registration")
+            return
+        self._validate_kind_state(kind, state)
+        self.replica_kind[key] = kind
+        self.replica_state[key] = state
+        if runtime is not None:
+            self._runtime_inventory[key] = runtime
 
-    def inspect_runtime(self, ctx, key):
-        """Read-only lifecycle lookup by ReplicaKey; never returns a donor handle."""
-        return self._lifecycle.get(key)
+    @staticmethod
+    def _validate_kind_state(kind: ReplicaKind, state: ReplicaState) -> None:
+        if kind is ReplicaKind.BORROWED and state is ReplicaState.DORMANT:
+            raise ValueError("borrowed replica cannot enter DORMANT")
+        if kind is ReplicaKind.NATIVE and state is ReplicaState.RELEASED:
+            raise ValueError("native replica must sleep instead of entering RELEASED")
 
-    def create_hidden(self, ctx, key, placement):
-        raise NotImplementedError(
-            "RuntimeBackend.create_hidden requires verified native backend"
-        )
+    def transition_replica(self, key: ReplicaKey, new_state: ReplicaState) -> ReplicaState:
+        if key not in self.replica_state:
+            raise KeyError(key)
+        current = self.replica_state[key]
+        new_state = ReplicaState(new_state)
+        if new_state is current:
+            return current
+        if new_state not in _ALLOWED[current]:
+            raise ValueError(f"illegal replica transition: {current.value} -> {new_state.value}")
+        self._validate_kind_state(self.replica_kind[key], new_state)
+        self.replica_state[key] = new_state
+        if new_state is ReplicaState.RELEASED:
+            self._runtime_inventory.pop(key, None)
+        return new_state
 
-    def sleep(self, ctx, key, proof):
-        raise NotImplementedError(
-            "RuntimeBackend.sleep requires verified native backend"
-        )
+    def replica_meta(self, key: ReplicaKey) -> tuple[ReplicaKind, ReplicaState]:
+        return self.replica_kind[key], self.replica_state[key]
 
-    def wake_weights(self, ctx, key):
-        raise NotImplementedError(
-            "RuntimeBackend.wake_weights requires verified native backend"
-        )
+    def inspect_runtime(self, key: ReplicaKey):
+        return self._runtime_inventory.get(key)
 
-    def wake_kv_and_validate(self, ctx, key, weight):
-        raise NotImplementedError(
-            "RuntimeBackend.wake_kv_and_validate requires verified native backend"
-        )
+    def create_hidden(self, *args, **kwargs):
+        raise NotImplementedError("RuntimeBackend.create_hidden requires verified native backend")
 
-    def destroy(self, ctx, key, proof):
-        raise NotImplementedError(
-            "RuntimeBackend.destroy requires verified native backend"
-        )
+    def sleep(self, *args, **kwargs):
+        raise NotImplementedError("RuntimeBackend.sleep requires verified native backend")
 
-    def query_phase(self, ctx, phase):
-        raise NotImplementedError(
-            "RuntimeBackend.query_phase requires owner-side journal wiring"
-        )
+    def wake_weights(self, *args, **kwargs):
+        raise NotImplementedError("RuntimeBackend.wake_weights requires verified native backend")
+
+    def destroy(self, *args, **kwargs):
+        raise NotImplementedError("RuntimeBackend.destroy requires verified native backend")
+
+    def query_runtime(self, key: ReplicaKey):
+        return self.inspect_runtime(key)
