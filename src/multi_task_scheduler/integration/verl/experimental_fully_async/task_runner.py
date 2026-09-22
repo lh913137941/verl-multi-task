@@ -259,9 +259,6 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                 self._attached_to_gs = False
 
     def _initialize_components(self, config) -> None:
-        # The task becomes schedulable only after native initialization, initial
-        # checkpoint load/sync and validation have completed. This prevents GS
-        # from issuing lifecycle commands against half-built owner objects.
         super()._initialize_components(config)
         ray.get(
             self.group_scheduler.attach_task.remote(
@@ -312,6 +309,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             ),
             ray_worker_group_cls=self.components["ray_worker_group_cls"],
             device_name=config.trainer.device,
+            task_session=self.task_session,
         )
         ray.get(trainer.init_workers.remote())
         self.components["trainer"] = trainer
