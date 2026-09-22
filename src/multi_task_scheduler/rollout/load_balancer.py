@@ -6,6 +6,8 @@ from verl.workers.rollout.router import DEFAULT_ROUTING_CACHE_SIZE, GlobalReques
 
 from multi_task_scheduler.orchestration.contracts import AttemptState, ReplicaKey
 
+_TERMINAL_ATTEMPT_STATES = {AttemptState.TERMINATED, AttemptState.SETTLED}
+
 
 class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
     """Reuse native routing/counters and add only exact per-request exit facts."""
@@ -73,7 +75,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         state = self.attempt_state.get(request_id)
         if state is None:
             raise KeyError(f"unknown request_id {request_id!r}")
-        if state in {AttemptState.SETTLED, AttemptState.TERMINATED}:
+        if state in _TERMINAL_ATTEMPT_STATES:
             return state
         if state is not AttemptState.ADMITTED:
             raise ValueError(
@@ -91,7 +93,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
 
     def has_unsettled_requests(self, server_id: str) -> bool:
         return any(
-            self.attempt_state.get(request_id) is not AttemptState.SETTLED
+            self.attempt_state.get(request_id) not in _TERMINAL_ATTEMPT_STATES
             for request_id in self.requests_for_server(server_id)
         )
 
@@ -116,6 +118,6 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
 
     def gc_settled_requests(self, request_ids) -> None:
         for request_id in request_ids:
-            if self.attempt_state.get(request_id) is AttemptState.SETTLED:
+            if self.attempt_state.get(request_id) in _TERMINAL_ATTEMPT_STATES:
                 self.attempt_state.pop(request_id, None)
                 self.active_request_server.pop(request_id, None)
