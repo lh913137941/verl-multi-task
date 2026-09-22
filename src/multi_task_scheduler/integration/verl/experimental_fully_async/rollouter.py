@@ -144,30 +144,36 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         if manager is None:
             raise RuntimeError("LLM server manager is not initialized")
         kind, state = manager.replica_meta(replica_key)
-        if state is not ReplicaState.ACTIVE:
-            raise ValueError(
-                f"prepare_exit requires ACTIVE replica, got {state.value}"
-            )
 
         if force:
             if kind is not ReplicaKind.BORROWED:
                 raise ValueError("FORCE REMOVE is borrowed-only")
+            if state is not ReplicaState.ACTIVE:
+                raise ValueError(
+                    f"FORCE prepare_exit requires ACTIVE replica, got {state.value}"
+                )
             # Do not close admission or mutate M before the validated continuation
             # backend exists. A placeholder must never strand a live replica.
             raise NotImplementedError(
                 "FORCE prepare_exit requires verified targeted abort/continuation backend"
             )
 
-        manager.transition_replica(replica_key, ReplicaState.DRAINING)
+        if state is ReplicaState.ACTIVE:
+            manager.transition_replica(replica_key, ReplicaState.DRAINING)
+        elif state is not ReplicaState.DRAINING:
+            raise ValueError(
+                f"prepare_exit requires ACTIVE/DRAINING replica, got {state.value}"
+            )
+
         lb = manager.global_load_balancer
         server_id = ray.get(lb.begin_drain.remote(replica_key), timeout=30)
 
         # Natural draining has no success-by-timeout rule. Keep waiting until every
-        # request that was admitted on the target has reached a legal terminal state.
+        # request admitted on the target reaches a legal terminal state. Final route
+        # deletion belongs to the later service commit under Trainer G.
         while ray.get(lb.has_unsettled_requests.remote(server_id), timeout=30):
             time.sleep(0.1)
 
-        ray.get(lb.finish_remove.remote(replica_key), timeout=30)
         return OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
 
     def commit_service_change(self, operation: OperationRecord):
