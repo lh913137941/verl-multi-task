@@ -240,7 +240,6 @@ def test_rollouter_natural_exit_closes_admission_then_returns_exit_ready():
     class LB:
         begin_drain = RemoteMethod(lambda target: calls.append(("begin", target)) or "s0")
         has_unsettled_requests = RemoteMethod(lambda server_id: False)
-        finish_remove = RemoteMethod(lambda target: calls.append(("finish", target)))
 
     class Manager:
         global_load_balancer = LB()
@@ -266,8 +265,12 @@ def test_rollouter_natural_exit_closes_admission_then_returns_exit_ready():
     assert calls == [
         ("state", ReplicaState.DRAINING),
         ("begin", key),
-        ("finish", key),
     ]
+
+    calls.clear()
+    retry = rollouter.prepare_exit(key, operation_id="op-retry")
+    assert retry.type is EvidenceType.EXIT_READY
+    assert calls == [("begin", key)]
 
 
 def test_rollouter_force_fails_before_mutating_m_without_verified_backend():
