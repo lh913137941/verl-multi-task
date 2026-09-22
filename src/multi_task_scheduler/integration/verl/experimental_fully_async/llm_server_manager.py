@@ -64,6 +64,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             key: runtime._server_address
             for key, runtime in self._runtime_inventory.items()
             if getattr(runtime, "_server_address", None)
+            and self.replica_state.get(key) is ReplicaState.ACTIVE
         }
         self.global_load_balancer = ray.remote(self._load_balancer_cls).remote(
             servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
@@ -124,6 +125,36 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
 
     def inspect_runtime(self, key: ReplicaKey):
         return self._runtime_inventory.get(key)
+
+    def deactivate_service(self, key: ReplicaKey):
+        """Remove one runtime from native active-service lists without destroying it."""
+        runtime = self._runtime_inventory.get(key)
+        if runtime is None:
+            raise KeyError(key)
+
+        if runtime in self.rollout_replicas:
+            self.rollout_replicas.remove(runtime)
+
+        address = getattr(runtime, "_server_address", None)
+        if address in self.server_addresses:
+            index = self.server_addresses.index(address)
+            self.server_addresses.pop(index)
+            self.server_handles.pop(index)
+        return runtime
+
+    def activate_service(self, key: ReplicaKey):
+        """Restore one retained runtime to native active-service lists."""
+        runtime = self._runtime_inventory.get(key)
+        if runtime is None:
+            raise KeyError(key)
+        if runtime not in self.rollout_replicas:
+            self.rollout_replicas.append(runtime)
+        address = getattr(runtime, "_server_address", None)
+        handle = getattr(runtime, "_server_handle", None)
+        if address and address not in self.server_addresses:
+            self.server_addresses.append(address)
+            self.server_handles.append(handle)
+        return runtime
 
     def create_hidden(self, *args, **kwargs):
         raise NotImplementedError("RuntimeBackend.create_hidden requires verified native backend")
