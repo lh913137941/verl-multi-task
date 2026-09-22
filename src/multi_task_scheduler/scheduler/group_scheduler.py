@@ -14,10 +14,13 @@ from multi_task_scheduler.orchestration.contracts import (
     OperationEvidence,
     OperationKind,
     OperationRecord,
+    ReplicaKey,
+    ReplicaKind,
 )
 
 RUNTIME_KIND = "verl-multi-task:experimental_fully_async_standalone:092203"
 _RELEASE_KINDS = {OperationKind.DONATE, OperationKind.REMOVE}
+_EXPIRY_BLOCKED_KINDS = {OperationKind.ADD, OperationKind.RESTORE}
 
 
 @ray.remote(num_cpus=0)
@@ -61,13 +64,32 @@ class GroupScheduler:
         candidates = report.get("candidates")
         if not isinstance(task_session, str) or not task_session:
             raise ValueError("idle report requires task_session")
+        if task_session not in self.task_runners:
+            raise ValueError("idle report references a detached task_session")
         if not isinstance(candidates, (tuple, list)):
             raise ValueError("idle report requires candidates")
+
+        normalized = []
+        seen = set()
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                raise TypeError("idle candidate must be a metadata dict")
+            key = candidate.get("replica_key")
+            if not isinstance(key, ReplicaKey):
+                raise TypeError("idle candidate requires ReplicaKey")
+            if key.task_session != task_session:
+                raise ValueError("idle candidate belongs to another task_session")
+            kind = ReplicaKind(candidate.get("kind"))
+            if key in seen:
+                raise ValueError("idle report contains duplicate ReplicaKey")
+            seen.add(key)
+            normalized.append({"replica_key": key, "kind": kind.value})
+
         self.idle_reports[task_session] = {
             "observed_at": time.monotonic(),
-            "candidates": tuple(candidates),
+            "candidates": tuple(normalized),
         }
-        return {"accepted": True, "candidate_count": len(candidates)}
+        return {"accepted": True, "candidate_count": len(normalized)}
 
     def submit_operation(self, command: OperationCommand) -> OperationRecord:
         if not isinstance(command, OperationCommand):
@@ -75,8 +97,11 @@ class GroupScheduler:
         lease = self.leases.get(command.lease_id)
         if lease is None:
             raise ValueError(f"unknown lease {command.lease_id!r}")
-        if lease.expires_at and time.time() >= lease.expires_at:
-            raise ValueError(f"lease {command.lease_id!r} has expired")
+        expired = bool(lease.expires_at and time.time() >= lease.expires_at)
+        if expired and command.kind in _EXPIRY_BLOCKED_KINDS:
+            raise ValueError(
+                f"expired lease {command.lease_id!r} cannot start {command.kind.value}"
+            )
 
         previous = self.operation_commands.get(command.operation_id)
         if previous is not None and previous != command:
