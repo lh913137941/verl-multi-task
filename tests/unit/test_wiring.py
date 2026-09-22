@@ -1,6 +1,6 @@
 import ast
+import threading
 from pathlib import Path
-import pytest
 from multi_task_scheduler.orchestration.contracts import OperationCommand, OperationRecord, OperationStatus, ReplicaKey, ReplicaKind, ReplicaState
 from multi_task_scheduler.orchestration.operation_journal import OperationJournal
 SOURCE=Path(__file__).resolve().parents[2]/"src/multi_task_scheduler"
@@ -13,8 +13,8 @@ def isolated(relative,name,parent,**scope):
 def test_taskrunner_minimal_journal_surface():
     class Parent:
         def __init__(self): self.components={}
-    cls=isolated(f"{INTEGRATION}/task_runner.py","MultiTaskFullyAsyncTaskRunner",Parent,OperationJournal=OperationJournal,OperationCommand=OperationCommand,OperationRecord=OperationRecord,OperationStatus=OperationStatus)
-    runner=cls(); cmd=OperationCommand("op","ADD",ReplicaKey("task-a","r0"),"l1")
+    cls=isolated(f"{INTEGRATION}/task_runner.py","MultiTaskFullyAsyncTaskRunner",Parent,OperationJournal=OperationJournal,OperationCommand=OperationCommand,OperationRecord=OperationRecord,OperationStatus=OperationStatus,threading=threading)
+    runner=cls(); runner.task_session="task-a"; cmd=OperationCommand("op","ADD",ReplicaKey("task-a","r0"),"l1")
     assert runner.submit_operation(cmd).status is OperationStatus.ACCEPTED
     assert runner.query_operation("missing").status is OperationStatus.UNKNOWN
 
