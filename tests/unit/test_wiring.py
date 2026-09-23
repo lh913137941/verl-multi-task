@@ -509,6 +509,16 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         asyncio.run(manager.create_borrowed_replica(valid_spec))
     assert manager.next_replica_rank == 1
 
+    # A retry may carry the rank recovered from the manager's first record.
+    resolved_retry = dict(valid_spec, replica_rank=0)
+    with pytest.raises(NotImplementedError, match="PG/bundle actor backend"):
+        asyncio.run(manager.create_borrowed_replica(resolved_retry))
+    assert manager.next_replica_rank == 1
+
+    wrong_rank = dict(valid_spec, replica_rank=7)
+    with pytest.raises(ValueError, match="conflicting borrowed create replay"):
+        asyncio.run(manager.create_borrowed_replica(wrong_rank))
+
     conflicting = dict(valid_spec, operation_id="op-other")
     with pytest.raises(ValueError, match="conflicting borrowed create replay"):
         asyncio.run(manager.create_borrowed_replica(conflicting))

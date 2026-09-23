@@ -278,6 +278,19 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         return rank
 
     @staticmethod
+    def _same_borrowed_create_request(record: dict, incoming: dict) -> bool:
+        expected = dict(record["request_spec"])
+        current = dict(incoming)
+        expected_rank = expected.get("replica_rank")
+        current_rank = current.get("replica_rank")
+        resolved_rank = record["replica_rank"]
+        if expected_rank is None and current_rank == resolved_rank:
+            current["replica_rank"] = None
+        elif current_rank is None and expected_rank == resolved_rank:
+            expected["replica_rank"] = None
+        return expected == current
+
+    @staticmethod
     def _borrowed_receipt(record: dict) -> dict:
         result = record.get("result")
         if result is not None:
@@ -306,7 +319,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             if existing is not None:
                 if (
                     existing["operation_id"] != normalized["operation_id"]
-                    or existing["request_spec"] != normalized
+                    or not self._same_borrowed_create_request(existing, normalized)
                 ):
                     raise ValueError("conflicting borrowed create replay")
                 if existing["state"] == "FAILED":
