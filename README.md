@@ -107,7 +107,7 @@ Lease(lease_id, claims, expires_at)
 - 原生 STANDALONE replicas 初始化完成后登记为 `NATIVE/ACTIVE`，供 M 和空泡判断读取；borrowed ADD 一经 Manager 接受就用同一 `ReplicaKey` 登记为 `BORROWED/CREATING`，创建结果未能证明成功时收口到 `QUARANTINED`，不会跳过 M 直接发布服务；
 - LB 复用当前 VERL router API，并补逐 request `ADMITTED/TERMINATED/SETTLED`；
 - 自然 release 进入 `SETTLED`；已验证 continuation 先进入 `TERMINATED`，随后由迟到 release 或退出提交收敛到 `SETTLED`；
-- GS 维护最小 Lease 账本，claim_id 永久绑定原 lease；首版整卡下同一 PG/bundle 与 GPU UUID 在 RELEASED 前不能被第二个 lease 重复授权；
+- GS 维护最小 Lease 账本，claim_id 永久绑定原 lease；首版一个 Lease 只覆盖一个完整 donor replica。DONATE 的 RELEASED 只把已预留 claims 推进到 borrower handoff-ready，仍禁止第二个 lease 抢占；只有 borrowed REMOVE 的 RELEASED 才把 PG/bundle 与 GPU UUID 真正归还全局可授权池；
 - RELEASED 必须与已登记的 `operation_id → lease_id` 对应，并完整覆盖 lease 的 GPU UUID 集合；runtime release 无法给出真实证据时 Manager 将目标从 DRAINING 收口到 QUARANTINED，而不是留下可误判的半完成状态；
 - native 参数同步继续复用原生实现，但进入同一个 Trainer G；
 - Queue exactly-once 仍是原生样本之上的逻辑 key + digest 薄层；

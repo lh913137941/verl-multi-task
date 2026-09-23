@@ -33,6 +33,10 @@ class GroupScheduler:
         self.operation_commands: dict[str, OperationCommand] = {}
         self.release_evidence: dict[tuple[str, str], OperationEvidence] = {}
         self.release_history: dict[str, list[str]] = {}
+        # Internal derived phase: donor RELEASED has made the reserved claims
+        # safe for the borrower ADD, but they remain owned by this borrower
+        # lease until borrowed REMOVE produces its own RELEASED evidence.
+        self.handoff_ready_leases: set[str] = set()
         # claim_id is globally unique for the lifetime of this GS ledger.
         # Bundle/GPU ownership is active-only and is released only by verified
         # RELEASED evidence.
@@ -109,6 +113,27 @@ class GroupScheduler:
                 raise ValueError(
                     f"expired lease {command.lease_id!r} cannot start ADD"
                 )
+
+            donor_task_id = lease.claims[0]["donor_task_id"]
+            if command.kind is OperationKind.DONATE:
+                if command.target.task_session != donor_task_id:
+                    raise ValueError("DONATE target does not own the lease claims")
+                if command.lease_id in self.handoff_ready_leases:
+                    raise ValueError("lease handoff is already ready")
+            elif command.kind in {OperationKind.ADD, OperationKind.REMOVE}:
+                if command.lease_id not in self.handoff_ready_leases:
+                    raise ValueError(
+                        f"{command.kind.value} requires donor RELEASED handoff"
+                    )
+            elif command.kind is OperationKind.RESTORE:
+                if any(
+                    self.active_gpu_owner.get(gpu_uuid) == command.lease_id
+                    for gpu_uuid in lease.gpu_uuids
+                ):
+                    raise ValueError(
+                        "RESTORE requires borrower claims to be fully returned"
+                    )
+
             self.operation_commands[command.operation_id] = command
 
         task_runner = self.task_runners.get(command.target.task_session)
@@ -198,14 +223,19 @@ class GroupScheduler:
         self.release_evidence[evidence_key] = evidence
         self.release_history.setdefault(lease_id, []).append(evidence.operation_id)
 
-        # Capacity becomes reusable only after the exact RELEASED proof above.
-        # claim_id remains permanently bound to its original lease identity.
-        for bundle_key in lease.bundle_keys:
-            if self.active_bundle_owner.get(bundle_key) == lease_id:
-                self.active_bundle_owner.pop(bundle_key, None)
-        for gpu_uuid in lease.gpu_uuids:
-            if self.active_gpu_owner.get(gpu_uuid) == lease_id:
-                self.active_gpu_owner.pop(gpu_uuid, None)
+        # DONATE hands the already-reserved claims to the borrower; it must not
+        # expose the same physical slot to another lease. Only borrowed REMOVE
+        # returns the claims to the global free pool.
+        if command.kind is OperationKind.DONATE:
+            self.handoff_ready_leases.add(lease_id)
+        else:
+            self.handoff_ready_leases.discard(lease_id)
+            for bundle_key in lease.bundle_keys:
+                if self.active_bundle_owner.get(bundle_key) == lease_id:
+                    self.active_bundle_owner.pop(bundle_key, None)
+            for gpu_uuid in lease.gpu_uuids:
+                if self.active_gpu_owner.get(gpu_uuid) == lease_id:
+                    self.active_gpu_owner.pop(gpu_uuid, None)
 
         return {
             "lease_id": lease_id,

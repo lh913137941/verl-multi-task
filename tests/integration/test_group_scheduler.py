@@ -89,6 +89,14 @@ def test_group_scheduler_minimal_lease_and_forwarding():
             "released": True,
         }
         assert ray.get(gs.advance_lease.remote("l1", evidence)) == result
+
+        add = OperationCommand(
+            "op-add",
+            OperationKind.ADD,
+            ReplicaKey("task-a", "borrowed-0"),
+            "l1",
+        )
+        assert ray.get(gs.submit_operation.remote(add)).operation_id == "op-add"
     finally:
         ray.shutdown()
 
@@ -135,8 +143,38 @@ def test_group_scheduler_fences_active_claims_until_verified_release():
             )
         )
 
-        # The physical slot can be re-authorized only after RELEASED, while
-        # claim ids themselves remain globally unique ledger identities.
+        # DONATE releases the donor runtime but keeps the slot reserved for l1.
+        with pytest.raises(ValueError, match="already active"):
+            ray.get(gs.open_lease.remote(overlapping))
+
+        add = OperationCommand(
+            "op-add",
+            OperationKind.ADD,
+            ReplicaKey("task-a", "borrowed-0"),
+            "l1",
+        )
+        ray.get(gs.submit_operation.remote(add))
+
+        remove = OperationCommand(
+            "op-remove",
+            OperationKind.REMOVE,
+            ReplicaKey("task-a", "borrowed-0"),
+            "l1",
+        )
+        ray.get(gs.submit_operation.remote(remove))
+        ray.get(
+            gs.advance_lease.remote(
+                "l1",
+                OperationEvidence(
+                    "op-remove",
+                    EvidenceType.RELEASED,
+                    2,
+                    ("u0",),
+                ),
+            )
+        )
+
+        # Only borrowed REMOVE returns the physical slot to the free pool.
         assert ray.get(gs.open_lease.remote(overlapping)) == overlapping
 
         reused_claim_id = Lease(
@@ -153,6 +191,29 @@ def test_group_scheduler_fences_active_claims_until_verified_release():
         )
         with pytest.raises(ValueError, match="claim_id"):
             ray.get(gs.open_lease.remote(reused_claim_id))
+    finally:
+        ray.shutdown()
+
+
+def test_add_requires_verified_donor_handoff():
+    ray.init(num_cpus=2, ignore_reinit_error=True)
+    try:
+        gs = GroupScheduler.remote()
+        runner = Runner.remote()
+        ray.get(gs.attach_task.remote("task-a", runner))
+        ray.get(gs.open_lease.remote(Lease("l1", (claim(),), 0)))
+
+        with pytest.raises(ValueError, match="requires donor RELEASED handoff"):
+            ray.get(
+                gs.submit_operation.remote(
+                    OperationCommand(
+                        "op-add-early",
+                        OperationKind.ADD,
+                        ReplicaKey("task-a", "borrowed-0"),
+                        "l1",
+                    )
+                )
+            )
     finally:
         ray.shutdown()
 

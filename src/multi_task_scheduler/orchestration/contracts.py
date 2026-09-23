@@ -231,6 +231,15 @@ class Lease:
         if len(set(bundle_keys)) != len(bundle_keys):
             raise ValueError("lease claims must not repeat a PG bundle")
 
+        donor_replicas = {
+            (claim["donor_task_id"], claim["donor_replica_rank"])
+            for claim in claims
+        }
+        if len(donor_replicas) != 1:
+            raise ValueError(
+                "first release Lease must cover one complete donor replica"
+            )
+
         if type(self.expires_at) not in (int, float) or not math.isfinite(
             float(self.expires_at)
         ):

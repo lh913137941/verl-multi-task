@@ -106,6 +106,23 @@ def test_lease_normalizes_legacy_claim_lease_id_to_source_lease_id():
     assert lease.source_lease_ids == ("source-lease-0",)
 
 
+def test_first_release_lease_rejects_claims_from_multiple_donor_replicas():
+    with pytest.raises(ValueError, match="one complete donor replica"):
+        Lease(
+            "l1",
+            (
+                claim(),
+                claim(
+                    claim_id="claim-1",
+                    gpu_uuid="u1",
+                    bundle_index=1,
+                    donor_replica_rank=1,
+                ),
+            ),
+            0,
+        )
+
+
 def test_first_release_lease_is_whole_gpu_and_has_unique_bundle_and_uuid():
     with pytest.raises(ValueError, match="whole-GPU"):
         Lease("l1", (claim(gpu_fraction=0.5),), 0)
