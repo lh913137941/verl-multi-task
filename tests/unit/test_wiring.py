@@ -399,6 +399,15 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
             self.rollout_replicas = []
             self.server_addresses = []
             self.server_handles = []
+            self.rollout_config = type(
+                "RolloutConfig",
+                (),
+                {
+                    "tensor_model_parallel_size": 1,
+                    "data_parallel_size": 1,
+                    "pipeline_model_parallel_size": 1,
+                },
+            )()
 
     allowed = {
         ReplicaState.CREATING: {
@@ -533,6 +542,11 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     wrong_world = dict(valid_spec, world_size=2)
     with pytest.raises(ValueError, match="world_size"):
         manager.validate_borrowed_spec(wrong_world)
+
+    manager.rollout_config.tensor_model_parallel_size = 2
+    with pytest.raises(ValueError, match="parallel topology"):
+        manager.validate_borrowed_spec(valid_spec)
+    manager.rollout_config.tensor_model_parallel_size = 1
 
     expired = dict(valid_spec, expires_at=time.time() - 1)
     with pytest.raises(ValueError, match="expired"):

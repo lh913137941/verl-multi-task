@@ -200,6 +200,17 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         if world_size != len(raw_claims):
             raise ValueError("borrowed placement world_size must equal len(claims)")
 
+        configured_world_size = (
+            int(self.rollout_config.tensor_model_parallel_size)
+            * int(self.rollout_config.data_parallel_size)
+            * int(self.rollout_config.pipeline_model_parallel_size)
+        )
+        if world_size != configured_world_size:
+            raise ValueError(
+                "first release borrowed world_size must match the borrower task "
+                f"parallel topology ({configured_world_size})"
+            )
+
         max_colocate_count = spec.get("max_colocate_count", 1)
         if type(max_colocate_count) is not int or max_colocate_count <= 0:
             raise ValueError("max_colocate_count must be a positive integer")

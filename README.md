@@ -97,7 +97,8 @@ Lease(lease_id, claims, expires_at)
 ```
 
 `ReplicaKey` 只是共享身份。Lease 的 claim 至少携带 Ray `pg_id/bundle_index`
-调度键和 `node_id/gpu_uuid` 物理校验键；首版只允许整 GPU claim。
+调度键和 `node_id/gpu_uuid` 物理校验键；首版只允许整 GPU claim，并要求 borrowed
+`world_size` 严格等于 borrower 任务自己的 TP×DP×PP 拓扑，不能仅凭 claim 数改变模型并行拓扑。
 
 ## 当前已落代码的控制面能力
 
