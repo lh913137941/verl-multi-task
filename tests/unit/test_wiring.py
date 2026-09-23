@@ -579,6 +579,10 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     record = manager.borrowed_operations["borrower-lease"]
     assert record["state"] == "FAILED"
     assert record["replica_rank"] == 0
+    borrowed_key = ReplicaKey("task-a", "borrowed-0", 0)
+    assert record["replica_key"] == borrowed_key
+    assert manager.replica_kind[borrowed_key] is ReplicaKind.BORROWED
+    assert manager.replica_state[borrowed_key] is ReplicaState.QUARANTINED
     assert record["claim_ids"] == ["claim-0"]
     assert record["source_lease_ids"] == ["source-lease-0"]
     assert manager.next_replica_rank == 1

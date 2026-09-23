@@ -104,7 +104,7 @@ Lease(lease_id, claims, expires_at)
 
 - TaskRunner 使用有限并发，让原生长时间 `run()` 执行期间仍能处理 GS 的
   `submit_operation/query_operation`；operation journal 用锁保护；
-- 原生 STANDALONE replicas 初始化完成后登记为 `NATIVE/ACTIVE`，供 M 和空泡判断读取；
+- 原生 STANDALONE replicas 初始化完成后登记为 `NATIVE/ACTIVE`，供 M 和空泡判断读取；borrowed ADD 一经 Manager 接受就用同一 `ReplicaKey` 登记为 `BORROWED/CREATING`，创建结果未能证明成功时收口到 `QUARANTINED`，不会跳过 M 直接发布服务；
 - LB 复用当前 VERL router API，并补逐 request `ADMITTED/TERMINATED/SETTLED`；
 - 自然 release 进入 `SETTLED`；已验证 continuation 先进入 `TERMINATED`，随后由迟到 release 或退出提交收敛到 `SETTLED`；
 - GS 维护最小 Lease 账本，claim_id 永久绑定原 lease；首版整卡下同一 PG/bundle 与 GPU UUID 在 RELEASED 前不能被第二个 lease 重复授权；

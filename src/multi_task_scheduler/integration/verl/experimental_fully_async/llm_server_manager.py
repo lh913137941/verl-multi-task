@@ -422,10 +422,21 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             resolved_spec["claims"] = [dict(claim) for claim in normalized["claims"]]
             resolved_spec["lease_ids"] = list(normalized["lease_ids"])
             resolved_spec["replica_rank"] = rank
+            replica_key = ReplicaKey(
+                normalized["borrower_task_id"],
+                normalized["borrower_replica_id"],
+                normalized["placement_epoch"],
+            )
+            self.register_replica(
+                replica_key,
+                ReplicaKind.BORROWED,
+                state=ReplicaState.CREATING,
+            )
             record = {
                 "operation_id": normalized["operation_id"],
                 "lease_id": lease_id,
                 "borrower_task_id": normalized["borrower_task_id"],
+                "replica_key": replica_key,
                 "replica_rank": rank,
                 "claim_ids": [claim["claim_id"] for claim in normalized["claims"]],
                 "source_lease_ids": list(normalized["lease_ids"]),
@@ -455,6 +466,9 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         except BaseException as exc:
             async with self.replica_operation_lock:
                 current = self.borrowed_operations[lease_id]
+                replica_key = current["replica_key"]
+                if self.replica_state.get(replica_key) is ReplicaState.CREATING:
+                    self.transition_replica(replica_key, ReplicaState.QUARANTINED)
                 current["state"] = "FAILED"
                 current["error"] = {
                     "type": type(exc).__name__,
