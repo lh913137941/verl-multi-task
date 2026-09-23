@@ -127,23 +127,50 @@ def load_balancer_class():
         DEFAULT_ROUTING_CACHE_SIZE=128,
         ReplicaKey=ReplicaKey,
         AttemptState=AttemptState,
-        _TERMINAL_ATTEMPT_STATES={AttemptState.TERMINATED, AttemptState.SETTLED},
+        OperationEvidence=OperationEvidence,
+        EvidenceType=EvidenceType,
     )
 
 
-def test_terminated_request_still_blocks_route_removal():
+def test_admitted_request_blocks_removal_until_verified_continuation():
     key = ReplicaKey("task-a", "r0")
     lb = load_balancer_class()({"s0": object()}, initial_routes={key: "s0"})
     lb.acquire_server("request-1")
     lb.begin_drain(key)
-    lb.confirm_continuation("request-1", "client-1", "prefix-1")
-    lb.release_server("s0", request_id="request-1")
 
+    # Draining closes admission by dropping the server from the routing pool.
+    assert "s0" not in lb._servers
+
+    # An admitted request still owns its generation, so the route must stay.
     assert lb.has_unsettled_requests("s0")
-    with pytest.raises(ValueError, match="requests remain unsettled"):
+    with pytest.raises(ValueError, match="requests remain admitted"):
         lb.finish_remove(key)
-    lb.gc_settled_requests(["request-1"])
+
+    # A verified client continuation terminates the attempt on this server and
+    # records the handoff proof; the request stops blocking the route.
+    evidence = lb.confirm_continuation("request-1", "client-1", "prefix-1")
+    assert evidence.type is EvidenceType.EXIT_READY
     assert lb.query_attempt("request-1") is AttemptState.TERMINATED
+    assert not lb.has_unsettled_requests("s0")
+
+    # A late release must not erase the verified continuation terminal state.
+    lb.release_server("s0", request_id="request-1")
+    assert lb.query_attempt("request-1") is AttemptState.TERMINATED
+
+    lb.finish_remove(key)
+    assert key not in lb.routes
+
+
+def test_drained_server_leaves_the_routing_pool_for_new_requests():
+    key = ReplicaKey("task-a", "r0")
+    lb = load_balancer_class()(
+        {"s0": object(), "s1": object()}, initial_routes={key: "s0"}
+    )
+    lb.begin_drain(key)
+
+    server_id, _handle = lb.acquire_server("request-2")
+    assert server_id == "s1"
+    assert lb.query_attempt("request-2") is AttemptState.ADMITTED
 
 
 def test_wrong_server_release_does_not_change_native_inflight_count():

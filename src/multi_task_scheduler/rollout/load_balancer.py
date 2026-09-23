@@ -87,23 +87,23 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             raise TypeError("key must be ReplicaKey")
         return self.routes.get(key)
 
-    def commit_routable(self, key: ReplicaKey, server_id: str, handle):
-        if not isinstance(key, ReplicaKey):
-            raise TypeError("key must be ReplicaKey")
-        current = self.routes.get(key)
-        if current is not None and current != server_id:
-            raise ValueError("ReplicaKey already maps to another server")
-        if server_id not in self._servers:
-            self.add_servers({server_id: handle})
-        self.routes[key] = server_id
-
     def begin_drain(self, key: ReplicaKey):
+        """Close admission by removing the server from the routing pool.
+
+        The server is dropped from the native pool so least-loaded selection and
+        the sticky cache stop choosing it: native ``acquire_server`` honours a
+        removed server by clearing the stale sticky entry and re-selecting a
+        healthy replica. Request facts stay in ``routes``/``active_request_server``,
+        which the drain loop reads instead of the native sticky cache.
+        """
         if not isinstance(key, ReplicaKey):
             raise TypeError("key must be ReplicaKey")
         server_id = self.routes.get(key)
         if server_id is None:
             raise KeyError(key)
         self.draining_servers.add(server_id)
+        if server_id in self._servers:
+            self.remove_servers([server_id])
         return server_id
 
     def finish_remove(self, key: ReplicaKey):

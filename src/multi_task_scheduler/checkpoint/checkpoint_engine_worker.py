@@ -8,24 +8,19 @@ from verl.checkpoint_engine.base import CheckpointEngineWorker
 class MultiTaskCheckpointEngineWorker(CheckpointEngineWorker):
     """Keep transfer replay facts local to the checkpoint owner.
 
-    The worker records replay readiness only. Actual backend-specific weight
-    movement remains owned by the native VERL checkpoint implementation.
+    Replay readiness is reported only once a native backend can prove it moved
+    the weights; until then both hooks fail explicitly rather than synthesising
+    a READY record.
     """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._replay_records: dict[str, dict[str, str]] = {}
 
     def replay_current_weights(self, transfer_id: str):
         if not isinstance(transfer_id, str) or not transfer_id:
             raise ValueError("transfer_id must be a nonempty string")
-
-        record = {
-            "transfer_id": transfer_id,
-            "status": "READY",
-        }
-        self._replay_records[transfer_id] = record
-        return record.copy()
+        raise NotImplementedError(
+            "weight replay requires a verified native checkpoint transfer backend"
+        )
 
     def replay_status(self, transfer_id: str):
-        return self._replay_records.get(transfer_id)
+        raise NotImplementedError(
+            "replay status requires a verified native checkpoint transfer backend"
+        )

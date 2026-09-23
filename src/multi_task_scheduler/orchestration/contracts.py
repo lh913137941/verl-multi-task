@@ -57,6 +57,8 @@ class EvidenceType(str, Enum):
 
 @dataclass(frozen=True)
 class ReplicaKey:
+    """Stable logical replica identity shared by M/E/R/C views."""
+
     task_session: str
     replica_id: str
     runtime_epoch: int = 0
@@ -94,6 +96,8 @@ class OperationCommand:
 
 @dataclass
 class OperationRecord:
+    """TaskRunner-owned authoritative operation journal projection."""
+
     operation_id: str
     status: OperationStatus = OperationStatus.ACCEPTED
     result: str | None = None
@@ -108,6 +112,8 @@ class OperationRecord:
 
 @dataclass(frozen=True)
 class OperationEvidence:
+    """Cross-owner completion proof for one lifecycle operation stage."""
+
     operation_id: str
     type: EvidenceType
     timestamp: int
@@ -121,7 +127,10 @@ class OperationEvidence:
             raise ValueError("timestamp must be a nonnegative integer")
         if len(set(self.released_gpu_uuids)) != len(self.released_gpu_uuids):
             raise ValueError("released_gpu_uuids must not contain duplicates")
-        if any(not isinstance(value, str) or not value for value in self.released_gpu_uuids):
+        if any(
+            not isinstance(value, str) or not value
+            for value in self.released_gpu_uuids
+        ):
             raise ValueError("released_gpu_uuids must contain nonempty strings")
         if self.type is EvidenceType.RELEASED:
             if not self.released_gpu_uuids:
@@ -130,7 +139,13 @@ class OperationEvidence:
             raise ValueError("released_gpu_uuids are valid only for RELEASED evidence")
 
     @classmethod
-    def now(cls, operation_id: str, type: EvidenceType, *, released_gpu_uuids: tuple[str, ...] = ()) -> "OperationEvidence":
+    def now(
+        cls,
+        operation_id: str,
+        type: EvidenceType,
+        *,
+        released_gpu_uuids: tuple[str, ...] = (),
+    ) -> "OperationEvidence":
         return cls(
             operation_id=operation_id,
             type=type,
@@ -141,6 +156,8 @@ class OperationEvidence:
 
 @dataclass(frozen=True)
 class Lease:
+    """GS ledger entry: authorized claims and expiry, without a public state machine."""
+
     lease_id: str
     claims: tuple[Mapping[str, Any], ...]
     expires_at: float = 0.0
@@ -170,10 +187,19 @@ class Lease:
         uuids = [claim["gpu_uuid"] for claim in claims]
         if len(set(uuids)) != len(uuids):
             raise ValueError("lease claims must not repeat gpu_uuid")
-        if type(self.expires_at) not in (int, float) or not math.isfinite(float(self.expires_at)):
+        bundle_keys = [
+            (claim["pg_id"], claim["bundle_index"])
+            for claim in claims
+        ]
+        if len(set(bundle_keys)) != len(bundle_keys):
+            raise ValueError("lease claims must not repeat a PG bundle")
+
+        if type(self.expires_at) not in (int, float) or not math.isfinite(
+            float(self.expires_at)
+        ):
             raise ValueError("expires_at must be finite")
         if self.expires_at < 0:
-            raise ValueError("expires_at must be >= 0")
+            raise ValueError("expires_at must be >= 0 (0 means no fixed expiry)")
         object.__setattr__(self, "claims", claims)
         object.__setattr__(self, "expires_at", float(self.expires_at))
 

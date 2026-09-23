@@ -37,9 +37,6 @@ class MultiTaskvLLMReplica(vLLMReplica):
             replica_rank=self.replica_rank,
         )
 
-    def bind_lease(self, lease) -> None:
-        self.placement_claims = lease.claims
-
     def prepare_create(self) -> dict:
         raise NotImplementedError(
             "replica creation requires verified native runtime backend"
@@ -62,10 +59,9 @@ class MultiTaskvLLMReplica(vLLMReplica):
 
     def _setup_env_cuda_visible_devices(self, *args, **kwargs):
         if self.replica_kind is ReplicaKind.BORROWED:
-            if not self.placement_claims:
-                raise ValueError(
-                    "borrowed replica requires placement claims"
-                )
+            raise NotImplementedError(
+                "borrowed replica requires a verified lease-aware GPU binding backend"
+            )
         return super()._setup_env_cuda_visible_devices(*args, **kwargs)
 
     def abort_target(self, request_ids):

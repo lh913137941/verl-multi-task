@@ -28,7 +28,11 @@ from multi_task_scheduler.integration.verl.experimental_fully_async.trainer impo
     MultiTaskFullyAsyncTrainer,
 )
 from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
-from multi_task_scheduler.orchestration.contracts import AttemptState, ReplicaKey
+from multi_task_scheduler.orchestration.contracts import (
+    AttemptState,
+    EvidenceType,
+    ReplicaKey,
+)
 from multi_task_scheduler.orchestration.exactly_once import DuplicateCompletionError
 from multi_task_scheduler.rollout.load_balancer import MultiTaskGlobalRequestLoadBalancer
 
@@ -66,10 +70,9 @@ def test_late_release_does_not_erase_verified_continuation_terminal_state():
     server = object()
     lb = MultiTaskGlobalRequestLoadBalancer({"s": server}, full_determinism=True)
     lb.acquire_server("r")
-    assert (
-        lb.confirm_continuation("r", "client-1", "prefix-1")
-        is AttemptState.TERMINATED
-    )
+    evidence = lb.confirm_continuation("r", "client-1", "prefix-1")
+    assert evidence.type is EvidenceType.EXIT_READY
+    assert lb.query_attempt("r") is AttemptState.TERMINATED
     lb.release_server("s", request_id="r")
     assert lb.query_attempt("r") is AttemptState.TERMINATED
 
@@ -88,7 +91,7 @@ def test_initial_native_route_and_drain_keep_exact_request_facts():
     assert lb.begin_drain(key) == "s"
     assert "s" not in lb.get_all_servers()
     assert lb.requests_for_server("s") == ("r",)
-    with pytest.raises(ValueError, match="requests remain unsettled"):
+    with pytest.raises(ValueError, match="requests remain admitted"):
         lb.finish_remove(key)
 
     lb.release_server("s", request_id="r")
