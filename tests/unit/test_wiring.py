@@ -136,7 +136,7 @@ def test_admitted_request_blocks_removal_until_verified_continuation():
     key = ReplicaKey("task-a", "r0")
     lb = load_balancer_class()({"s0": object()}, initial_routes={key: "s0"})
     lb.acquire_server("request-1")
-    lb.begin_drain(key)
+    lb.begin_drain(key, "op")
 
     # Draining closes admission by dropping the server from the routing pool.
     assert "s0" not in lb._servers
@@ -150,14 +150,30 @@ def test_admitted_request_blocks_removal_until_verified_continuation():
     # records the handoff proof; the request stops blocking the route.
     evidence = lb.confirm_continuation("request-1", "client-1", "prefix-1")
     assert evidence.type is EvidenceType.EXIT_READY
+    assert evidence.operation_id == "op"
     assert lb.query_attempt("request-1") is AttemptState.TERMINATED
     assert not lb.has_unsettled_requests("s0")
 
-    # A late release must not erase the verified continuation terminal state.
+    # A late native release settles the already-verified terminal attempt.
     lb.release_server("s0", request_id="request-1")
-    assert lb.query_attempt("request-1") is AttemptState.TERMINATED
+    assert lb.query_attempt("request-1") is AttemptState.SETTLED
+    assert lb.requests_for_server("s0") == ()
 
     lb.finish_remove(key)
+    assert key not in lb.routes
+
+
+def test_finish_remove_settles_verified_continuation_without_late_release():
+    key = ReplicaKey("task-a", "r0")
+    lb = load_balancer_class()({"s0": object()}, initial_routes={key: "s0"})
+    lb.acquire_server("request-1")
+    lb.begin_drain(key, "op")
+    lb.confirm_continuation("request-1", "client-1", "prefix-1")
+
+    lb.finish_remove(key)
+
+    assert lb.query_attempt("request-1") is AttemptState.SETTLED
+    assert lb.requests_for_server("s0") == ()
     assert key not in lb.routes
 
 
@@ -166,7 +182,7 @@ def test_drained_server_leaves_the_routing_pool_for_new_requests():
     lb = load_balancer_class()(
         {"s0": object(), "s1": object()}, initial_routes={key: "s0"}
     )
-    lb.begin_drain(key)
+    lb.begin_drain(key, "op")
 
     server_id, _handle = lb.acquire_server("request-2")
     assert server_id == "s1"
@@ -375,7 +391,9 @@ def test_rollouter_natural_exit_separates_drain_from_service_commit():
     calls = []
 
     class LB:
-        begin_drain = AsyncRemoteMethod(lambda target: calls.append(("begin", target)) or "s0")
+        begin_drain = AsyncRemoteMethod(
+            lambda target, operation_id: calls.append(("begin", target, operation_id)) or "s0"
+        )
         has_unsettled_requests = AsyncRemoteMethod(lambda server_id: False)
         server_for_replica = AsyncRemoteMethod(lambda target: "s0")
         finish_remove = AsyncRemoteMethod(lambda target: calls.append(("finish", target)))
@@ -405,7 +423,7 @@ def test_rollouter_natural_exit_separates_drain_from_service_commit():
     assert exit_evidence.type is EvidenceType.EXIT_READY
     assert calls == [
         ("state", ReplicaState.DRAINING),
-        ("begin", key),
+        ("begin", key, "op"),
     ]
     assert rollouter.get_pending_target("op") == key
 

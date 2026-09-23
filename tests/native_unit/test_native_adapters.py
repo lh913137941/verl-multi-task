@@ -66,15 +66,22 @@ def test_lb_adds_only_request_exit_metadata():
     assert lb.query_attempt("r") is AttemptState.SETTLED
 
 
-def test_late_release_does_not_erase_verified_continuation_terminal_state():
+def test_late_release_settles_verified_continuation():
     server = object()
-    lb = MultiTaskGlobalRequestLoadBalancer({"s": server}, full_determinism=True)
+    key = ReplicaKey("task-a", "native-0")
+    lb = MultiTaskGlobalRequestLoadBalancer(
+        {"s": server},
+        full_determinism=True,
+        initial_routes={key: "s"},
+    )
     lb.acquire_server("r")
+    lb.begin_drain(key, "op")
     evidence = lb.confirm_continuation("r", "client-1", "prefix-1")
     assert evidence.type is EvidenceType.EXIT_READY
+    assert evidence.operation_id == "op"
     assert lb.query_attempt("r") is AttemptState.TERMINATED
     lb.release_server("s", request_id="r")
-    assert lb.query_attempt("r") is AttemptState.TERMINATED
+    assert lb.query_attempt("r") is AttemptState.SETTLED
 
 
 def test_initial_native_route_and_drain_keep_exact_request_facts():
@@ -88,7 +95,7 @@ def test_initial_native_route_and_drain_keep_exact_request_facts():
     assert lb.routes[key] == "s"
     lb.acquire_server("r")
 
-    assert lb.begin_drain(key) == "s"
+    assert lb.begin_drain(key, "op") == "s"
     assert "s" not in lb.get_all_servers()
     assert lb.requests_for_server("s") == ("r",)
     with pytest.raises(ValueError, match="requests remain admitted"):

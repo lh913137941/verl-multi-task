@@ -170,7 +170,7 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             )
 
         lb = manager.global_load_balancer
-        server_id = await lb.begin_drain.remote(replica_key)
+        server_id = await lb.begin_drain.remote(replica_key, operation_id)
 
         while await lb.has_unsettled_requests.remote(server_id):
             await asyncio.sleep(0.1)

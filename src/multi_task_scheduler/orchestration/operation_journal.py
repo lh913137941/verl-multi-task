@@ -14,7 +14,13 @@ _TERMINAL = {
     OperationStatus.FAILED,
     OperationStatus.UNKNOWN,
 }
-_RESOLVED = _TERMINAL
+_RESOLVED = {
+    OperationStatus.SUCCEEDED,
+    OperationStatus.FAILED,
+}
+# UNKNOWN means owner-side effects are not reconciled yet. It is terminal for
+# replay of the same operation, but it must keep the task's lifecycle slot
+# fenced until a real reconciliation path proves a resolved outcome.
 
 
 class OperationJournal:

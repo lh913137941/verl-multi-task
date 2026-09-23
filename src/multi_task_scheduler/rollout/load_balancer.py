@@ -25,6 +25,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         self.active_request_server: dict[str, str] = {}
         self.attempt_state: dict[str, AttemptState] = {}
         self.draining_servers: set[str] = set()
+        self.draining_operations: dict[str, str] = {}
         for key, server_id in dict(initial_routes or {}).items():
             if not isinstance(key, ReplicaKey):
                 raise TypeError("initial route key must be ReplicaKey")
@@ -41,7 +42,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
     def acquire_server(self, request_id: str, **extra):
         state = self.attempt_state.get(request_id)
         if state in {AttemptState.ADMITTED, AttemptState.TERMINATED}:
-            raise RuntimeError("request already owns an unsettled generation")
+            raise RuntimeError("request already has an unsettled generation")
         server_id, handle = super().acquire_server(request_id, **extra)
         if self._is_draining_server(server_id):
             super().release_server(server_id, request_id=request_id)
@@ -59,7 +60,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             if state is AttemptState.SETTLED:
                 return
         super().release_server(server_id, request_id=request_id)
-        if request_id and state is AttemptState.ADMITTED:
+        if request_id and state in {AttemptState.ADMITTED, AttemptState.TERMINATED}:
             self.attempt_state[request_id] = AttemptState.SETTLED
             self.active_request_server.pop(request_id, None)
 
@@ -72,8 +73,12 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             raise ValueError("continuation fields must be nonempty")
         if self.attempt_state.get(request_id) is not AttemptState.ADMITTED:
             raise ValueError("request is not eligible for continuation")
+        server_id = self.active_request_server.get(request_id)
+        operation_id = self.draining_operations.get(server_id)
+        if operation_id is None:
+            raise ValueError("request is not part of an active drain operation")
         self.attempt_state[request_id] = AttemptState.TERMINATED
-        return OperationEvidence.now(request_id, EvidenceType.EXIT_READY)
+        return OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
 
     def requests_for_server(self, server_id: str) -> tuple[str, ...]:
         return tuple(r for r, s in self.active_request_server.items() if s == server_id)
@@ -87,8 +92,8 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             raise TypeError("key must be ReplicaKey")
         return self.routes.get(key)
 
-    def begin_drain(self, key: ReplicaKey):
-        """Close admission by removing the server from the routing pool.
+    def begin_drain(self, key: ReplicaKey, operation_id: str):
+        """Close admission and bind the drain to one lifecycle operation.
 
         The server is dropped from the native pool so least-loaded selection and
         the sticky cache stop choosing it: native ``acquire_server`` honours a
@@ -98,10 +103,16 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         """
         if not isinstance(key, ReplicaKey):
             raise TypeError("key must be ReplicaKey")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("begin_drain requires operation_id")
         server_id = self.routes.get(key)
         if server_id is None:
             raise KeyError(key)
+        existing = self.draining_operations.get(server_id)
+        if existing is not None and existing != operation_id:
+            raise ValueError("server is already draining under another operation")
         self.draining_servers.add(server_id)
+        self.draining_operations[server_id] = operation_id
         if server_id in self._servers:
             self.remove_servers([server_id])
         return server_id
@@ -112,9 +123,18 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             return
         if self.has_unsettled_requests(server_id):
             raise ValueError("cannot remove route while requests remain admitted")
+
+        # TERMINATED is safe to stop serving; SETTLED is the point where the old
+        # server no longer owns the request in R. Keep SETTLED for ACK-loss query.
+        for request_id in self.requests_for_server(server_id):
+            if self.attempt_state.get(request_id) is AttemptState.TERMINATED:
+                self.attempt_state[request_id] = AttemptState.SETTLED
+                self.active_request_server.pop(request_id, None)
+
         if server_id in self._servers:
             self.remove_servers([server_id])
         self.draining_servers.discard(server_id)
+        self.draining_operations.pop(server_id, None)
         self.routes.pop(key, None)
 
     def gc_settled_requests(self, request_ids):

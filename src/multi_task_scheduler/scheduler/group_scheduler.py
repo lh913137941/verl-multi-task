@@ -53,9 +53,6 @@ class GroupScheduler:
     def get_task_runners(self) -> dict[str, ActorHandle]:
         return dict(self.task_runners)
 
-    def schedule(self) -> list:
-        return []
-
     def submit_idle_report(self, report):
         if not isinstance(report, dict):
             raise TypeError("submit_idle_report requires a metadata dict")
