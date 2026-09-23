@@ -1917,12 +1917,20 @@ def test_rollouter_verified_borrowed_destroy_commits_released():
     assert "op" not in rollouter._pending_operation_targets
 
 
-def test_rollouter_force_fails_before_mutating_m_without_verified_backend():
+def test_rollouter_force_requires_partial_rollout_before_mutating_m():
     cls = rollouter_class()
     rollouter = cls(object(), object())
     key = ReplicaKey("task-a", "r0")
+    rollouter.config = type(
+        "Config",
+        (),
+        {"async_training": type("Async", (), {"partial_rollout": False})()},
+    )()
+    rollouter._continuation_client_ready = True
 
     class Manager:
+        global_load_balancer = object()
+
         def __init__(self):
             self.replica_state = {key: ReplicaState.ACTIVE}
             self.replica_kind = {key: ReplicaKind.BORROWED}
@@ -1935,6 +1943,119 @@ def test_rollouter_force_fails_before_mutating_m_without_verified_backend():
 
     manager = Manager()
     rollouter.llm_server_manager = manager
-    with pytest.raises(NotImplementedError, match="targeted abort"):
+    with pytest.raises(RuntimeError, match="partial_rollout=true"):
         asyncio.run(rollouter.prepare_exit(key, operation_id="op", force=True))
+    assert manager.replica_state[key] is ReplicaState.ACTIVE
+
+
+def test_rollouter_force_aborts_target_and_waits_for_continuation_proof():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "borrowed-0")
+    rollouter.config = type(
+        "Config",
+        (),
+        {"async_training": type("Async", (), {"partial_rollout": True})()},
+    )()
+    rollouter._continuation_client_ready = True
+    calls = []
+
+    class LB:
+        def __init__(self):
+            self.unsettled = True
+
+        server_for_replica = AsyncRemoteMethod(lambda self_key: "s0")
+        get_all_servers = AsyncRemoteMethod(lambda: ["s0", "s1"])
+        begin_drain = AsyncRemoteMethod(
+            lambda target, operation_id: calls.append(("begin", target, operation_id)) or "s0"
+        )
+        has_unsettled_requests = AsyncRemoteMethod(lambda server_id: lb.unsettled)
+
+    lb = LB()
+
+    class Runtime:
+        async def abort_all_requests(self):
+            calls.append(("abort",))
+            # Simulate the continuation-aware client receiving VERL's aborted
+            # output and recording the handoff before native release/retry.
+            lb.unsettled = False
+
+    runtime = Runtime()
+
+    class Manager:
+        global_load_balancer = lb
+
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.ACTIVE}
+            self.replica_kind = {key: ReplicaKind.BORROWED}
+
+        def replica_meta(self, target):
+            return self.replica_kind[target], self.replica_state[target]
+
+        def inspect_runtime(self, target):
+            return runtime
+
+        def transition_replica(self, target, state):
+            self.replica_state[target] = state
+            calls.append(("state", state))
+
+    manager = Manager()
+    rollouter.llm_server_manager = manager
+
+    evidence = asyncio.run(
+        rollouter.prepare_exit(key, operation_id="op-force", force=True)
+    )
+
+    assert evidence.type is EvidenceType.EXIT_READY
+    assert evidence.operation_id == "op-force"
+    assert manager.replica_state[key] is ReplicaState.DRAINING
+    assert calls == [
+        ("state", ReplicaState.DRAINING),
+        ("begin", key, "op-force"),
+        ("abort",),
+    ]
+    assert rollouter.get_pending_target("op-force") == key
+
+
+def test_rollouter_force_requires_another_server_before_draining():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "borrowed-0")
+    rollouter.config = type(
+        "Config",
+        (),
+        {"async_training": type("Async", (), {"partial_rollout": True})()},
+    )()
+    rollouter._continuation_client_ready = True
+
+    class LB:
+        server_for_replica = AsyncRemoteMethod(lambda target: "s0")
+        get_all_servers = AsyncRemoteMethod(lambda: ["s0"])
+
+    class Runtime:
+        async def abort_all_requests(self):
+            raise AssertionError("abort must not run without a continuation target")
+
+    class Manager:
+        global_load_balancer = LB()
+
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.ACTIVE}
+            self.replica_kind = {key: ReplicaKind.BORROWED}
+
+        def replica_meta(self, target):
+            return self.replica_kind[target], self.replica_state[target]
+
+        def inspect_runtime(self, target):
+            return Runtime()
+
+        def transition_replica(self, target, state):
+            self.replica_state[target] = state
+
+    manager = Manager()
+    rollouter.llm_server_manager = manager
+    with pytest.raises(RuntimeError, match="another healthy rollout server"):
+        asyncio.run(
+            rollouter.prepare_exit(key, operation_id="op-force", force=True)
+        )
     assert manager.replica_state[key] is ReplicaState.ACTIVE
