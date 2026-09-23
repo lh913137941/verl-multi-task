@@ -126,6 +126,11 @@ def load_balancer_class():
                 self._servers.pop(server_id, None)
                 self._inflight_requests.pop(server_id, None)
 
+        def add_servers(self, servers):
+            for server_id, handle in dict(servers).items():
+                self._servers[server_id] = handle
+                self._inflight_requests.setdefault(server_id, 0)
+
     return isolated(
         "rollout/load_balancer.py",
         "MultiTaskGlobalRequestLoadBalancer",
