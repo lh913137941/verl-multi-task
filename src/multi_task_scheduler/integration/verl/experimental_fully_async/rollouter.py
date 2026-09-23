@@ -255,9 +255,51 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             EvidenceType.SERVICE_COMMITTED,
         )
 
-    def finalize_release(self, operation: OperationRecord):
+    def finalize_release(self, operation: OperationRecord) -> OperationEvidence:
+        """Close M only from verified runtime release evidence.
+
+        R/C/E were already committed before this phase. If the runtime backend
+        cannot prove sleep/destroy, M must not remain deceptively DRAINING: the
+        target is quarantined and the lifecycle operation stays unresolved.
+        """
         if not isinstance(operation, OperationRecord):
             raise TypeError("finalize_release requires OperationRecord")
-        raise NotImplementedError(
-            "finalize_release requires verified sleep/destroy and exact GPU release evidence"
-        )
+
+        target = self.get_pending_target(operation.operation_id)
+        manager = self.llm_server_manager
+        kind, state = manager.replica_meta(target)
+        if state is not ReplicaState.DRAINING:
+            raise ValueError(
+                f"finalize_release requires DRAINING replica, got {state.value}"
+            )
+
+        try:
+            if kind is ReplicaKind.NATIVE:
+                evidence = manager.sleep(
+                    target,
+                    operation_id=operation.operation_id,
+                )
+                target_state = ReplicaState.DORMANT
+            else:
+                evidence = manager.destroy(
+                    target,
+                    operation_id=operation.operation_id,
+                )
+                target_state = ReplicaState.RELEASED
+
+            if not isinstance(evidence, OperationEvidence):
+                raise TypeError("runtime release did not return OperationEvidence")
+            if evidence.operation_id != operation.operation_id:
+                raise ValueError("release evidence belongs to another operation")
+            if evidence.type is not EvidenceType.RELEASED:
+                raise ValueError(
+                    f"expected RELEASED evidence, got {evidence.type.value}"
+                )
+
+            manager.transition_replica(target, target_state)
+            self._pending_operation_targets.pop(operation.operation_id, None)
+            return evidence
+        except BaseException:
+            if manager.replica_state.get(target) is ReplicaState.DRAINING:
+                manager.transition_replica(target, ReplicaState.QUARANTINED)
+            raise
