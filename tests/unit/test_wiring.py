@@ -632,6 +632,163 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     assert manager.next_replica_rank == 1
 
 
+def replica_class():
+    class Parent:
+        def __init__(
+            self,
+            replica_rank,
+            config,
+            model_config,
+            gpus_per_node=8,
+            is_reward_model=False,
+            is_teacher_model=False,
+            name_suffix="",
+        ):
+            self.replica_rank = replica_rank
+            self.config = config
+            self.model_config = model_config
+            self.world_size = (
+                config.tensor_model_parallel_size
+                * config.data_parallel_size
+                * config.pipeline_model_parallel_size
+            )
+            self.gpus_per_node = gpus_per_node
+            self.gpus_per_replica_node = min(gpus_per_node, self.world_size)
+            self.nnodes = self.world_size // self.gpus_per_replica_node
+            self.is_reward_model = is_reward_model
+            self.is_teacher_model = is_teacher_model
+            self.name_suffix = name_suffix
+            self.workers = []
+            self.servers = []
+
+    fake_ray = type("ReplicaRay", (), {"remote": staticmethod(lambda cls: cls)})
+    return isolated(
+        "rollout/replica.py",
+        "MultiTaskvLLMReplica",
+        Parent,
+        ReplicaKind=ReplicaKind,
+        FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
+        RayClassWithInitArgs=object,
+        RayWorkerGroup=object,
+        ResourcePoolManager=object,
+        RolloutMode=object,
+        get_device_name=lambda: "cuda",
+        MultiTaskCheckpointEngineWorker=object,
+        MultiTaskvLLMHttpServer=object,
+        hashlib=__import__("hashlib"),
+        ray=fake_ray,
+    )
+
+
+def test_borrowed_worker_plan_is_deterministic_and_side_effect_free():
+    config = type(
+        "Config",
+        (),
+        {
+            "tensor_model_parallel_size": 1,
+            "data_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+        },
+    )()
+    cls = replica_class()
+    replica = cls(
+        replica_rank=7,
+        config=config,
+        model_config=object(),
+        replica_kind=ReplicaKind.BORROWED,
+        runtime_epoch=3,
+    )
+    spec = {
+        "operation_id": "op-add",
+        "lease_id": "lease-1",
+        "replica_rank": 7,
+        "placement_epoch": 3,
+        "world_size": 1,
+        "max_colocate_count": FIRST_RELEASE_MAX_COLOCATE_COUNT,
+        "claims": [
+            {
+                "claim_id": "claim-0",
+                "rank": 0,
+                "pg_id": "pg",
+                "bundle_index": 4,
+                "node_id": "node-a",
+                "gpu_uuid": "GPU-0",
+                "node_rank": 0,
+                "local_rank": 0,
+                "gpu_fraction": FIRST_RELEASE_RAY_GPU_FRACTION,
+                "cpu_request": 1.0,
+            }
+        ],
+    }
+
+    first = replica.build_borrowed_worker_plan(spec)
+    second = replica.build_borrowed_worker_plan(spec)
+
+    assert first == second
+    assert first[0]["actor_name"].startswith("borrowed_ce_7_")
+    assert first[0]["pg_id"] == "pg"
+    assert first[0]["bundle_index"] == 4
+    assert first[0]["num_gpus"] == FIRST_RELEASE_RAY_GPU_FRACTION
+    assert first[0]["env_vars"] == {
+        "WORLD_SIZE": "1",
+        "RANK": "0",
+        "RAY_LOCAL_WORLD_SIZE": "1",
+        "WG_PREFIX": first[0]["env_vars"]["WG_PREFIX"],
+        "WG_BACKEND": "ray",
+    }
+    assert replica.placement_claims[0]["claim_id"] == "claim-0"
+
+
+def test_borrowed_worker_plan_rejects_donor_topology_or_wrong_identity():
+    config = type(
+        "Config",
+        (),
+        {
+            "tensor_model_parallel_size": 1,
+            "data_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+        },
+    )()
+    replica = replica_class()(
+        replica_rank=2,
+        config=config,
+        model_config=object(),
+        replica_kind=ReplicaKind.BORROWED,
+        runtime_epoch=1,
+    )
+    base = {
+        "operation_id": "op-add",
+        "lease_id": "lease-1",
+        "replica_rank": 2,
+        "placement_epoch": 1,
+        "world_size": 1,
+        "max_colocate_count": FIRST_RELEASE_MAX_COLOCATE_COUNT,
+        "claims": [
+            {
+                "claim_id": "claim-0",
+                "rank": 0,
+                "pg_id": "pg",
+                "bundle_index": 0,
+                "node_id": "node-a",
+                "gpu_uuid": "GPU-0",
+                "node_rank": 0,
+                "local_rank": 0,
+                "gpu_fraction": FIRST_RELEASE_RAY_GPU_FRACTION,
+                "cpu_request": 1.0,
+            }
+        ],
+    }
+
+    wrong_rank = dict(base, replica_rank=3)
+    with pytest.raises(ValueError, match="replica_rank"):
+        replica.build_borrowed_worker_plan(wrong_rank)
+
+    donor_layout = dict(base)
+    donor_layout["claims"] = [dict(base["claims"][0], node_rank=9)]
+    with pytest.raises(ValueError, match="one-node borrower rank layout"):
+        replica.build_borrowed_worker_plan(donor_layout)
+
+
 def checkpoint_manager_class():
     class Parent:
         def __init__(self, config=None, actor_wg=None, replicas=None):
