@@ -14,6 +14,7 @@ _TERMINAL = {
     OperationStatus.FAILED,
     OperationStatus.UNKNOWN,
 }
+_RESOLVED = {OperationStatus.SUCCEEDED, OperationStatus.FAILED}
 
 
 class OperationJournal:
@@ -39,7 +40,7 @@ class OperationJournal:
         active_id = self._active_by_task.get(task_session)
         if active_id is not None:
             active = self._records[active_id]
-            if active.status not in _TERMINAL:
+            if active.status not in _RESOLVED:
                 raise OperationIdentityError(
                     f"another lifecycle operation is active for task {task_session!r}: {active_id!r}"
                 )
@@ -83,7 +84,7 @@ class OperationJournal:
         record.status = status
         record.result = result
         command = self._commands[operation_id]
-        if self._active_by_task.get(command.target.task_session) == operation_id:
+        if status in _RESOLVED and self._active_by_task.get(command.target.task_session) == operation_id:
             self._active_by_task.pop(command.target.task_session, None)
         return record
 
@@ -91,7 +92,7 @@ class OperationJournal:
         operation_id = self._active_by_task.get(task_session)
         if operation_id is None:
             return None
-        if self._records[operation_id].status in _TERMINAL:
+        if self._records[operation_id].status in _RESOLVED:
             self._active_by_task.pop(task_session, None)
             return None
         return operation_id

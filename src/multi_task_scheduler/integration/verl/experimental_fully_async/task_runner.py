@@ -77,17 +77,9 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
 
     @staticmethod
     def _failure_status(exc: BaseException) -> OperationStatus:
-        unknown_types = tuple(
-            error_type
-            for error_type in (
-                getattr(ray.exceptions, "GetTimeoutError", None),
-                getattr(ray.exceptions, "RayActorError", None),
-            )
-            if isinstance(error_type, type)
-        )
-        if unknown_types and isinstance(exc, unknown_types):
-            return OperationStatus.UNKNOWN
-        return OperationStatus.FAILED
+        # Once a lifecycle worker starts, an exception does not prove which
+        # owner-side effects completed. Keep the task fenced for reconciliation.
+        return OperationStatus.UNKNOWN
 
     def _launch_operation(self, operation_id: str) -> None:
         worker = threading.Thread(

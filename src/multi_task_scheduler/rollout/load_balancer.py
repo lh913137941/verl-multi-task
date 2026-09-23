@@ -53,18 +53,19 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         return server_id, handle
 
     def release_server(self, server_id: str, request_id: str | None = None) -> None:
+        state = self.attempt_state.get(request_id) if request_id is not None else None
+        if request_id is not None:
+            owner = self.active_request_server.get(request_id)
+            if owner is not None and owner != server_id:
+                raise ValueError("request_id release belongs to another server")
+            if state is AttemptState.SETTLED:
+                return
         super().release_server(server_id, request_id=request_id)
-        if request_id is None:
-            return
-        owner = self.active_request_server.get(request_id)
-        if owner is not None and owner != server_id:
-            raise ValueError("request_id release belongs to another server")
-        state = self.attempt_state.get(request_id)
-        if state is None:
+        if request_id is None or state is None:
             return
         if state is AttemptState.ADMITTED:
             self.attempt_state[request_id] = AttemptState.SETTLED
-        self.active_request_server.pop(request_id, None)
+            self.active_request_server.pop(request_id, None)
 
     def query_attempt(self, request_id: str) -> AttemptState | None:
         return self.attempt_state.get(request_id)
@@ -98,7 +99,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
 
     def has_unsettled_requests(self, server_id: str) -> bool:
         return any(
-            self.attempt_state.get(request_id) not in _TERMINAL_ATTEMPT_STATES
+            self.attempt_state.get(request_id) is not AttemptState.SETTLED
             for request_id in self.requests_for_server(server_id)
         )
 
@@ -140,6 +141,6 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
 
     def gc_settled_requests(self, request_ids) -> None:
         for request_id in request_ids:
-            if self.attempt_state.get(request_id) in _TERMINAL_ATTEMPT_STATES:
+            if self.attempt_state.get(request_id) is AttemptState.SETTLED:
                 self.attempt_state.pop(request_id, None)
                 self.active_request_server.pop(request_id, None)

@@ -17,3 +17,15 @@ def test_conflicting_replay_and_terminal_rewrite_fail():
     with pytest.raises(OperationIdentityError): j.begin(command("op-1", "r1"))
     j.finish("op-1", OperationStatus.FAILED, "failed")
     with pytest.raises(OperationIdentityError): j.finish("op-1", OperationStatus.UNKNOWN, "lost")
+
+
+def test_unknown_outcome_keeps_task_fenced_until_reconciled():
+    journal = OperationJournal()
+    first = command()
+    journal.begin(first)
+    journal.finish(first.operation_id, OperationStatus.UNKNOWN, "owner response lost")
+
+    assert journal.active_operation(first.target.task_session) == first.operation_id
+    assert journal.begin(first).status is OperationStatus.UNKNOWN
+    with pytest.raises(OperationIdentityError, match="another lifecycle operation"):
+        journal.begin(command("op-2", "r1"))

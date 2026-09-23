@@ -7,6 +7,7 @@ import pytest
 
 from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
+    AttemptState,
     OperationCommand,
     OperationEvidence,
     OperationKind,
@@ -95,7 +96,65 @@ def taskrunner_class():
         EvidenceType=EvidenceType,
         threading=threading,
         ray=FakeRay,
+        logger=type("Logger", (), {"exception": lambda *args, **kwargs: None})(),
     )
+
+
+def load_balancer_class():
+    class Parent:
+        def __init__(self, servers, **kwargs):
+            self._servers = dict(servers)
+            self._inflight_requests = {server_id: 0 for server_id in servers}
+
+        def acquire_server(self, request_id, **extra):
+            server_id = next(iter(self._servers))
+            self._inflight_requests[server_id] += 1
+            return server_id, self._servers[server_id]
+
+        def release_server(self, server_id, request_id=None):
+            if server_id in self._inflight_requests:
+                self._inflight_requests[server_id] -= 1
+
+        def remove_servers(self, server_ids):
+            for server_id in server_ids:
+                self._servers.pop(server_id, None)
+                self._inflight_requests.pop(server_id, None)
+
+    return isolated(
+        "rollout/load_balancer.py",
+        "MultiTaskGlobalRequestLoadBalancer",
+        Parent,
+        DEFAULT_ROUTING_CACHE_SIZE=128,
+        ReplicaKey=ReplicaKey,
+        AttemptState=AttemptState,
+        _TERMINAL_ATTEMPT_STATES={AttemptState.TERMINATED, AttemptState.SETTLED},
+    )
+
+
+def test_terminated_request_still_blocks_route_removal():
+    key = ReplicaKey("task-a", "r0")
+    lb = load_balancer_class()({"s0": object()}, initial_routes={key: "s0"})
+    lb.acquire_server("request-1")
+    lb.begin_drain(key)
+    lb.confirm_continuation("request-1", "client-1", "prefix-1")
+    lb.release_server("s0", request_id="request-1")
+
+    assert lb.has_unsettled_requests("s0")
+    with pytest.raises(ValueError, match="requests remain unsettled"):
+        lb.finish_remove(key)
+    lb.gc_settled_requests(["request-1"])
+    assert lb.query_attempt("request-1") is AttemptState.TERMINATED
+
+
+def test_wrong_server_release_does_not_change_native_inflight_count():
+    lb = load_balancer_class()({"s0": object(), "s1": object()})
+    lb.acquire_server("request-1")
+    lb._inflight_requests["s1"] = 1
+
+    with pytest.raises(ValueError, match="another server"):
+        lb.release_server("s1", request_id="request-1")
+    assert lb._inflight_requests["s1"] == 1
+    assert lb.query_attempt("request-1") is AttemptState.ADMITTED
 
 
 def test_taskrunner_minimal_journal_surface_and_replay_does_not_relaunch():
@@ -150,6 +209,44 @@ def test_taskrunner_executes_add_and_commits_terminal_record():
     record = runner.query_operation("op")
     assert record.status is OperationStatus.SUCCEEDED
     assert record.result == EvidenceType.SERVICE_COMMITTED.value
+
+
+def test_release_failure_after_service_commit_keeps_operation_unknown_and_fenced():
+    runner = taskrunner_class()()
+    runner.task_session = "task-a"
+    runner._control_ready = True
+    runner._launch_operation = lambda operation_id: None
+    key = ReplicaKey("task-a", "r0")
+
+    class Rollouter:
+        prepare_exit = RemoteMethod(
+            lambda target, **kwargs: OperationEvidence(
+                kwargs["operation_id"], EvidenceType.EXIT_READY, 1
+            )
+        )
+        finalize_release = RemoteMethod(
+            lambda operation: (_ for _ in ()).throw(
+                NotImplementedError("native sleep not verified")
+            )
+        )
+
+    class Trainer:
+        remove_and_commit = RemoteMethod(
+            lambda operation: OperationEvidence(
+                operation.operation_id, EvidenceType.SERVICE_COMMITTED, 2
+            )
+        )
+
+    runner.components = {"rollouter": Rollouter(), "trainer": Trainer()}
+    runner.submit_operation(OperationCommand("op-1", OperationKind.DONATE, key, "l1"))
+    runner._execute_operation("op-1")
+
+    assert runner.query_operation("op-1").status is OperationStatus.UNKNOWN
+    assert runner._ensure_journal().active_operation("task-a") == "op-1"
+    with pytest.raises(Exception, match="another lifecycle operation"):
+        runner.submit_operation(
+            OperationCommand("op-2", OperationKind.DONATE, key, "l1")
+        )
 
 
 def test_manager_owns_state_kind_and_runtime_inventory_separately():

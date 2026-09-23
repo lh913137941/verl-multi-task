@@ -1,1 +1,4 @@
-"""Source-first MultiTask integration for experimental Fully Async."""\n\n__version__ = "0.1.0.dev0"\nIMPLEMENTATION_STAGE = "092203_CONTROL_PLANE_AND_NATIVE_BINDINGS"\n
+"""Source-first MultiTask integration for experimental Fully Async."""
+
+__version__ = "0.1.0.dev0"
+IMPLEMENTATION_STAGE = "092203_CONTROL_PLANE_AND_NATIVE_BINDINGS"
