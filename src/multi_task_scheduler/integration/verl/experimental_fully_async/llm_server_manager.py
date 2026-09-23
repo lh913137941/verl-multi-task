@@ -8,7 +8,14 @@ import ray
 from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncLLMServerManager
 from verl.workers.rollout.router import DEFAULT_ROUTING_CACHE_SIZE
 
-from multi_task_scheduler.orchestration.contracts import Lease, ReplicaKey, ReplicaKind, ReplicaState
+from multi_task_scheduler.orchestration.contracts import (
+    FIRST_RELEASE_MAX_COLOCATE_COUNT,
+    FIRST_RELEASE_RAY_GPU_FRACTION,
+    Lease,
+    ReplicaKey,
+    ReplicaKind,
+    ReplicaState,
+)
 from multi_task_scheduler.rollout.load_balancer import MultiTaskGlobalRequestLoadBalancer
 from multi_task_scheduler.rollout.replica import MultiTaskvLLMReplica
 
@@ -211,9 +218,15 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 f"parallel topology ({configured_world_size})"
             )
 
-        max_colocate_count = spec.get("max_colocate_count", 1)
-        if type(max_colocate_count) is not int or max_colocate_count <= 0:
-            raise ValueError("max_colocate_count must be a positive integer")
+        max_colocate_count = spec.get(
+            "max_colocate_count",
+            FIRST_RELEASE_MAX_COLOCATE_COUNT,
+        )
+        if max_colocate_count != FIRST_RELEASE_MAX_COLOCATE_COUNT:
+            raise ValueError(
+                "first release max_colocate_count must match the native "
+                f"Ray accounting layout ({FIRST_RELEASE_MAX_COLOCATE_COUNT})"
+            )
 
         placement_epoch = spec.get("placement_epoch", 0)
         if type(placement_epoch) is not int or placement_epoch < 0:
@@ -235,6 +248,11 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
 
         claims = [dict(claim) for claim in lease.claims]
         for rank, claim in enumerate(claims):
+            if claim["gpu_fraction"] != FIRST_RELEASE_RAY_GPU_FRACTION:
+                raise ValueError(
+                    "borrowed claim Ray GPU share does not match "
+                    "max_colocate_count"
+                )
             supplied_rank = claim.get("rank", rank)
             if type(supplied_rank) is not int or supplied_rank != rank:
                 raise ValueError(

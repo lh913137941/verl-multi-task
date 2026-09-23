@@ -15,6 +15,7 @@ from verl.trainer.ppo.utils import Role
 from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
 from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
+    FIRST_RELEASE_MAX_COLOCATE_COUNT,
     Lease,
     OperationCommand,
     OperationEvidence,
@@ -90,7 +91,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             "replica_rank": None,
             "selected_slots": selected_slots,
             "world_size": len(selected_slots),
-            "max_colocate_count": 1,
+            "max_colocate_count": FIRST_RELEASE_MAX_COLOCATE_COUNT,
             "expires_at": lease.expires_at,
             "placement_epoch": command.target.runtime_epoch,
         }

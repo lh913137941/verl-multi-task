@@ -9,6 +9,8 @@ import pytest
 from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
     AttemptState,
+    FIRST_RELEASE_MAX_COLOCATE_COUNT,
+    FIRST_RELEASE_RAY_GPU_FRACTION,
     Lease,
     OperationCommand,
     OperationEvidence,
@@ -99,6 +101,7 @@ def taskrunner_class():
         EvidenceType=EvidenceType,
         threading=threading,
         ray=FakeRay,
+        FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
         logger=type("Logger", (), {"exception": lambda *args, **kwargs: None})(),
     )
 
@@ -236,6 +239,8 @@ def taskrunner_lease():
                 "bundle_index": 0,
                 "node_id": "n0",
                 "gpu_uuid": "u0",
+                "gpu_fraction": FIRST_RELEASE_RAY_GPU_FRACTION,
+                "cpu_request": 1.0,
                 "node_rank": 0,
                 "local_rank": 0,
             },
@@ -309,6 +314,11 @@ def test_taskrunner_executes_add_and_commits_terminal_record():
     assert spec["borrower_task_id"] == "task-a"
     assert spec["borrower_replica_id"] == "r0"
     assert spec["selected_slots"][0]["rank"] == 0
+    assert spec["max_colocate_count"] == FIRST_RELEASE_MAX_COLOCATE_COUNT
+    assert (
+        spec["selected_slots"][0]["gpu_fraction"]
+        == FIRST_RELEASE_RAY_GPU_FRACTION
+    )
 
 
 def test_taskrunner_borrowed_spec_rebuilds_rank_view_from_claim_order():
@@ -482,6 +492,8 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         ReplicaKind=ReplicaKind,
         ReplicaState=ReplicaState,
         Lease=Lease,
+        FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
+        FIRST_RELEASE_RAY_GPU_FRACTION=FIRST_RELEASE_RAY_GPU_FRACTION,
         asyncio=asyncio,
         ray=fake_ray,
         time=time,
@@ -520,18 +532,19 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
                 "gpu_uuid": "u0",
                 "node_rank": 0,
                 "local_rank": 0,
-                "gpu_fraction": 1.0,
+                "gpu_fraction": FIRST_RELEASE_RAY_GPU_FRACTION,
                 "cpu_request": 1.0,
             }
         ],
         "world_size": 1,
-        "max_colocate_count": 1,
+        "max_colocate_count": FIRST_RELEASE_MAX_COLOCATE_COUNT,
         "replica_rank": None,
         "expires_at": 0,
         "placement_epoch": 0,
     }
     normalized = manager.validate_borrowed_spec(valid_spec)
     assert "selected_slots" not in normalized
+    assert normalized["max_colocate_count"] == FIRST_RELEASE_MAX_COLOCATE_COUNT
     assert normalized["claims"][0]["rank"] == 0
     assert normalized["lease_ids"] == ["source-lease-0"]
 
@@ -547,6 +560,17 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     with pytest.raises(ValueError, match="parallel topology"):
         manager.validate_borrowed_spec(valid_spec)
     manager.rollout_config.tensor_model_parallel_size = 1
+
+    wrong_m = dict(valid_spec, max_colocate_count=1)
+    with pytest.raises(ValueError, match="max_colocate_count"):
+        manager.validate_borrowed_spec(wrong_m)
+
+    wrong_share = dict(valid_spec)
+    wrong_share["selected_slots"] = [
+        dict(valid_spec["selected_slots"][0], gpu_fraction=1.0)
+    ]
+    with pytest.raises(ValueError, match="Ray GPU accounting share"):
+        manager.validate_borrowed_spec(wrong_share)
 
     expired = dict(valid_spec, expires_at=time.time() - 1)
     with pytest.raises(ValueError, match="expired"):

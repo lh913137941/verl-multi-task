@@ -3,6 +3,8 @@ import pytest
 from multi_task_scheduler.orchestration.contracts import (
     AttemptState,
     EvidenceType,
+    FIRST_RELEASE_MAX_COLOCATE_COUNT,
+    FIRST_RELEASE_RAY_GPU_FRACTION,
     Lease,
     OperationCommand,
     OperationEvidence,
@@ -25,6 +27,8 @@ def claim(**overrides):
         "bundle_index": 0,
         "node_id": "n0",
         "gpu_uuid": "u0",
+        "gpu_fraction": FIRST_RELEASE_RAY_GPU_FRACTION,
+        "cpu_request": 1.0,
     }
     value.update(overrides)
     return value
@@ -123,9 +127,13 @@ def test_first_release_lease_rejects_claims_from_multiple_donor_replicas():
         )
 
 
-def test_first_release_lease_is_whole_gpu_and_has_unique_bundle_and_uuid():
-    with pytest.raises(ValueError, match="whole-GPU"):
-        Lease("l1", (claim(gpu_fraction=0.5),), 0)
+def test_first_release_lease_uses_fixed_ray_share_and_unique_physical_gpu():
+    assert FIRST_RELEASE_MAX_COLOCATE_COUNT == 2
+    lease = Lease("l1", (claim(),), 0)
+    assert lease.claims[0]["gpu_fraction"] == 0.5
+
+    with pytest.raises(ValueError, match="Ray GPU accounting share"):
+        Lease("l1", (claim(gpu_fraction=1.0),), 0)
     with pytest.raises(ValueError, match="repeat gpu_uuid"):
         Lease(
             "l1",

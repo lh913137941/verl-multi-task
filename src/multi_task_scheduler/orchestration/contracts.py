@@ -13,6 +13,13 @@ from enum import Enum
 from typing import Any, Mapping
 
 
+# Physical whole-GPU exclusivity is a GS ownership rule. Ray still needs room
+# in the donor PG bundle for the retained dormant CE actor plus one borrower CE
+# actor, so each actor uses this accounting share in the first release.
+FIRST_RELEASE_MAX_COLOCATE_COUNT = 2
+FIRST_RELEASE_RAY_GPU_FRACTION = 1.0 / FIRST_RELEASE_MAX_COLOCATE_COUNT
+
+
 class ReplicaKind(str, Enum):
     NATIVE = "NATIVE"
     BORROWED = "BORROWED"
@@ -205,14 +212,25 @@ class Lease:
             bundle_index = claim.get("bundle_index")
             if type(bundle_index) is not int or bundle_index < 0:
                 raise ValueError("each claim requires a nonnegative integer bundle_index")
-            gpu_fraction = claim.get("gpu_fraction", 1.0)
-            if type(gpu_fraction) not in (int, float) or float(gpu_fraction) != 1.0:
-                raise ValueError("first release requires whole-GPU claims")
-            cpu_request = claim.get("cpu_request", 0.0)
-            if type(cpu_request) not in (int, float) or float(cpu_request) < 0:
-                raise ValueError("cpu_request must be nonnegative")
+            gpu_fraction = claim.get(
+                "gpu_fraction",
+                FIRST_RELEASE_RAY_GPU_FRACTION,
+            )
+            if (
+                type(gpu_fraction) not in (int, float)
+                or float(gpu_fraction) != FIRST_RELEASE_RAY_GPU_FRACTION
+            ):
+                raise ValueError(
+                    "first release requires the Ray GPU accounting share "
+                    f"{FIRST_RELEASE_RAY_GPU_FRACTION}"
+                )
+            cpu_request = claim.get("cpu_request", 1.0)
+            if type(cpu_request) not in (int, float) or float(cpu_request) != 1.0:
+                raise ValueError("first release requires cpu_request=1.0")
 
             normalized = dict(claim)
+            normalized["gpu_fraction"] = float(gpu_fraction)
+            normalized["cpu_request"] = float(cpu_request)
             normalized["source_lease_id"] = source_lease_id
             normalized.pop("lease_id", None)
             normalized_claims.append(normalized)

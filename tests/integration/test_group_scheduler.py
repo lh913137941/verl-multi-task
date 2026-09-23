@@ -43,6 +43,8 @@ def claim(
         "pg_id": "pg",
         "bundle_index": bundle_index,
         "node_id": "n0",
+        "gpu_fraction": 0.5,
+        "cpu_request": 1.0,
     }
 
 
