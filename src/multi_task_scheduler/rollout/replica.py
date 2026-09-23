@@ -1,9 +1,11 @@
 """Native vLLM replica extension for the supported STANDALONE profile."""
 
+import asyncio
 import hashlib
 
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from ray.util.state import list_actors
 
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import get_master_addr_port
@@ -198,6 +200,89 @@ class MultiTaskvLLMReplica(vLLMReplica):
             )
         ).remote()
 
+    async def validate_worker_placement(self) -> tuple[dict, ...]:
+        """Verify each borrower CE actor landed on the claimed node/GPU UUID."""
+        claims = tuple(self.placement_claims or ())
+        if len(self.workers) != len(claims):
+            raise RuntimeError(
+                "borrower worker count does not match normalized placement claims"
+            )
+        placements = await asyncio.gather(
+            *[worker.runtime_placement.remote() for worker in self.workers]
+        )
+        for claim, actual in zip(claims, placements, strict=True):
+            if not isinstance(actual, dict):
+                raise TypeError("runtime placement probe returned a non-dict result")
+            if actual.get("node_id") != claim["node_id"]:
+                raise RuntimeError(
+                    f"borrower rank {claim['rank']} landed on unexpected node"
+                )
+            if actual.get("gpu_uuid") != claim["gpu_uuid"]:
+                raise RuntimeError(
+                    f"borrower rank {claim['rank']} landed on unexpected GPU UUID"
+                )
+        self.borrowed_worker_placement = tuple(dict(item) for item in placements)
+        return self.borrowed_worker_placement
+
+    @staticmethod
+    def _non_dead_actor_names(
+        names: tuple[str, ...],
+        namespace: str,
+    ) -> tuple[str, ...]:
+        active = []
+        for name in names:
+            states = list_actors(
+                filters=[
+                    ("ray_namespace", "=", namespace),
+                    ("name", "=", name),
+                ]
+            )
+            for state in states:
+                value = state.state if hasattr(state, "state") else state["state"]
+                if value != "DEAD":
+                    active.append(name)
+                    break
+        return tuple(active)
+
+    async def _wait_actor_names_dead(
+        self,
+        names: tuple[str, ...],
+        *,
+        timeout_s: float = 10.0,
+    ) -> None:
+        if not names:
+            return
+        namespace = ray.get_runtime_context().namespace
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while True:
+            active = await asyncio.to_thread(
+                self._non_dead_actor_names,
+                names,
+                namespace,
+            )
+            if not active:
+                return
+            if loop.time() >= deadline:
+                raise RuntimeError(
+                    f"Ray actors did not reach DEAD before timeout: {active!r}"
+                )
+            await asyncio.sleep(0.1)
+
+    async def _kill_workers_verified(
+        self,
+        workers,
+        names: tuple[str, ...],
+    ) -> None:
+        for worker in workers:
+            try:
+                ray.kill(worker, no_restart=True)
+            except BaseException:
+                # Kill acknowledgement is not release proof. The state query
+                # below remains authoritative for this cleanup attempt.
+                pass
+        await self._wait_actor_names_dead(names)
+
     async def _create_workers_from_claims(
         self,
         spec: dict,
@@ -263,20 +348,18 @@ class MultiTaskvLLMReplica(vLLMReplica):
             )
             self.workers = list(worker_group.workers)
             self.borrowed_worker_names = tuple(names)
+            await self.validate_worker_placement()
             return worker_group
         except BaseException as exc:
-            cleanup_errors = []
-            for created in workers:
-                try:
-                    ray.kill(created, no_restart=True)
-                except BaseException as cleanup_exc:
-                    cleanup_errors.append(cleanup_exc)
-            self.workers = []
-            if cleanup_errors:
+            try:
+                await self._kill_workers_verified(workers, tuple(names))
+            except BaseException as cleanup_exc:
+                self.workers = []
                 raise RuntimeError(
                     "borrowed CE creation failed and actor cleanup is unverified"
-                ) from exc
-            raise
+                ) from cleanup_exc
+            self.workers = []
+            raise exc
 
     def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
         return RayClassWithInitArgs(

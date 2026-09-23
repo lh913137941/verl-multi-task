@@ -847,8 +847,23 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
             self.servers = []
 
     created = []
+    killed = []
+
+    class FakeHandle:
+        def __init__(self, record, *, gpu_uuid="GPU-x"):
+            self.record = record
+            self.runtime_placement = AsyncRemoteMethod(
+                lambda: {
+                    "node_id": "node",
+                    "accelerator_id": "0",
+                    "gpu_uuid": gpu_uuid,
+                    "visible_devices": "0",
+                }
+            )
 
     class FakeCIA:
+        next_gpu_uuid = "GPU-x"
+
         def __init__(self, cls, *args, **kwargs):
             self.cls = cls
             self.args = args
@@ -859,10 +874,13 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
             self.options.update(options)
 
         def __call__(self, **kwargs):
-            handle = {
-                "options": dict(self.options),
-                "placement": dict(kwargs),
-            }
+            handle = FakeHandle(
+                {
+                    "options": dict(self.options),
+                    "placement": dict(kwargs),
+                },
+                gpu_uuid=type(self).next_gpu_uuid,
+            )
             created.append(handle)
             return handle
 
@@ -879,7 +897,10 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
         (),
         {
             "remote": staticmethod(lambda cls: cls),
-            "kill": staticmethod(lambda *args, **kwargs: None),
+            "kill": staticmethod(lambda worker, **kwargs: killed.append(worker)),
+            "get_runtime_context": staticmethod(
+                lambda: type("Context", (), {"namespace": "test"})()
+            ),
         },
     )
     cls = isolated(
@@ -898,6 +919,8 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
         MultiTaskCheckpointEngineWorker=object,
         MultiTaskvLLMHttpServer=object,
         hashlib=__import__("hashlib"),
+        asyncio=asyncio,
+        list_actors=lambda **kwargs: [],
         ray=fake_ray,
     )
     config = type(
@@ -949,17 +972,34 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
 
     assert group.workers == created
     assert len(created) == 1
-    assert created[0]["placement"]["placement_group"] == "PG"
-    assert created[0]["placement"]["placement_group_bundle_idx"] == 2
-    assert created[0]["placement"]["num_gpus"] == FIRST_RELEASE_RAY_GPU_FRACTION
-    env = created[0]["options"]["runtime_env"]["env_vars"]
+    record = created[0].record
+    assert record["placement"]["placement_group"] == "PG"
+    assert record["placement"]["placement_group_bundle_idx"] == 2
+    assert record["placement"]["num_gpus"] == FIRST_RELEASE_RAY_GPU_FRACTION
+    env = record["options"]["runtime_env"]["env_vars"]
     assert env["MASTER_ADDR"] == "127.0.0.1"
     assert env["MASTER_PORT"] == "23456"
     assert env["WORLD_SIZE"] == "1"
     assert env["RANK"] == "0"
     assert replica.borrowed_worker_names == (
-        created[0]["options"]["name"],
+        record["options"]["name"],
     )
+    assert replica.borrowed_worker_placement[0]["gpu_uuid"] == "GPU-x"
+    assert killed == []
+
+    FakeCIA.next_gpu_uuid = "GPU-wrong"
+    failed = cls(
+        replica_rank=4,
+        config=config,
+        model_config=object(),
+        replica_kind=ReplicaKind.BORROWED,
+        runtime_epoch=0,
+    )
+    failed._get_master_addr_port_for_slot = fake_master
+    with pytest.raises(RuntimeError, match="unexpected GPU UUID"):
+        asyncio.run(failed._create_workers_from_claims(spec, {"pg": "PG"}))
+    assert killed
+    assert failed.workers == []
 
 
 def checkpoint_manager_class():
