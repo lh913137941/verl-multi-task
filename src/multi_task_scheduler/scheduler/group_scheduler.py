@@ -1,378 +1,266 @@
-"""Shared GroupScheduler actor for simplified design §3/§8.
+"""Shared GroupScheduler actor for the minimal 092203 lease/command contract."""
 
-GS owns global resource authorization and intent. It forwards lifecycle commands
-to the attached TaskRunner and never converts ACK/health/status into physical
-release proof.
-"""
+from __future__ import annotations
 
 import time
-import uuid
 
 import ray
 from ray.actor import ActorHandle
 
 from multi_task_scheduler.orchestration.contracts import (
-    IdleCandidateReport,
+    EvidenceType,
+    Lease,
     OperationCommand,
-    OperationResult,
-    QueryResult,
-)
-from multi_task_scheduler.orchestration.operation_journal import (
+    OperationEvidence,
     OperationKind,
-    OperationStatus,
-    Outcome,
-    Phase,
-    operation_outcome,
+    OperationRecord,
+    ReplicaKey,
+    ReplicaKind,
 )
-from multi_task_scheduler.orchestration.receipts import Ack
-from multi_task_scheduler.scheduler.ledger import (
-    Ledger,
-    LeaseRecord,
-    ProtocolInstance,
-    ResourceManifest,
-)
-from multi_task_scheduler.scheduler.lease import LeaseState, LeaseStateMachine
 
-RUNTIME_KIND = "verl-multi-task:experimental_fully_async_standalone:p1"
-PROTOCOL_VERSION = 1
-
-_EXPECTED_LEASE_STATE = {
-    OperationKind.DONATE: LeaseState.DONOR_DRAINING,
-    OperationKind.ADD: LeaseState.BORROWER_PREPARING,
-    OperationKind.REMOVE: LeaseState.RECALLING,
-    OperationKind.RESTORE: LeaseState.DONOR_RESTORING,
-}
+RUNTIME_KIND = "verl-multi-task:experimental_fully_async_standalone:092203"
+_RELEASE_KINDS = {OperationKind.DONATE, OperationKind.REMOVE}
 
 
 @ray.remote(num_cpus=0)
 class GroupScheduler:
-    """Keep task controllers plus authoritative GS ledger/lease state."""
-
     def __init__(self) -> None:
         self.task_runners: dict[str, ActorHandle] = {}
-        self.controllers: dict[tuple[str, str], ActorHandle] = {}
-        self.ledger = Ledger(
-            ProtocolInstance(
-                protocol_version=PROTOCOL_VERSION,
-                runtime_kind=RUNTIME_KIND,
-                gs_epoch=f"gs-{uuid.uuid4().hex}",
-                sharing_namespace="verl-multi-task",
-                recovery_state="RECOVERY_ONLY",
-            )
-        )
-        self.lease_sm = LeaseStateMachine()
+        self.leases: dict[str, Lease] = {}
+        self.idle_reports: dict[str, object] = {}
+        # GS keeps intent so later RELEASED evidence can be bound back to the
+        # exact operation and lease instead of accepting a bare GPU list.
+        self.operation_commands: dict[str, OperationCommand] = {}
+        self.borrower_targets: dict[str, ReplicaKey] = {}
+        self.release_evidence: dict[tuple[str, str], OperationEvidence] = {}
+        self.release_history: dict[str, list[str]] = {}
+        # Internal derived phase: donor RELEASED has made the reserved claims
+        # safe for the borrower ADD, but they remain owned by this borrower
+        # lease until borrowed REMOVE produces its own RELEASED evidence.
+        self.handoff_ready_leases: set[str] = set()
+        # claim_id is globally unique for the lifetime of this GS ledger.
+        # Bundle/GPU ownership is active-only and is released only by verified
+        # RELEASED evidence.
+        self.claim_id_owner: dict[str, str] = {}
+        self.active_bundle_owner: dict[tuple[str, int], str] = {}
+        self.active_gpu_owner: dict[str, str] = {}
 
     def runtime_kind(self) -> str:
         return RUNTIME_KIND
 
     def attach_task(self, task_id: str, task_runner: ActorHandle) -> None:
-        """Runtime discovery hook used before task_session registration exists."""
         if not isinstance(task_id, str) or not task_id:
-            raise ValueError("task_id must be a nonempty TaskRunner Actor ID")
+            raise ValueError("task_id must be a nonempty string")
         if not isinstance(task_runner, ActorHandle):
-            raise TypeError("GroupScheduler requires a real TaskRunner ActorHandle")
+            raise TypeError("task_runner must be a real Ray ActorHandle")
         existing = self.task_runners.get(task_id)
         if existing is not None and existing != task_runner:
-            raise ValueError(f"TaskRunner reference already exists for {task_id}")
+            raise ValueError(f"TaskRunner already attached for {task_id}")
         self.task_runners[task_id] = task_runner
 
     def detach_task(self, task_id: str) -> None:
-        self.task_runners.pop(task_id, None)
+        self.task_runners.pop(str(task_id), None)
 
     def get_task_runners(self) -> dict[str, ActorHandle]:
         return dict(self.task_runners)
 
-    def schedule(self) -> list:
-        """Cross-task policy is outside this implementation pass."""
-        return []
-
-    def attach_controller(
-        self,
-        task_id: str,
-        task_session: str,
-        handle: ActorHandle,
-        protocol: dict | None = None,
-    ) -> dict:
-        if not isinstance(task_id, str) or not task_id:
-            raise ValueError("task_id must be a nonempty string")
+    def submit_idle_report(self, report):
+        if not isinstance(report, dict):
+            raise TypeError("submit_idle_report requires a metadata dict")
+        task_session = report.get("task_session")
+        candidates = report.get("candidates")
         if not isinstance(task_session, str) or not task_session:
-            raise ValueError("task_session must be a nonempty string")
-        if not isinstance(handle, ActorHandle):
-            raise TypeError("attach_controller requires a real TaskRunner ActorHandle")
-        self.ledger.register_task(task_id, task_session, task_runner=handle)
-        self.controllers[(task_id, task_session)] = handle
-        return {
-            "task_id": task_id,
-            "task_session": task_session,
-            "protocol_version": self.ledger.protocol.protocol_version,
-            "gs_epoch": self.ledger.protocol.gs_epoch,
+            raise ValueError("idle report requires task_session")
+        if task_session not in self.task_runners:
+            raise ValueError("idle report references a detached task_session")
+        if not isinstance(candidates, (tuple, list)):
+            raise ValueError("idle report requires candidates")
+
+        normalized = []
+        seen = set()
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                raise TypeError("idle candidate must be a metadata dict")
+            key = candidate.get("replica_key")
+            if not isinstance(key, ReplicaKey):
+                raise TypeError("idle candidate requires ReplicaKey")
+            if key.task_session != task_session:
+                raise ValueError("idle candidate belongs to another task_session")
+            kind = ReplicaKind(candidate.get("kind"))
+            if key in seen:
+                raise ValueError("idle report contains duplicate ReplicaKey")
+            seen.add(key)
+            normalized.append({"replica_key": key, "kind": kind.value})
+
+        self.idle_reports[task_session] = {
+            "observed_at": time.monotonic(),
+            "candidates": tuple(normalized),
         }
+        return {"accepted": True, "candidate_count": len(normalized)}
 
-    def register_resources(self, registration_id: str, manifest: ResourceManifest) -> dict:
-        if not isinstance(manifest, ResourceManifest):
-            raise TypeError("register_resources requires ResourceManifest")
-        self.ledger.register_resources(manifest)
-        for record in self.ledger.tasks.values():
-            if record.task_session == manifest.owner_task_session:
-                record.status = "READY"
-        return {"registration_id": registration_id, "status": "READY"}
-
-    def report_idle_candidates(self, report: IdleCandidateReport) -> Ack:
-        if not isinstance(report, IdleCandidateReport):
-            raise TypeError("report_idle_candidates requires IdleCandidateReport")
-        self.ledger.upsert_idle_report(
-            report, valid_until=time.monotonic() + report.valid_for_ms / 1000
-        )
-        return Ack(accepted=True, revision=report.source_seq)
-
-    def _validate_lease_authorization(self, command: OperationCommand) -> None:
-        lease = self.ledger.leases.get(command.ctx.lease_id)
-        if lease is None:
-            raise ValueError("unknown lease")
-        authorization = command.authorization
-        if lease.lease_epoch != command.ctx.lease_epoch:
-            raise ValueError("stale lease_epoch")
-        if authorization.donor_session != lease.donor_session:
-            raise ValueError("authorization donor_session does not match lease")
-        if lease.borrower_session is None:
-            raise ValueError("lease has no borrower_session")
-        if authorization.borrower_session != lease.borrower_session:
-            raise ValueError("authorization borrower_session does not match lease")
-        if lease.placement is None:
-            raise ValueError("lease has no placement evidence")
-        if authorization.placement_digest != lease.placement.placement_digest:
-            raise ValueError("authorization placement does not match lease")
-
-        expected_state = _EXPECTED_LEASE_STATE[command.kind]
-        if LeaseState(lease.state) is not expected_state:
-            raise ValueError(
-                f"lease state {lease.state} does not authorize {command.kind.value}"
-            )
-
-        expected_session = (
-            lease.donor_session
-            if command.kind in {OperationKind.DONATE, OperationKind.RESTORE}
-            else lease.borrower_session
-        )
-        if command.ctx.task_session != expected_session:
-            raise ValueError("operation targets the wrong lease participant")
-
-        if command.kind in {OperationKind.ADD, OperationKind.RESTORE}:
-            if lease.last_release_digest is None:
-                raise ValueError("lease has no GS-confirmed prior release evidence")
-            if authorization.prior_release_digest != lease.last_release_digest:
-                raise ValueError("prior_release_digest does not match GS-confirmed release")
-
-        self.lease_sm.validate_authorization(
-            command.ctx.lease_id,
-            command.ctx.operation_id,
-            authorization.authorization_seq,
-        )
-
-    def _validate_command_fence(self, command: OperationCommand) -> None:
-        protocol = self.ledger.protocol
-        if command.ctx.protocol_version != protocol.protocol_version:
-            raise ValueError(
-                "protocol version mismatch: "
-                f"{command.ctx.protocol_version} != {protocol.protocol_version}"
-            )
-        if command.ctx.gs_epoch != protocol.gs_epoch:
-            raise ValueError("stale gs_epoch")
-        task_key = (command.ctx.task_id, command.ctx.task_session)
-        task = self.ledger.tasks.get(task_key)
-        if task is None:
-            raise ValueError("unknown target task session")
-        if task.status != "READY":
-            raise ValueError("target task is not READY")
-        if command.target.task_session != command.ctx.task_session:
-            raise ValueError("target runtime belongs to a different task_session")
-        if task_key not in self.controllers:
-            raise ValueError("target TaskRunner controller is not attached")
-        self._validate_lease_authorization(command)
-
-    def submit_operation(self, command: OperationCommand) -> OperationResult:
-        """Record/forward a new intent or replay an already accepted operation.
-
-        Current lease-state authorization is evaluated only for a new operation.
-        Once an operation_id has been accepted, later retries are fenced by its
-        immutable recorded command. When the TaskRunner is reachable, replay is
-        forwarded idempotently so GS observes the latest authoritative journal
-        progress instead of returning a stale cached result.
-        """
+    def submit_operation(self, command: OperationCommand) -> OperationRecord:
         if not isinstance(command, OperationCommand):
             raise TypeError("submit_operation requires OperationCommand")
+        lease = self.leases.get(command.lease_id)
+        if lease is None:
+            raise ValueError(f"unknown lease {command.lease_id!r}")
 
-        existing = self.ledger.operations.get(command.ctx.operation_id)
-        if existing is None:
-            self._validate_command_fence(command)
-            record = self.ledger.record_operation(command)
-            self.lease_sm.record_authorization(
-                command.ctx.lease_id,
-                command.ctx.operation_id,
-                command.authorization.authorization_seq,
+        previous = self.operation_commands.get(command.operation_id)
+        if previous is not None and previous != command:
+            raise ValueError("conflicting operation replay at GroupScheduler")
+        if previous is None:
+            expired = bool(lease.expires_at and time.time() >= lease.expires_at)
+            if expired and command.kind is OperationKind.ADD:
+                raise ValueError(
+                    f"expired lease {command.lease_id!r} cannot start ADD"
+                )
+
+            donor_task_id = lease.claims[0]["donor_task_id"]
+            if command.kind is OperationKind.DONATE:
+                if command.target.task_session != donor_task_id:
+                    raise ValueError("DONATE target does not own the lease claims")
+                if not self._target_matches_donor(command.target, lease):
+                    raise ValueError("DONATE target does not match the lease donor replica")
+                if command.lease_id in self.handoff_ready_leases:
+                    raise ValueError("lease handoff is already ready")
+            elif command.kind is OperationKind.ADD:
+                if command.lease_id not in self.handoff_ready_leases:
+                    raise ValueError(
+                        f"{command.kind.value} requires donor RELEASED handoff"
+                    )
+                existing_target = self.borrower_targets.get(command.lease_id)
+                if existing_target is not None and existing_target != command.target:
+                    raise ValueError("lease already has another borrower target")
+            elif command.kind is OperationKind.REMOVE:
+                if command.lease_id not in self.handoff_ready_leases:
+                    raise ValueError("REMOVE requires donor RELEASED handoff")
+                expected_target = self.borrower_targets.get(command.lease_id)
+                if expected_target is None or expected_target != command.target:
+                    raise ValueError("REMOVE target does not match the borrowed replica")
+            elif command.kind is OperationKind.RESTORE:
+                if any(
+                    self.active_gpu_owner.get(gpu_uuid) == command.lease_id
+                    for gpu_uuid in lease.gpu_uuids
+                ):
+                    raise ValueError(
+                        "RESTORE requires borrower claims to be fully returned"
+                    )
+
+        task_runner = self.task_runners.get(command.target.task_session)
+        if task_runner is None:
+            raise ValueError(
+                "no TaskRunner is attached under target.task_session; "
+                "first release uses the attached task id as task_session"
             )
-        else:
-            record = self.ledger.record_operation(command)
-
-        controller = self.controllers.get(
-            (record.command.ctx.task_id, record.command.ctx.task_session)
+        result = ray.get(
+            task_runner.submit_operation.remote(command, lease=lease),
+            timeout=30,
         )
-        if controller is None:
-            return self._local_query_result(record).value
-
-        result = ray.get(controller.submit_operation.remote(record.command), timeout=30)
-        if not isinstance(result, OperationResult):
-            raise TypeError("TaskRunner returned a non-OperationResult")
-        self.ledger.merge_operation_result(record.operation_id, result)
+        if not isinstance(result, OperationRecord):
+            raise TypeError("TaskRunner returned a non-OperationRecord")
+        if previous is None:
+            self.operation_commands[command.operation_id] = command
+            if command.kind is OperationKind.ADD:
+                self.borrower_targets[command.lease_id] = command.target
         return result
 
     @staticmethod
-    def _local_query_result(record) -> QueryResult[OperationResult]:
-        if record.final_result is not None:
-            result = record.final_result
-            outcome = operation_outcome(result.status, result.error)
+    def _target_matches_donor(target: ReplicaKey, lease: Lease) -> bool:
+        """Match first-release donor identity without trusting a handle from GS."""
+        claim = lease.claims[0]
+        rank = claim["donor_replica_rank"]
+        replica_id = target.replica_id
+        return replica_id in {f"r{rank}", f"native-{rank}"}
+
+    def open_lease(self, lease: Lease) -> Lease:
+        """GS-internal ledger action; scheduler policy calls this before command issue."""
+        if not isinstance(lease, Lease):
+            raise TypeError("open_lease requires Lease")
+        existing = self.leases.get(lease.lease_id)
+        if existing is not None:
+            if existing != lease:
+                raise ValueError("conflicting lease replay")
+            return existing
+
+        for claim_id in lease.claim_ids:
+            owner = self.claim_id_owner.get(claim_id)
+            if owner is not None and owner != lease.lease_id:
+                raise ValueError(
+                    f"claim_id {claim_id!r} already belongs to lease {owner!r}"
+                )
+        for bundle_key in lease.bundle_keys:
+            owner = self.active_bundle_owner.get(bundle_key)
+            if owner is not None and owner != lease.lease_id:
+                raise ValueError(
+                    f"PG bundle {bundle_key!r} is already active under lease {owner!r}"
+                )
+        for gpu_uuid in lease.gpu_uuids:
+            owner = self.active_gpu_owner.get(gpu_uuid)
+            if owner is not None and owner != lease.lease_id:
+                raise ValueError(
+                    f"GPU {gpu_uuid!r} is already active under lease {owner!r}"
+                )
+
+        self.leases[lease.lease_id] = lease
+        self.release_history.setdefault(lease.lease_id, [])
+        for claim_id in lease.claim_ids:
+            self.claim_id_owner[claim_id] = lease.lease_id
+        for bundle_key in lease.bundle_keys:
+            self.active_bundle_owner[bundle_key] = lease.lease_id
+        for gpu_uuid in lease.gpu_uuids:
+            self.active_gpu_owner[gpu_uuid] = lease.lease_id
+        return lease
+
+    def advance_lease(self, lease_id: str, evidence: OperationEvidence) -> dict:
+        """GS-internal release commit after exact operation/lease/GPU validation."""
+        lease = self.leases.get(lease_id)
+        if lease is None:
+            raise ValueError(f"unknown lease {lease_id!r}")
+        if not isinstance(evidence, OperationEvidence):
+            raise TypeError("advance_lease requires OperationEvidence")
+        if evidence.type is not EvidenceType.RELEASED:
+            raise ValueError("lease handoff requires RELEASED evidence")
+
+        command = self.operation_commands.get(evidence.operation_id)
+        if command is None:
+            raise ValueError("RELEASED evidence references an unknown operation")
+        if command.lease_id != lease_id:
+            raise ValueError("RELEASED evidence operation belongs to another lease")
+        if command.kind not in _RELEASE_KINDS:
+            raise ValueError("only DONATE/REMOVE operations may release lease GPUs")
+        if set(evidence.released_gpu_uuids) != set(lease.gpu_uuids):
+            raise ValueError("RELEASED evidence must exactly cover lease GPU claims")
+
+        evidence_key = (lease_id, evidence.operation_id)
+        existing = self.release_evidence.get(evidence_key)
+        if existing is not None:
+            if existing != evidence:
+                raise ValueError("conflicting release evidence replay")
+            return {
+                "lease_id": lease_id,
+                "operation_id": evidence.operation_id,
+                "released": True,
+            }
+
+        self.release_evidence[evidence_key] = evidence
+        self.release_history.setdefault(lease_id, []).append(evidence.operation_id)
+
+        # DONATE hands the already-reserved claims to the borrower; it must not
+        # expose the same physical slot to another lease. Only borrowed REMOVE
+        # returns the claims to the global free pool.
+        if command.kind is OperationKind.DONATE:
+            self.handoff_ready_leases.add(lease_id)
         else:
-            result = OperationResult(
-                ctx=record.command.ctx,
-                target=record.command.target,
-                status=OperationStatus.ACCEPTED,
-                phase=Phase.VALIDATE,
-                phase_revision=0,
-            )
-            # GS has recorded intent but has no authoritative TaskRunner result;
-            # unlike the TaskRunner journal, this fallback cannot assert that
-            # side effects are definitely not applied.
-            outcome = Outcome.UNKNOWN
-        return QueryResult(found=True, value=result, outcome=outcome)
-
-    def query_operation(
-        self, task_session: str, operation_id: str
-    ) -> QueryResult[OperationResult]:
-        """Prefer the TaskRunner authoritative journal; never infer from health."""
-        record = self.ledger.operations.get(operation_id)
-        if record is None or record.command.ctx.task_session != task_session:
-            return QueryResult(found=False, value=None, outcome=Outcome.UNKNOWN)
-
-        controller = self.controllers.get(
-            (record.command.ctx.task_id, record.command.ctx.task_session)
-        )
-        if controller is None:
-            return self._local_query_result(record)
-        try:
-            queried = ray.get(
-                controller.query_operation.remote(task_session, operation_id),
-                timeout=30,
-            )
-        except Exception:
-            return self._local_query_result(record)
-        if not isinstance(queried, QueryResult):
-            raise TypeError("TaskRunner query returned a non-QueryResult")
-        if queried.found and queried.value is not None:
-            self.ledger.merge_operation_result(operation_id, queried.value)
-        return queried
-
-    def probe_task(self, task_id: str, task_session: str):
-        controller = self.controllers.get((task_id, task_session))
-        if controller is None:
-            raise ValueError("unknown target task session")
-        return ray.get(controller.probe_task.remote(task_session), timeout=30)
-
-    def get_resource_snapshot(self, expected_session: str) -> dict:
-        """GS physical-ledger inspection; not a ReleaseEvidence substitute."""
-        return {
-            "protocol_version": self.ledger.protocol.protocol_version,
-            "gs_epoch": self.ledger.protocol.gs_epoch,
-            "expected_session": expected_session,
-            "tasks": [
-                {
-                    "task_id": record.task_id,
-                    "task_session": record.task_session,
-                    "status": record.status,
-                    "initial_gpus": record.initial_gpus,
-                }
-                for record in self.ledger.tasks.values()
-            ],
-            "gpus": [
-                {
-                    "node_id": gpu.node_id,
-                    "gpu_uuid": gpu.gpu_uuid,
-                    "state": gpu.state,
-                    "current_user": gpu.current_user,
-                    "lease_id": gpu.lease_id,
-                    "lease_epoch": gpu.lease_epoch,
-                }
-                for gpu in self.ledger.gpus.values()
-            ],
-        }
-
-    def report_operation_result(self, result: OperationResult) -> Ack:
-        if not isinstance(result, OperationResult):
-            raise TypeError("report_operation_result requires OperationResult")
-        self.ledger.merge_operation_result(result.ctx.operation_id, result)
-        return Ack(accepted=True, revision=result.phase_revision)
-
-    def open_lease(self, lease: LeaseRecord) -> dict:
-        if not isinstance(lease, LeaseRecord):
-            raise TypeError("open_lease requires LeaseRecord")
-        self.ledger.open_lease(lease)
-        self.lease_sm.register(lease)
-        return {"lease_id": lease.lease_id, "state": lease.state}
-
-    def advance_lease(
-        self,
-        lease_id: str,
-        new_state: str,
-        operation_id: str | None = None,
-    ) -> dict:
-        """Advance lease state and the GS GPU-user ledger as one actor turn.
-
-        Evidence validation remains in ``LeaseStateMachine``. The two edges that
-        actually transfer authorization additionally preflight the exact
-        registered GPU set before changing the lease state, then commit the GPU
-        ledger after the state-machine transition succeeds. Because GS is a
-        single Ray actor, nothing can interleave between preflight and commit.
-        """
-        target_state = LeaseState(new_state)
-        before = self.lease_sm.get(lease_id)
-        current_state = LeaseState(before.state)
-
-        gpu_action = None
-        gpu_keys = ()
-        if (
-            current_state is LeaseState.DONOR_RELEASED
-            and target_state is LeaseState.BORROWER_PREPARING
-        ):
-            gpu_action = "BORROWER"
-            gpu_keys = self.ledger.validate_borrower_gpu_authorization(before)
-        elif (
-            current_state is LeaseState.BORROWER_RELEASED
-            and target_state is LeaseState.DONOR_RESTORING
-        ):
-            gpu_action = "NATIVE"
-            gpu_keys = self.ledger.validate_native_gpu_restoration(before)
-
-        supporting_result = None
-        if operation_id is not None:
-            record = self.ledger.operations.get(operation_id)
-            if record is None:
-                raise ValueError(f"unknown operation {operation_id!r}")
-            queried = self.query_operation(record.command.ctx.task_session, operation_id)
-            if queried.found:
-                supporting_result = queried.value
-
-        lease = self.lease_sm.advance(
-            lease_id,
-            target_state,
-            supporting_result=supporting_result,
-        )
-
-        if gpu_action == "BORROWER":
-            self.ledger.authorize_borrower_gpus(lease, gpu_keys)
-        elif gpu_action == "NATIVE":
-            self.ledger.restore_native_gpus(lease, gpu_keys)
+            self.handoff_ready_leases.discard(lease_id)
+            for bundle_key in lease.bundle_keys:
+                if self.active_bundle_owner.get(bundle_key) == lease_id:
+                    self.active_bundle_owner.pop(bundle_key, None)
+            for gpu_uuid in lease.gpu_uuids:
+                if self.active_gpu_owner.get(gpu_uuid) == lease_id:
+                    self.active_gpu_owner.pop(gpu_uuid, None)
 
         return {
             "lease_id": lease_id,
-            "state": lease.state,
-            "last_release_digest": lease.last_release_digest,
+            "operation_id": evidence.operation_id,
+            "released": True,
         }

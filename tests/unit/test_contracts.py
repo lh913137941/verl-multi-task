@@ -1,257 +1,154 @@
-"""Current cross-component contract validation."""
-
 import pytest
 
 from multi_task_scheduler.orchestration.contracts import (
-    CapabilityProof,
-    CapacityRecord,
-    LeaseAuthorization,
-    NodePlacement,
+    AttemptState,
+    EvidenceType,
+    FIRST_RELEASE_MAX_COLOCATE_COUNT,
+    FIRST_RELEASE_RAY_GPU_FRACTION,
+    Lease,
     OperationCommand,
-    OperationContext,
-    OperationResult,
-    PlacementSpec,
-    PublishedWeightSnapshot,
-    RecallMode,
-    ReplicaKey,
-    RouteEntry,
-    RouteState,
-    RuntimeReady,
-    SyncHealth,
-    TaskSnapshot,
-)
-from multi_task_scheduler.orchestration.operation_journal import (
+    OperationEvidence,
     OperationKind,
+    OperationRecord,
     OperationStatus,
-    Phase,
+    ReplicaKey,
+    ReplicaKind,
+    ReplicaState,
 )
-from multi_task_scheduler.orchestration.production_window import ProductionWindow, WindowState
-from multi_task_scheduler.orchestration.replica_record import ReplicaKind, ReplicaRecord, ReplicaState
 
 
-def _ctx(**overrides):
-    values = dict(
-        protocol_version=1,
-        gs_epoch="gs-1",
-        task_id="task-a",
-        task_session="s1",
-        operation_id="op-1",
-        lease_id="lease-1",
-        lease_epoch=0,
-        command_seq=0,
-    )
-    values.update(overrides)
-    return OperationContext(**values)
+def claim(**overrides):
+    value = {
+        "claim_id": "claim-0",
+        "source_lease_id": "source-lease-0",
+        "donor_task_id": "donor-task",
+        "donor_replica_rank": 0,
+        "pg_id": "pg",
+        "bundle_index": 0,
+        "node_id": "n0",
+        "gpu_uuid": "u0",
+        "gpu_fraction": FIRST_RELEASE_RAY_GPU_FRACTION,
+        "cpu_request": 1.0,
+    }
+    value.update(overrides)
+    return value
 
 
-def _placement(*, task_gpu="u0"):
-    return PlacementSpec(
-        node=NodePlacement(
-            node_id="n1",
-            gpu_uuids=(task_gpu, "u1") if task_gpu == "u0" else (task_gpu,),
-            physical_gpu_ids=(0, 1) if task_gpu == "u0" else (0,),
-            global_ranks=(0, 1) if task_gpu == "u0" else (0,),
-            local_ranks=(0, 1) if task_gpu == "u0" else (0,),
-        ),
-        tp=2 if task_gpu == "u0" else 1,
-        dp=1,
-        pp=1,
-        model_signature="sig-1",
-        placement_digest="placement-1" if task_gpu == "u0" else f"placement-{task_gpu}",
-    )
+def test_current_public_enums_are_minimal():
+    assert {s.value for s in ReplicaState} == {
+        "CREATING",
+        "ACTIVE",
+        "DRAINING",
+        "DORMANT",
+        "RELEASED",
+        "QUARANTINED",
+    }
+    assert {k.value for k in ReplicaKind} == {"NATIVE", "BORROWED"}
+    assert {s.value for s in AttemptState} == {
+        "ADMITTED",
+        "TERMINATED",
+        "SETTLED",
+    }
 
 
-def _authorization(kind, ctx, placement_digest="placement-1"):
-    return LeaseAuthorization(
-        lease_id=ctx.lease_id,
-        gs_epoch=ctx.gs_epoch,
-        donor_session="donor",
-        borrower_session=ctx.task_session,
-        placement_digest=placement_digest,
-        lease_epoch=ctx.lease_epoch,
-        purpose=kind,
-        prior_release_digest=(
-            "release-previous" if kind in {OperationKind.ADD, OperationKind.RESTORE} else None
-        ),
-        authorization_seq=1,
-    )
+def test_command_force_is_remove_only():
+    key = ReplicaKey("task-a", "r0")
+    assert OperationCommand(
+        "op",
+        OperationKind.REMOVE,
+        key,
+        "l1",
+        True,
+    ).force is True
+    with pytest.raises(ValueError):
+        OperationCommand("op2", OperationKind.ADD, key, "l1", True)
 
 
-def _window(task_session="s1"):
-    return ProductionWindow(
-        task_session=task_session,
-        epoch=3,
-        revision=9,
-        state=WindowState.CLOSED_BACKPRESSURE,
-        eligible_pending=0,
-        held_samples=0,
-    )
+def test_record_is_small_authoritative_projection():
+    record = OperationRecord("op")
+    assert record.status is OperationStatus.ACCEPTED
+    assert record.result is None
 
 
-def _record(task_session="s1", replica_id="r1"):
-    placement = _placement() if task_session == "s1" else _placement(task_gpu="other-u0")
-    return ReplicaRecord(
-        key=ReplicaKey(task_session=task_session, replica_id=replica_id, runtime_epoch=0),
-        kind=ReplicaKind.NATIVE,
-        state=ReplicaState.ACTIVE,
-        revision=1,
-        placement=placement,
-    )
+def test_release_evidence_gpu_set_rules():
+    with pytest.raises(ValueError):
+        OperationEvidence("op", EvidenceType.RELEASED, 1, ("u0", "u0"))
+    with pytest.raises(ValueError):
+        OperationEvidence("op", EvidenceType.EXIT_READY, 1, ("u0",))
 
 
-def test_operation_context_identity_includes_all_fences():
-    assert _ctx().identity == _ctx().identity
-    assert _ctx().identity != _ctx(lease_epoch=1).identity
-    assert _ctx().identity != _ctx(command_seq=1).identity
-    assert _ctx().identity != _ctx(expected_revision=1).identity
+def test_lease_has_claims_and_expiry_without_public_state():
+    lease = Lease("l1", (claim(),), 0)
+    assert lease.gpu_uuids == ("u0",)
+    assert not hasattr(lease, "state")
 
 
-def test_operation_context_requires_integer_protocol_and_string_gs_epoch():
-    with pytest.raises(ValueError, match="protocol_version"):
-        OperationContext("p1", "gs-1", "t", "s", "op", "l", 0, 0)
-    with pytest.raises(ValueError, match="gs_epoch"):
-        OperationContext(1, "", "t", "s", "op", "l", 0, 0)
+def test_lease_requires_claim_source_owner_and_physical_validation_keys():
+    for field in (
+        "claim_id",
+        "source_lease_id",
+        "donor_task_id",
+        "donor_replica_rank",
+        "pg_id",
+        "bundle_index",
+        "node_id",
+        "gpu_uuid",
+    ):
+        invalid = claim()
+        invalid.pop(field)
+        with pytest.raises(ValueError):
+            Lease("l1", (invalid,), 0)
 
 
-def test_single_node_placement_requires_first_release_topology():
-    spec = _placement()
-    assert spec.node.gpu_uuids == ("u0", "u1")
-    assert spec.tp == 2 and spec.dp == 1 and spec.pp == 1
-    with pytest.raises(ValueError, match="same length"):
-        NodePlacement("n1", ("u0",), (0, 1), (0,), (0,))
-    with pytest.raises(ValueError, match="dp=1"):
-        PlacementSpec(
-            node=NodePlacement("n1", ("u0",), (0,), (0,), (0,)),
-            tp=1,
-            dp=2,
-            pp=1,
-            model_signature="sig",
-            placement_digest="p",
+def test_lease_normalizes_legacy_claim_lease_id_to_source_lease_id():
+    legacy = claim()
+    legacy["lease_id"] = legacy.pop("source_lease_id")
+    lease = Lease("borrower-lease", (legacy,), 0)
+    assert lease.claims[0]["source_lease_id"] == "source-lease-0"
+    assert "lease_id" not in lease.claims[0]
+    assert lease.claim_ids == ("claim-0",)
+    assert lease.source_lease_ids == ("source-lease-0",)
+
+
+def test_first_release_lease_rejects_claims_from_multiple_donor_replicas():
+    with pytest.raises(ValueError, match="one complete donor replica"):
+        Lease(
+            "l1",
+            (
+                claim(),
+                claim(
+                    claim_id="claim-1",
+                    gpu_uuid="u1",
+                    bundle_index=1,
+                    donor_replica_rank=1,
+                ),
+            ),
+            0,
         )
 
 
-def test_add_command_requires_nested_identity_authorization_and_matching_placement():
-    ctx = _ctx()
-    target = ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0)
-    command = OperationCommand(
-        ctx=ctx,
-        kind=OperationKind.ADD,
-        target=target,
-        authorization=_authorization(OperationKind.ADD, ctx),
-        payload_digest="payload-1",
-        remaining_budget_ms=1000,
-        placement=_placement(),
-    )
-    assert command.kind is OperationKind.ADD
-    with pytest.raises(ValueError, match="placement must match authorization"):
-        OperationCommand(
-            ctx=ctx,
-            kind=OperationKind.ADD,
-            target=target,
-            authorization=_authorization(OperationKind.ADD, ctx, "different"),
-            payload_digest="payload-1",
-            remaining_budget_ms=1000,
-            placement=_placement(),
+def test_first_release_lease_uses_fixed_ray_share_and_unique_physical_gpu():
+    assert FIRST_RELEASE_MAX_COLOCATE_COUNT == 2
+    lease = Lease("l1", (claim(),), 0)
+    assert lease.claims[0]["gpu_fraction"] == 0.5
+
+    with pytest.raises(ValueError, match="Ray GPU accounting share"):
+        Lease("l1", (claim(gpu_fraction=1.0),), 0)
+    with pytest.raises(ValueError, match="repeat gpu_uuid"):
+        Lease(
+            "l1",
+            (
+                claim(),
+                claim(claim_id="claim-1", bundle_index=1),
+            ),
+            0,
         )
-
-
-def test_add_and_restore_must_not_carry_recall_mode():
-    ctx = _ctx()
-    target = ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0)
-    with pytest.raises(ValueError, match="must not carry recall_mode"):
-        OperationCommand(
-            ctx=ctx,
-            kind=OperationKind.ADD,
-            target=target,
-            authorization=_authorization(OperationKind.ADD, ctx),
-            payload_digest="payload-1",
-            remaining_budget_ms=1000,
-            placement=_placement(),
-            recall_mode=RecallMode.NATURAL,
+    with pytest.raises(ValueError, match="repeat a PG bundle"):
+        Lease(
+            "l1",
+            (
+                claim(),
+                claim(claim_id="claim-1", gpu_uuid="u1"),
+            ),
+            0,
         )
-
-
-def test_operation_result_keeps_phase_and_status_independent():
-    result = OperationResult(
-        ctx=_ctx(),
-        target=ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0),
-        status=OperationStatus.RUNNING,
-        phase=Phase.CREATE,
-        phase_revision=2,
-        replica_state=ReplicaState.PREPARING,
-    )
-    assert result.phase is Phase.CREATE
-    with pytest.raises(ValueError, match="DONE"):
-        OperationResult(
-            ctx=_ctx(),
-            target=result.target,
-            status=OperationStatus.RUNNING,
-            phase=Phase.DONE,
-            phase_revision=3,
-        )
-
-
-def test_route_entry_and_capacity_keep_owner_fences():
-    key = ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0)
-    route = RouteEntry(key, object(), RouteState.DRAINING, 2, 3, 7, "op-1")
-    assert route.state is RouteState.DRAINING
-    capacity = CapacityRecord(frozenset({key}), 4, 6, "op-4")
-    assert capacity.max_concurrent_samples == 6
-
-
-def test_task_snapshot_includes_published_version_and_rejects_cross_session_facts():
-    key = ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0)
-    capacity = CapacityRecord(frozenset({key}), 2, 4, "op-2")
-    snapshot = TaskSnapshot(
-        task_session="s1",
-        production=_window(),
-        replica_records=(_record(),),
-        ce_revision=3,
-        published_version=11,
-        lb_revision=4,
-        capacity=capacity,
-        sync_health=SyncHealth.HEALTHY,
-        current_operation_id=None,
-        consistency="STABLE",
-    )
-    assert snapshot.published_version == 11
-    with pytest.raises(ValueError, match="production window"):
-        TaskSnapshot(
-            task_session="s1",
-            production=_window("s2"),
-            replica_records=(_record(),),
-            ce_revision=3,
-            published_version=11,
-            lb_revision=4,
-            capacity=capacity,
-            sync_health=SyncHealth.HEALTHY,
-            current_operation_id=None,
-            consistency="UNKNOWN",
-        )
-
-
-def test_published_weight_snapshot_drops_observability_byte_size():
-    snapshot = PublishedWeightSnapshot(
-        snapshot_id="snapshot-7",
-        manifest_digest="manifest-7",
-        model_signature="sig-1",
-        version=7,
-        sender=object(),
-    )
-    assert snapshot.version == 7
-    assert not hasattr(snapshot, "byte_size")
-
-
-def test_runtime_ready_and_capability_proof_keep_verified_shapes():
-    key = ReplicaKey(task_session="s1", replica_id="r1", runtime_epoch=0)
-    assert RuntimeReady(key, "RECEIVER_READY", None).loaded_version is None
-    with pytest.raises(ValueError, match="requires loaded_version"):
-        RuntimeReady(key, "SERVING_READY", None)
-    proof = CapabilityProof(
-        name="target_abort_resume",
-        backend_version="vllm-x",
-        model_signature="sig-1",
-        placement_digest="placement-1",
-        validation_id="validation-1",
-    )
-    assert proof.name == "target_abort_resume"

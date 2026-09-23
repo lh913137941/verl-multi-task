@@ -1,236 +1,31 @@
-"""OperationJournal replay, lifecycle serialization and sequence fencing."""
-
-from dataclasses import replace
-
 import pytest
+from multi_task_scheduler.orchestration.contracts import OperationCommand, OperationKind, OperationStatus, ReplicaKey
+from multi_task_scheduler.orchestration.operation_journal import OperationIdentityError, OperationJournal
 
-from multi_task_scheduler.orchestration.contracts import (
-    LeaseAuthorization,
-    NodePlacement,
-    OperationCommand,
-    OperationContext,
-    PlacementSpec,
-    ReplicaKey,
-)
-from multi_task_scheduler.orchestration.operation_journal import (
-    ExpiredLeaseError,
-    IllegalOperationTransitionError,
-    OperationIdentityError,
-    OperationJournal,
-    OperationKind,
-    OperationStatus,
-    Outcome,
-    Phase,
-    command_identity,
-    operation_outcome,
-)
+def command(op="op-1", replica="r0"):
+    return OperationCommand(op, OperationKind.ADD, ReplicaKey("task-a", replica), "l1")
+
+def test_replay_and_single_active_fence():
+    j = OperationJournal(); first = j.begin(command())
+    assert j.begin(command()) is first
+    with pytest.raises(OperationIdentityError): j.begin(command("op-2", "r1"))
+    j.finish("op-1", OperationStatus.SUCCEEDED, "done")
+    assert j.begin(command("op-2", "r1")).operation_id == "op-2"
+
+def test_conflicting_replay_and_terminal_rewrite_fail():
+    j = OperationJournal(); j.begin(command())
+    with pytest.raises(OperationIdentityError): j.begin(command("op-1", "r1"))
+    j.finish("op-1", OperationStatus.FAILED, "failed")
+    with pytest.raises(OperationIdentityError): j.finish("op-1", OperationStatus.UNKNOWN, "lost")
 
 
-def _placement():
-    return PlacementSpec(
-        node=NodePlacement(
-            node_id="n1",
-            gpu_uuids=("u0",),
-            physical_gpu_ids=(0,),
-            global_ranks=(0,),
-            local_ranks=(0,),
-        ),
-        tp=1,
-        dp=1,
-        pp=1,
-        model_signature="sig",
-        placement_digest="placement-u0",
-    )
-
-
-def _command(**ctx_overrides):
-    values = dict(
-        protocol_version=1,
-        gs_epoch="gs-1",
-        task_id="task-a",
-        task_session="s1",
-        operation_id="op-1",
-        lease_id="l1",
-        lease_epoch=0,
-        command_seq=0,
-    )
-    values.update(ctx_overrides)
-    ctx = OperationContext(**values)
-    return OperationCommand(
-        ctx=ctx,
-        kind=OperationKind.ADD,
-        target=ReplicaKey(task_session=ctx.task_session, replica_id="r1", runtime_epoch=0),
-        authorization=LeaseAuthorization(
-            lease_id=ctx.lease_id,
-            gs_epoch=ctx.gs_epoch,
-            donor_session="donor",
-            borrower_session=ctx.task_session,
-            placement_digest="placement-u0",
-            lease_epoch=ctx.lease_epoch,
-            purpose=OperationKind.ADD,
-            prior_release_digest="release-0",
-            authorization_seq=1,
-        ),
-        payload_digest="payload-1",
-        remaining_budget_ms=1000,
-        placement=_placement(),
-    )
-
-
-def test_begin_stores_full_command_and_returns_validate_accepted():
+def test_unknown_outcome_keeps_task_fenced_until_reconciled():
     journal = OperationJournal()
-    command = _command()
-    record = journal.begin(command)
-    assert record.command is command
-    assert record.operation_id == "op-1"
-    assert record.target == command.target
-    assert record.phase is Phase.VALIDATE
-    assert record.status is OperationStatus.ACCEPTED
-
-
-def test_retry_budget_is_not_identity_and_cannot_extend_original_deadline():
-    now = [100.0]
-    journal = OperationJournal(clock=lambda: now[0])
-    command = _command()
-    first = journal.begin(command)
-    assert journal.remaining_budget_ms("op-1") == 1000
-
-    now[0] = 100.4
-    retry = replace(command, remaining_budget_ms=10_000)
-    assert command_identity(command) == command_identity(retry)
-    assert journal.begin(retry) is first
-    assert first.command is command
-    assert 0 < journal.remaining_budget_ms("op-1") <= 600
-
-    now[0] = 101.1
-    assert journal.remaining_budget_ms("op-1") == 0
-
-
-def test_operation_outcome_mapping_is_shared_and_typed():
-    assert operation_outcome(OperationStatus.ACCEPTED) is Outcome.KNOWN_NOT_APPLIED
-    assert operation_outcome(OperationStatus.SUCCEEDED) is Outcome.KNOWN_APPLIED
-    assert operation_outcome(OperationStatus.RUNNING) is Outcome.UNKNOWN
-    assert operation_outcome(OperationStatus.UNKNOWN) is Outcome.UNKNOWN
-
-
-def test_conflicting_command_identity_is_rejected():
-    journal = OperationJournal()
-    command = _command()
-    journal.begin(command)
-    with pytest.raises(OperationIdentityError):
-        journal.begin(replace(command, payload_digest="other"))
-    with pytest.raises(OperationIdentityError):
-        journal.begin(replace(command, target=replace(command.target, replica_id="r2")))
-    with pytest.raises(OperationIdentityError):
-        journal.begin(
-            replace(
-                command,
-                authorization=replace(
-                    command.authorization,
-                    authorization_seq=command.authorization.authorization_seq + 1,
-                ),
-            )
-        )
-
-
-def test_operation_id_cannot_cross_lease_epoch():
-    journal = OperationJournal()
-    journal.begin(_command(lease_epoch=1))
-    with pytest.raises(ExpiredLeaseError):
-        journal.begin(_command(lease_epoch=0))
-    with pytest.raises(OperationIdentityError):
-        journal.begin(_command(lease_epoch=2))
-
-
-def test_journal_owns_single_active_operation_and_command_seq_fences():
-    journal = OperationJournal()
-    journal.begin(_command(command_seq=5))
-
-    with pytest.raises(OperationIdentityError, match="another lifecycle operation is active"):
-        journal.begin(_command(operation_id="op-2", command_seq=6))
-
-    journal.transition("op-1", Phase.DONE, status=OperationStatus.SUCCEEDED)
-    with pytest.raises(OperationIdentityError, match="stale command_seq"):
-        journal.begin(_command(operation_id="op-old", command_seq=5))
-
-    assert journal.begin(_command(operation_id="op-2", command_seq=6)).status is OperationStatus.ACCEPTED
-
-
-def test_command_seq_is_task_session_wide_not_per_replica():
-    journal = OperationJournal()
-    first = _command(command_seq=5)
+    first = command()
     journal.begin(first)
-    journal.transition("op-1", Phase.DONE, status=OperationStatus.SUCCEEDED)
+    journal.finish(first.operation_id, OperationStatus.UNKNOWN, "owner response lost")
 
-    stale_other_replica = replace(
-        _command(operation_id="op-2", command_seq=5),
-        target=ReplicaKey(task_session="s1", replica_id="r2", runtime_epoch=0),
-    )
-    with pytest.raises(OperationIdentityError, match="stale command_seq"):
-        journal.begin(stale_other_replica)
-
-    fresh_other_replica = replace(
-        _command(operation_id="op-3", command_seq=6),
-        target=ReplicaKey(task_session="s1", replica_id="r2", runtime_epoch=0),
-    )
-    assert journal.begin(fresh_other_replica).status is OperationStatus.ACCEPTED
-
-
-def test_add_happy_path_requires_explicit_terminal_status():
-    journal = OperationJournal()
-    journal.begin(_command())
-    for phase in (
-        Phase.CREATE,
-        Phase.WAIT_GATE,
-        Phase.LOAD_WEIGHTS,
-        Phase.JOIN_CE,
-        Phase.COMMIT_SERVICE,
-    ):
-        journal.transition("op-1", phase)
-    with pytest.raises(IllegalOperationTransitionError, match="explicit"):
-        journal.transition("op-1", Phase.DONE)
-    journal.transition("op-1", Phase.DONE, status=OperationStatus.SUCCEEDED)
-    assert journal.query("op-1").status is OperationStatus.SUCCEEDED
-
-
-def test_terminal_status_cannot_appear_before_done():
-    journal = OperationJournal()
-    journal.begin(_command())
-    with pytest.raises(IllegalOperationTransitionError, match="requires phase DONE"):
-        journal.transition("op-1", Phase.CREATE, status=OperationStatus.FAILED)
-
-
-def test_reconcile_is_unknown_and_can_finish_unknown():
-    journal = OperationJournal()
-    journal.begin(_command())
-    journal.transition("op-1", Phase.RECONCILE)
-    assert journal.query("op-1").status is OperationStatus.UNKNOWN
-    journal.transition("op-1", Phase.DONE, status=OperationStatus.UNKNOWN)
-    assert journal.query("op-1").status is OperationStatus.UNKNOWN
-
-
-def test_illegal_phase_skip_and_wrong_lease_require_raise():
-    journal = OperationJournal()
-    journal.begin(_command())
-    with pytest.raises(IllegalOperationTransitionError):
-        journal.transition("op-1", Phase.COMMIT_SERVICE)
-    with pytest.raises(ExpiredLeaseError):
-        journal.require("op-1", 1)
-
-
-def test_phase_result_timing_and_error_are_revisioned():
-    journal = OperationJournal()
-    journal.begin(_command())
-    proof = object()
-    error = object()
-    record = journal.transition(
-        "op-1",
-        Phase.CREATE,
-        phase_result=proof,
-        elapsed_ms=12,
-        error=error,
-    )
-    assert record.phase_results[Phase.CREATE] is proof
-    assert record.phase_timings_ms[Phase.CREATE] == 12
-    assert record.error is error
-    assert record.phase_revision == 1
+    assert journal.active_operation(first.target.task_session) == first.operation_id
+    assert journal.begin(first).status is OperationStatus.UNKNOWN
+    with pytest.raises(OperationIdentityError, match="another lifecycle operation"):
+        journal.begin(command("op-2", "r1"))

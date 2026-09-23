@@ -7,7 +7,7 @@ _MISSING = object()
 
 
 class ProfileConfigurationError(ValueError):
-    """The requested profile cannot use this pure-STANDALONE adapter family."""
+    """The requested profile is outside the first-release verified boundary."""
 
 
 def _select(config, path, default=_MISSING):
@@ -16,7 +16,9 @@ def _select(config, path, default=_MISSING):
         if value is None and default is not _MISSING:
             return default
         if not isinstance(value, Mapping):
-            raise ProfileConfigurationError(f"{path}: parent of {key} must be a mapping")
+            raise ProfileConfigurationError(
+                f"{path}: parent of {key} must be a mapping"
+            )
         if key not in value:
             if default is _MISSING:
                 raise ProfileConfigurationError(f"Missing configuration: {path}")
@@ -26,15 +28,6 @@ def _select(config, path, default=_MISSING):
 
 
 def validate_runtime_profile(config) -> bool:
-    """Check selection and minimal native preconditions without changing config.
-
-    Explicit ``enabled=false`` overrides any stored profile. ``enabled=true``
-    selects the sole profile by default; old custom configs without the switch
-    can still select it explicitly. Nothing is written back to Hydra config.
-
-    Native main has already mapped rollout node/GPU counts. Backend placement and
-    training algorithm checks remain native; this is not a full topology validator.
-    """
     if not isinstance(config, Mapping):
         raise ProfileConfigurationError("Configuration must be a mapping")
     multitask = _select(config, "multitask", None)
@@ -54,12 +47,17 @@ def validate_runtime_profile(config) -> bool:
             return False
         profile = PROFILE_ID
     if not isinstance(profile, str) or profile != PROFILE_ID:
-        raise ProfileConfigurationError(f"Unknown multitask.runtime.profile: {profile!r}")
+        raise ProfileConfigurationError(
+            f"Unknown multitask.runtime.profile: {profile!r}"
+        )
     runtime = _select(config, "multitask.runtime", None)
     if runtime is not None and set(runtime) - {"profile"}:
-        raise ProfileConfigurationError("multitask.runtime accepts only profile, not per-class selectors")
+        raise ProfileConfigurationError("multitask.runtime accepts only profile")
     if _select(config, "multitask.rollout_deployment", None) is not None:
-        raise ProfileConfigurationError("Use only multitask.runtime.profile to select the deployment")
+        raise ProfileConfigurationError(
+            "Use only multitask.runtime.profile to select the deployment"
+        )
+
     for path, expected in (
         ("actor_rollout_ref.hybrid_engine", False),
         ("async_training.use_trainer_do_validate", False),
@@ -72,42 +70,82 @@ def validate_runtime_profile(config) -> bool:
     ):
         value = _select(config, path)
         if type(value) is not type(expected) or value != expected:
-            raise ProfileConfigurationError(f"{path} must be {expected!r}, got {value!r}")
+            raise ProfileConfigurationError(
+                f"{path} must be {expected!r}, got {value!r}"
+            )
+
     prefix = "actor_rollout_ref.rollout"
     disaggregation = _select(config, f"{prefix}.disaggregation", None)
     if disaggregation is not None:
-        if not isinstance(disaggregation, Mapping) or disaggregation.get("enabled", False) is not False:
-            raise ProfileConfigurationError("This vLLM adapter family does not implement PD replicas")
+        if (
+            not isinstance(disaggregation, Mapping)
+            or disaggregation.get("enabled", False) is not False
+        ):
+            raise ProfileConfigurationError(
+                "first release does not support PD/disaggregated rollout"
+            )
+
+    router_config_path = _select(config, f"{prefix}.router_config_path", None)
+    if router_config_path not in (None, ""):
+        raise ProfileConfigurationError(
+            "first release owns the request-state LB and does not support router_config_path"
+        )
+
     backend = _select(config, f"{prefix}.checkpoint_engine.backend")
     if not isinstance(backend, str) or not backend.strip() or backend == "naive":
-        raise ProfileConfigurationError("Pure STANDALONE requires a non-naive checkpoint engine")
+        raise ProfileConfigurationError(
+            "pure STANDALONE requires a non-naive checkpoint engine"
+        )
+    if backend in ("nccl", "hccl"):
+        rebuild_path = f"{prefix}.checkpoint_engine.engine_kwargs.{backend}.rebuild_group"
+        if _select(config, rebuild_path, False) is not True:
+            raise ProfileConfigurationError(
+                f"{rebuild_path} must be True for dynamic checkpoint membership"
+            )
+
     sizes = {}
     for field in (
-        "nnodes", "n_gpus_per_node", "tensor_model_parallel_size",
-        "data_parallel_size", "pipeline_model_parallel_size",
+        "nnodes",
+        "n_gpus_per_node",
+        "tensor_model_parallel_size",
+        "data_parallel_size",
+        "pipeline_model_parallel_size",
     ):
         value = _select(config, f"{prefix}.{field}")
         if type(value) is not int or value <= 0:
-            raise ProfileConfigurationError(f"{prefix}.{field} must be a positive integer")
+            raise ProfileConfigurationError(
+                f"{prefix}.{field} must be a positive integer"
+            )
         sizes[field] = value
+
+    if sizes["nnodes"] != 1:
+        raise ProfileConfigurationError(
+            "first release supports single-node rollout only"
+        )
+    if sizes["data_parallel_size"] != 1:
+        raise ProfileConfigurationError(
+            "first release requires data_parallel_size=1"
+        )
+    if sizes["pipeline_model_parallel_size"] != 1:
+        raise ProfileConfigurationError(
+            "first release requires pipeline_model_parallel_size=1"
+        )
+
     for field in ("nnodes", "n_gpus_per_node"):
         value = _select(config, f"rollout.{field}")
         if type(value) is not int or value != sizes[field]:
-            raise ProfileConfigurationError(f"Native main must map rollout.{field} before selecting MultiTask")
-    replica_gpus = (
-        sizes["tensor_model_parallel_size"] * sizes["data_parallel_size"] * sizes["pipeline_model_parallel_size"]
-    )
-    if sizes["nnodes"] * sizes["n_gpus_per_node"] < replica_gpus:
-        raise ProfileConfigurationError("Rollout resources cannot fit one replica")
+            raise ProfileConfigurationError(
+                f"Native main must map rollout.{field} before selecting MultiTask"
+            )
+
+    if sizes["tensor_model_parallel_size"] > sizes["n_gpus_per_node"]:
+        raise ProfileConfigurationError(
+            "TP replica must fit on the single supported node"
+        )
     return True
 
 
 def resolve_runtime_profile(config):
-    """Return the real root ActorClass, or None for a disabled profile.
-
-    Import failures propagate: an enabled MultiTask run must not silently fall
-    back to native classes. This function never starts Ray or discovers GS.
-    """
     if not validate_runtime_profile(config):
         return None
     from .experimental_fully_async.task_runner import MultiTaskFullyAsyncTaskRunner
