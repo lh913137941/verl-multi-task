@@ -25,7 +25,10 @@ def config():
                 "data_parallel_size": 1,
                 "pipeline_model_parallel_size": 1,
                 "disaggregation": {"enabled": False},
-                "checkpoint_engine": {"backend": "nccl"},
+                "checkpoint_engine": {
+                    "backend": "nccl",
+                    "engine_kwargs": {"nccl": {"rebuild_group": True}},
+                },
             },
         },
         "rollout": {"nnodes": 1, "n_gpus_per_node": 8},
@@ -131,6 +134,27 @@ def test_non_naive_checkpoint_engine_is_required():
     current = config()
     current["actor_rollout_ref"]["rollout"]["checkpoint_engine"]["backend"] = "naive"
     with pytest.raises(ProfileConfigurationError, match="non-naive"):
+        validate_runtime_profile(current)
+
+
+@pytest.mark.parametrize("backend", ["nccl", "hccl"])
+@pytest.mark.parametrize("value", [None, False, "true", 1])
+def test_dynamic_collective_membership_requires_explicit_rebuild(backend, value):
+    current = config()
+    ce = current["actor_rollout_ref"]["rollout"]["checkpoint_engine"]
+    ce["backend"] = backend
+    ce["engine_kwargs"] = {backend: {"rebuild_group": value}}
+    with pytest.raises(ProfileConfigurationError, match="rebuild_group"):
+        validate_runtime_profile(current)
+
+
+@pytest.mark.parametrize("backend", ["nccl", "hccl"])
+def test_collective_rebuild_missing_is_rejected(backend):
+    current = config()
+    ce = current["actor_rollout_ref"]["rollout"]["checkpoint_engine"]
+    ce["backend"] = backend
+    ce.pop("engine_kwargs", None)
+    with pytest.raises(ProfileConfigurationError, match="rebuild_group"):
         validate_runtime_profile(current)
 
 

@@ -1337,6 +1337,10 @@ def test_ce_pending_bootstrap_is_not_effective_until_weight_ready():
         )
     assert ce.replicas == ["native"]
 
+    # Model the CE-owned confirmation; real transfer ordering is tested below.
+    ce._bootstrap_ready()[key] = (
+        "op-add", 7, OperationEvidence("op-add", EvidenceType.WEIGHT_READY, 2)
+    )
     ce.commit_pending(
         key,
         OperationEvidence("op-add", EvidenceType.WEIGHT_READY, 2),
@@ -1458,6 +1462,10 @@ def test_ce_target_bootstrap_syncs_only_pending_target_and_is_idempotent():
     assert second == first
     assert calls == before
 
+    ce.commit_pending(key, first, loaded_version=7)
+    assert ce.effective_replicas[key] == ((replica,), 7)
+    assert ce.replicas == ["native", replica]
+
     with pytest.raises(ValueError, match="conflicting target bootstrap replay"):
         asyncio.run(
             ce.bootstrap_target(key, operation_id="op-add", loaded_version=8)
@@ -1539,6 +1547,85 @@ def test_ce_can_advance_one_effective_member_version():
     ce.mark_loaded_version(key, 3)
 
     assert ce.effective_replicas[key] == (("replica",), 3)
+
+
+def test_ce_rejects_unverified_weight_ready_without_changing_membership():
+    ce = checkpoint_manager_class()(replicas=[])
+    key = ReplicaKey("task-a", "borrowed-0")
+    ce.register_pending(key, ["borrowed"], operation_id="op-add")
+    with pytest.raises(ValueError, match="confirmed bootstrap"):
+        ce.commit_pending(
+            key, OperationEvidence("op-add", EvidenceType.WEIGHT_READY, 2),
+            loaded_version=7,
+        )
+    assert key in ce.pending_bootstrap
+    assert ce.effective_replicas == {}
+    assert ce.replicas == []
+
+
+@pytest.mark.parametrize("version", [6, 8, True])
+def test_ce_commit_requires_confirmed_bootstrap_version(version):
+    ce = checkpoint_manager_class()(replicas=[])
+    key = ReplicaKey("task-a", "borrowed-0")
+    evidence = OperationEvidence("op-add", EvidenceType.WEIGHT_READY, 2)
+    ce.register_pending(key, ["borrowed"], operation_id="op-add")
+    ce._bootstrap_ready()[key] = ("op-add", 7, evidence)
+    with pytest.raises(ValueError):
+        ce.commit_pending(key, evidence, loaded_version=version)
+    assert ce.effective_replicas == {}
+    assert ce.replicas == []
+
+
+def test_ce_remove_invalidates_bootstrap_result_for_reused_key():
+    ce = checkpoint_manager_class()(replicas=[])
+    key = ReplicaKey("task-a", "borrowed-0")
+    evidence = OperationEvidence("op-add", EvidenceType.WEIGHT_READY, 2)
+    ce.register_pending(key, ["old-runtime"], operation_id="op-add")
+    ce._bootstrap_ready()[key] = ("op-add", 7, evidence)
+    ce.commit_pending(key, evidence, loaded_version=7)
+    ce.remove_effective(key)
+    ce.register_pending(key, ["new-runtime"], operation_id="op-next")
+    assert key not in ce._bootstrap_ready()
+    assert ce.replicas == []
+
+
+def test_ce_committed_replay_rejects_replaced_evidence():
+    ce = checkpoint_manager_class()(replicas=[])
+    key = ReplicaKey("task-a", "borrowed-0")
+    evidence = OperationEvidence("op-add", EvidenceType.WEIGHT_READY, 2)
+    ce.register_pending(key, ["runtime"], operation_id="op-add")
+    ce._bootstrap_ready()[key] = ("op-add", 7, evidence)
+    ce.commit_pending(key, evidence, loaded_version=7)
+    with pytest.raises(ValueError, match="confirmed bootstrap"):
+        ce.commit_pending(
+            key, OperationEvidence("op-add", EvidenceType.WEIGHT_READY, 3),
+            loaded_version=7,
+        )
+    assert ce.effective_replicas[key] == (("runtime",), 7)
+
+
+@pytest.mark.parametrize("stage", ["pending", "effective"])
+def test_ce_runtime_cannot_belong_to_two_replica_keys(stage):
+    ce = checkpoint_manager_class()(replicas=[])
+    first = ReplicaKey("task-a", "first")
+    second = ReplicaKey("task-a", "second")
+    if stage == "pending":
+        ce.register_pending(first, ["runtime"], operation_id="op-first")
+    else:
+        ce.add_effective(first, ["runtime"], loaded_version=1)
+    with pytest.raises(ValueError):
+        ce.register_pending(second, ["runtime"], operation_id="op-second")
+    with pytest.raises(ValueError, match="another ReplicaKey"):
+        ce.add_effective(second, ["runtime"], loaded_version=1)
+
+
+def test_ce_rejects_duplicate_target_runtimes():
+    ce = checkpoint_manager_class()(replicas=[])
+    key = ReplicaKey("task-a", "borrowed-0")
+    with pytest.raises(ValueError, match="duplicate"):
+        ce.register_pending(key, ["runtime", "runtime"], operation_id="op-add")
+    with pytest.raises(ValueError, match="duplicate"):
+        ce.add_effective(key, ["runtime", "runtime"], loaded_version=1)
 
 
 def test_rollouter_idle_detection_treats_unknown_capacity_as_zero():

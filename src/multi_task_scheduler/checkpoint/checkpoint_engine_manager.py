@@ -50,6 +50,15 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
     def pending_bootstrap(self) -> dict:
         return self._pending_members()
 
+    def _validate_runtime_membership(self, key: ReplicaKey, replicas: tuple) -> None:
+        for index, replica in enumerate(replicas):
+            if replica in replicas[:index]:
+                raise ValueError("duplicate runtime in CE membership")
+        for entries in (self._members(), self._pending_members()):
+            for other_key, (other_replicas, _) in entries.items():
+                if other_key != key and any(r in other_replicas for r in replicas):
+                    raise ValueError("runtime already belongs to another ReplicaKey")
+
     def register_pending(
         self,
         key: ReplicaKey,
@@ -65,6 +74,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         replicas = tuple(replicas)
         if not replicas:
             raise ValueError("pending bootstrap requires at least one replica")
+        self._validate_runtime_membership(key, replicas)
 
         effective = self._members().get(key)
         if effective is not None:
@@ -97,11 +107,16 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             raise TypeError("commit_pending requires OperationEvidence")
         if evidence.type is not EvidenceType.WEIGHT_READY:
             raise ValueError("pending bootstrap may commit only from WEIGHT_READY")
+        if type(loaded_version) is not int or loaded_version < 0:
+            raise ValueError("loaded_version must be a nonnegative integer")
 
         existing_commit = self._bootstrap_commits().get(key)
         if existing_commit is not None:
             if existing_commit != evidence.operation_id:
                 raise ValueError("ReplicaKey bootstrap was committed by another operation")
+            confirmed = self._bootstrap_ready().get(key)
+            if confirmed != (evidence.operation_id, loaded_version, evidence):
+                raise ValueError("WEIGHT_READY does not match confirmed bootstrap")
             member = self._members().get(key)
             if member is None or member[1] != loaded_version:
                 raise ValueError("conflicting bootstrap commit replay")
@@ -113,6 +128,8 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             raise KeyError(f"no pending bootstrap for {key!r}") from exc
         if operation_id != evidence.operation_id:
             raise ValueError("WEIGHT_READY evidence belongs to another operation")
+        if self._bootstrap_ready().get(key) != (operation_id, loaded_version, evidence):
+            raise ValueError("WEIGHT_READY does not match confirmed bootstrap")
 
         self.add_effective(key, replicas, loaded_version=loaded_version)
         self._pending_members().pop(key, None)
@@ -131,6 +148,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         replicas = tuple(replicas)
         if not replicas:
             raise ValueError("effective membership requires at least one replica")
+        self._validate_runtime_membership(key, replicas)
         entry = (replicas, loaded_version)
         existing = self._members().get(key)
         if existing is not None and existing != entry:
@@ -142,7 +160,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         self._members()[key] = entry
 
     def remove_effective(self, key: ReplicaKey) -> None:
-        self._pending_members().pop(key, None)
+        self.discard_pending(key)
         self._bootstrap_commits().pop(key, None)
         entry = self._members().pop(key, None)
         if entry is None:

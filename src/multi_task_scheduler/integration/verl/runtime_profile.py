@@ -96,6 +96,12 @@ def validate_runtime_profile(config) -> bool:
         raise ProfileConfigurationError(
             "pure STANDALONE requires a non-naive checkpoint engine"
         )
+    if backend in ("nccl", "hccl"):
+        rebuild_path = f"{prefix}.checkpoint_engine.engine_kwargs.{backend}.rebuild_group"
+        if _select(config, rebuild_path, False) is not True:
+            raise ProfileConfigurationError(
+                f"{rebuild_path} must be True for dynamic checkpoint membership"
+            )
 
     sizes = {}
     for field in (

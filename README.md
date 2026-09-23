@@ -51,6 +51,7 @@ actor_rollout_ref.hybrid_engine=false
 actor_rollout_ref.rollout.name=vllm
 actor_rollout_ref.rollout.mode=async
 actor_rollout_ref.rollout.checkpoint_engine.backend=nccl
+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nccl.rebuild_group=true
 actor_rollout_ref.rollout.calculate_log_probs=true
 async_training.use_trainer_do_validate=false
 async_training.use_dynamic_resource_scheduling=false
