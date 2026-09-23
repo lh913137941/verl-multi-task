@@ -304,6 +304,78 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             "error": record.get("error"),
         }
 
+    def _resolve_placement_groups(self, claims) -> dict[str, object]:
+        """Resolve verified PG handles from serialized claim metadata.
+
+        The wire contract carries IDs, not Ray handles. The Ray PG table is
+        keyed by pg.id.hex() and records the stable PG name; resolving by name
+        avoids constructing private PlacementGroupID objects from strings.
+        """
+        claims = tuple(claims)
+        if not claims:
+            raise ValueError("placement resolution requires nonempty claims")
+
+        table = ray.util.placement_group_table()
+        namespace = ray.get_runtime_context().namespace
+        resolved = {}
+
+        for claim in claims:
+            pg_id = claim["pg_id"]
+            expected_namespace = claim.get("pg_namespace")
+            if expected_namespace is not None:
+                if not isinstance(expected_namespace, str) or not expected_namespace:
+                    raise ValueError("pg_namespace must be a nonempty string when provided")
+                if expected_namespace != namespace:
+                    raise ValueError("claim placement group belongs to another Ray namespace")
+
+            info = table.get(pg_id)
+            if info is None:
+                raise ValueError(f"placement group {pg_id!r} is not present in Ray")
+            if info.get("state") != "CREATED":
+                raise ValueError(
+                    f"placement group {pg_id!r} is not CREATED: {info.get('state')!r}"
+                )
+
+            bundle_index = claim["bundle_index"]
+            bundles = info.get("bundles") or {}
+            bundle = bundles.get(bundle_index, bundles.get(str(bundle_index)))
+            if bundle is None:
+                raise ValueError(
+                    f"placement group {pg_id!r} has no bundle {bundle_index}"
+                )
+
+            bundle_nodes = info.get("bundles_to_node_id") or {}
+            actual_node_id = bundle_nodes.get(
+                bundle_index,
+                bundle_nodes.get(str(bundle_index)),
+            )
+            if not actual_node_id:
+                raise ValueError(
+                    f"placement group {pg_id!r} bundle {bundle_index} has no node assignment"
+                )
+            if actual_node_id != claim["node_id"]:
+                raise ValueError(
+                    f"claim node_id does not match Ray placement for {pg_id!r}/{bundle_index}"
+                )
+
+            name = info.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError(
+                    f"placement group {pg_id!r} must be named for safe handle recovery"
+                )
+            pg = ray.util.get_placement_group(name)
+            actual_pg_id = pg.id.hex()
+            if actual_pg_id != pg_id:
+                raise ValueError(
+                    f"resolved placement group id mismatch: expected {pg_id!r}, got {actual_pg_id!r}"
+                )
+            if bundle_index >= pg.bundle_count:
+                raise ValueError(
+                    f"resolved placement group {pg_id!r} lacks bundle {bundle_index}"
+                )
+            resolved[pg_id] = pg
+
+        return resolved
     async def create_borrowed_replica(self, spec: dict) -> dict:
         """Idempotently register create intent, then stop at the unverified GPU boundary.
 
@@ -363,6 +435,9 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             self.borrowed_operations[lease_id] = record
 
         try:
+            pg_by_id = self._resolve_placement_groups(resolved_spec["claims"])
+            if set(pg_by_id) != {claim["pg_id"] for claim in resolved_spec["claims"]}:
+                raise RuntimeError("placement-group resolution returned incomplete coverage")
             raise NotImplementedError(
                 "borrowed runtime creation requires verified PG/bundle actor backend"
             )

@@ -420,6 +420,49 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         ReplicaState.RELEASED: set(),
         ReplicaState.QUARANTINED: set(),
     }
+    class FakePGId:
+        def __init__(self, value):
+            self.value = value
+
+        def hex(self):
+            return self.value
+
+    class FakePG:
+        def __init__(self, value, bundle_count=1):
+            self.id = FakePGId(value)
+            self.bundle_count = bundle_count
+
+    fake_pg = FakePG("pg")
+    fake_ray = type(
+        "ManagerRay",
+        (),
+        {
+            "util": type(
+                "Util",
+                (),
+                {
+                    "placement_group_table": staticmethod(
+                        lambda: {
+                            "pg": {
+                                "state": "CREATED",
+                                "name": "verl-pg-0",
+                                "bundles": {0: {"CPU": 1, "GPU": 1}},
+                                "bundles_to_node_id": {0: "n0"},
+                            }
+                        }
+                    ),
+                    "get_placement_group": staticmethod(
+                        lambda name: fake_pg
+                        if name == "verl-pg-0"
+                        else (_ for _ in ()).throw(ValueError(name))
+                    ),
+                },
+            )(),
+            "get_runtime_context": staticmethod(
+                lambda: type("RuntimeContext", (), {"namespace": "verl-test"})()
+            ),
+        },
+    )
     cls = isolated(
         f"{INTEGRATION}/llm_server_manager.py",
         "MultiTaskLLMServerManager",
@@ -431,6 +474,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         ReplicaState=ReplicaState,
         Lease=Lease,
         asyncio=asyncio,
+        ray=fake_ray,
         time=time,
         _ALLOWED=allowed,
     )
@@ -493,6 +537,27 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     expired = dict(valid_spec, expires_at=time.time() - 1)
     with pytest.raises(ValueError, match="expired"):
         manager.validate_borrowed_spec(expired)
+
+    wrong_namespace = dict(valid_spec)
+    wrong_namespace["selected_slots"] = [
+        dict(valid_spec["selected_slots"][0], pg_namespace="other")
+    ]
+    with pytest.raises(ValueError, match="another Ray namespace"):
+        manager._resolve_placement_groups(
+            manager.validate_borrowed_spec(wrong_namespace)["claims"]
+        )
+
+    wrong_node = dict(valid_spec)
+    wrong_node["selected_slots"] = [
+        dict(valid_spec["selected_slots"][0], node_id="n9")
+    ]
+    with pytest.raises(ValueError, match="node_id does not match"):
+        manager._resolve_placement_groups(
+            manager.validate_borrowed_spec(wrong_node)["claims"]
+        )
+
+    resolved_pgs = manager._resolve_placement_groups(normalized["claims"])
+    assert resolved_pgs == {"pg": fake_pg}
 
     with pytest.raises(NotImplementedError, match="PG/bundle actor backend"):
         asyncio.run(manager.create_borrowed_replica(valid_spec))
