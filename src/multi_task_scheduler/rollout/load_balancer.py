@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from verl.workers.rollout.router import DEFAULT_ROUTING_CACHE_SIZE, GlobalRequestLoadBalancer
 
-from multi_task_scheduler.orchestration.contracts import AttemptState, ReplicaKey
+from multi_task_scheduler.orchestration.contracts import (
+    AttemptState,
+    EvidenceType,
+    OperationEvidence,
+    ReplicaKey,
+)
 
 _TERMINAL_ATTEMPT_STATES = {AttemptState.TERMINATED, AttemptState.SETTLED}
 
@@ -30,6 +35,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         self.routes: dict[ReplicaKey, str] = {}
         self.active_request_server: dict[str, str] = {}
         self.attempt_state: dict[str, AttemptState] = {}
+        self.draining_servers: set[str] = set()
 
         for key, server_id in dict(initial_routes or {}).items():
             if not isinstance(key, ReplicaKey):
@@ -48,6 +54,8 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
                 "first release allows at most one unsettled generation per request_id"
             )
         server_id, handle = super().acquire_server(request_id, **extra)
+        if server_id in self.draining_servers:
+            raise RuntimeError("draining server cannot accept new requests")
         self.active_request_server[request_id] = server_id
         self.attempt_state[request_id] = AttemptState.ADMITTED
         return server_id, handle
@@ -75,20 +83,23 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         request_id: str,
         client_id: str,
         prefix_digest: str,
-    ) -> AttemptState:
+    ) -> OperationEvidence:
         if not request_id or not client_id or not prefix_digest:
             raise ValueError("request_id, client_id and prefix_digest must be nonempty")
         state = self.attempt_state.get(request_id)
         if state is None:
             raise KeyError(f"unknown request_id {request_id!r}")
         if state in _TERMINAL_ATTEMPT_STATES:
-            return state
+            raise ValueError("request already settled")
         if state is not AttemptState.ADMITTED:
             raise ValueError(
                 f"request {request_id!r} is not eligible for continuation handoff"
             )
         self.attempt_state[request_id] = AttemptState.TERMINATED
-        return AttemptState.TERMINATED
+        return OperationEvidence.now(
+            request_id,
+            EvidenceType.EXIT_READY,
+        )
 
     def requests_for_server(self, server_id: str) -> tuple[str, ...]:
         return tuple(
@@ -125,8 +136,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         server_id = self.routes.get(key)
         if server_id is None:
             raise KeyError(key)
-        if server_id in self._servers:
-            self.remove_servers([server_id])
+        self.draining_servers.add(server_id)
         return server_id
 
     def finish_remove(self, key: ReplicaKey) -> None:
@@ -137,6 +147,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             raise ValueError("cannot remove route while requests remain unsettled")
         if server_id in self._servers:
             self.remove_servers([server_id])
+        self.draining_servers.discard(server_id)
         self.routes.pop(key, None)
 
     def gc_settled_requests(self, request_ids) -> None:
