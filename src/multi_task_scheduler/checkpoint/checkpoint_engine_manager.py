@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+
+import ray
 from verl.checkpoint_engine.base import CheckpointEngineManager
+from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
+
+from multi_task_scheduler.checkpoint.checkpoint_engine_worker import (
+    MultiTaskCheckpointEngineWorker,
+)
 
 from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
@@ -32,6 +40,11 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         if not hasattr(self, "_bootstrap_commit_map"):
             self._bootstrap_commit_map = {}
         return self._bootstrap_commit_map
+
+    def _bootstrap_ready(self) -> dict:
+        if not hasattr(self, "_bootstrap_ready_map"):
+            self._bootstrap_ready_map = {}
+        return self._bootstrap_ready_map
 
     @property
     def pending_bootstrap(self) -> dict:
@@ -107,6 +120,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
 
     def discard_pending(self, key: ReplicaKey) -> None:
         self._pending_members().pop(key, None)
+        self._bootstrap_ready().pop(key, None)
 
     def add_effective(self, key: ReplicaKey, replicas, *, loaded_version: int) -> None:
         if not isinstance(key, ReplicaKey):
@@ -142,5 +156,119 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         for key, (replicas, _old_version) in tuple(self._members().items()):
             self._members()[key] = (replicas, loaded_version)
 
-    def bootstrap_target(self, *args, **kwargs):
-        raise NotImplementedError("CE.bootstrap_target requires verified target-only native backend")
+    async def bootstrap_target(
+        self,
+        key: ReplicaKey,
+        *,
+        operation_id: str,
+        loaded_version: int,
+    ) -> OperationEvidence:
+        """Synchronize only one hidden pending target using the native CE protocol."""
+        if not isinstance(key, ReplicaKey):
+            raise TypeError("key must be ReplicaKey")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("operation_id must be a nonempty string")
+        if type(loaded_version) is not int or loaded_version < 0:
+            raise ValueError("loaded_version must be a nonnegative integer")
+        if self.backend == "naive":
+            raise NotImplementedError(
+                "first-release target-only bootstrap requires non-naive checkpoint engine"
+            )
+
+        ready = self._bootstrap_ready().get(key)
+        if ready is not None:
+            ready_operation, ready_version, evidence = ready
+            if ready_operation != operation_id or ready_version != loaded_version:
+                raise ValueError("conflicting target bootstrap replay")
+            return evidence
+
+        try:
+            replicas, pending_operation = self._pending_members()[key]
+        except KeyError as exc:
+            raise KeyError(f"no pending bootstrap for {key!r}") from exc
+        if pending_operation != operation_id:
+            raise ValueError("pending target belongs to another operation")
+
+        workers = []
+        for replica in replicas:
+            workers.extend(replica.workers)
+        if not workers:
+            raise ValueError("pending target has no checkpoint-engine workers")
+
+        rollout = RayWorkerGroup.from_detached(
+            worker_handles=workers,
+            ray_cls_with_init=RayClassWithInitArgs(
+                cls=ray.remote(MultiTaskCheckpointEngineWorker)
+            ),
+            name_prefix=f"bootstrap_{operation_id}_",
+            use_gpu=True,
+        )
+        actor_wg = self.actor_wg
+        topology_started = False
+        finalized = False
+
+        try:
+            # Target is hidden, so active replicas must not be aborted or touched.
+            await asyncio.gather(
+                *[replica.release_kv_cache() for replica in replicas]
+            )
+
+            topology_started = True
+            self.build_process_group(rollout)
+
+            ray.get(
+                actor_wg.update_weights(
+                    global_steps=loaded_version,
+                    mode=self.backend,
+                )
+                + rollout.update_weights(global_steps=loaded_version)
+            )
+
+            ray.get(
+                actor_wg.execute_checkpoint_engine(
+                    ["finalize"] * actor_wg.world_size
+                )
+                + rollout.execute_checkpoint_engine(
+                    ["finalize"] * rollout.world_size
+                )
+            )
+            finalized = True
+
+            await asyncio.gather(
+                *[replica.resume_kv_cache() for replica in replicas]
+            )
+            health = await asyncio.gather(
+                *[replica.validate_server_runtime() for replica in replicas]
+            )
+            for item in health:
+                if item.get("global_steps") != loaded_version:
+                    raise RuntimeError(
+                        "target server did not confirm the published parameter version"
+                    )
+
+            evidence = OperationEvidence.now(
+                operation_id,
+                EvidenceType.WEIGHT_READY,
+            )
+            self._bootstrap_ready()[key] = (
+                operation_id,
+                loaded_version,
+                evidence,
+            )
+            return evidence
+        except BaseException as exc:
+            if topology_started and not finalized:
+                try:
+                    ray.get(
+                        actor_wg.execute_checkpoint_engine(
+                            ["finalize"] * actor_wg.world_size
+                        )
+                        + rollout.execute_checkpoint_engine(
+                            ["finalize"] * rollout.world_size
+                        )
+                    )
+                except BaseException as finalize_exc:
+                    raise RuntimeError(
+                        "target bootstrap failed and checkpoint topology cleanup is unverified"
+                    ) from finalize_exc
+            raise exc

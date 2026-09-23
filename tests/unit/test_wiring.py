@@ -1211,23 +1211,35 @@ def test_init_from_lease_reaches_runtime_ready_only_after_server_health():
     assert replica.borrowed_runtime_state == "RUNTIME_READY"
 
 
-def checkpoint_manager_class():
+def checkpoint_manager_class(**extra_scope):
     class Parent:
         def __init__(self, config=None, actor_wg=None, replicas=None):
+            self.config = config
+            self.backend = getattr(config, "backend", "nccl")
+            self.actor_wg = actor_wg
             self.replicas = list(replicas or [])
+            self.build_calls = []
 
         def remove_replicas(self, replicas):
             for replica in replicas:
                 if replica in self.replicas:
                     self.replicas.remove(replica)
 
+        def build_process_group(self, rollout):
+            self.build_calls.append(rollout)
+
+    scope = {
+        "ReplicaKey": ReplicaKey,
+        "OperationEvidence": OperationEvidence,
+        "EvidenceType": EvidenceType,
+        "asyncio": asyncio,
+        **extra_scope,
+    }
     return isolated(
         "checkpoint/checkpoint_engine_manager.py",
         "MultiTaskCheckpointEngineManager",
         Parent,
-        ReplicaKey=ReplicaKey,
-        OperationEvidence=OperationEvidence,
-        EvidenceType=EvidenceType,
+        **scope,
     )
 
 
@@ -1278,6 +1290,167 @@ def test_ce_pending_bootstrap_rejects_operation_rebind():
             OperationEvidence("op-2", EvidenceType.WEIGHT_READY, 1),
             loaded_version=3,
         )
+
+def test_ce_target_bootstrap_syncs_only_pending_target_and_is_idempotent():
+    calls = []
+
+    class FakeRolloutWG:
+        def __init__(self, workers):
+            self.workers = workers
+            self.world_size = len(workers)
+
+        @classmethod
+        def from_detached(cls, *, worker_handles, **kwargs):
+            calls.append(("wrap", tuple(worker_handles)))
+            return cls(list(worker_handles))
+
+        def update_weights(self, *, global_steps):
+            calls.append(("target-update", global_steps))
+            return [("target", global_steps)]
+
+        def execute_checkpoint_engine(self, methods):
+            calls.append(("target-finalize", tuple(methods)))
+            return [("target-finalize", len(methods))]
+
+    class FakeCIA:
+        def __init__(self, cls, *args, **kwargs):
+            self.cls = cls
+
+    class ActorWG:
+        world_size = 1
+
+        def update_weights(self, *, global_steps, mode):
+            calls.append(("actor-update", global_steps, mode))
+            return [("actor", global_steps)]
+
+        def execute_checkpoint_engine(self, methods):
+            calls.append(("actor-finalize", tuple(methods)))
+            return [("actor-finalize", len(methods))]
+
+    class FakeRay:
+        @staticmethod
+        def remote(cls):
+            return cls
+
+        @staticmethod
+        def get(value):
+            calls.append(("ray-get", tuple(value)))
+            return list(value)
+
+    class Replica:
+        workers = ["worker-0"]
+
+        async def release_kv_cache(self):
+            calls.append(("release-kv",))
+
+        async def resume_kv_cache(self):
+            calls.append(("resume-kv",))
+
+        async def validate_server_runtime(self):
+            calls.append(("health",))
+            return {"global_steps": 7}
+
+    config = type("Config", (), {"backend": "nccl"})()
+    cls = checkpoint_manager_class(
+        ray=FakeRay,
+        RayClassWithInitArgs=FakeCIA,
+        RayWorkerGroup=FakeRolloutWG,
+        MultiTaskCheckpointEngineWorker=object,
+    )
+    ce = cls(config=config, actor_wg=ActorWG(), replicas=["native"])
+    key = ReplicaKey("task-a", "borrowed-0")
+    replica = Replica()
+    ce.register_pending(key, [replica], operation_id="op-add")
+
+    first = asyncio.run(
+        ce.bootstrap_target(key, operation_id="op-add", loaded_version=7)
+    )
+    assert first.type is EvidenceType.WEIGHT_READY
+    assert key not in ce.effective_replicas
+    assert ce.replicas == ["native"]
+    assert ce.build_calls and ce.build_calls[0].workers == ["worker-0"]
+    assert ("actor-update", 7, "nccl") in calls
+    assert ("target-update", 7) in calls
+    assert ("health",) in calls
+
+    before = list(calls)
+    second = asyncio.run(
+        ce.bootstrap_target(key, operation_id="op-add", loaded_version=7)
+    )
+    assert second == first
+    assert calls == before
+
+    with pytest.raises(ValueError, match="conflicting target bootstrap replay"):
+        asyncio.run(
+            ce.bootstrap_target(key, operation_id="op-add", loaded_version=8)
+        )
+
+
+def test_ce_target_bootstrap_requires_server_version_confirmation():
+    class FakeRolloutWG:
+        world_size = 1
+
+        @classmethod
+        def from_detached(cls, *, worker_handles, **kwargs):
+            return cls()
+
+        def update_weights(self, *, global_steps):
+            return [None]
+
+        def execute_checkpoint_engine(self, methods):
+            return [None]
+
+    class FakeCIA:
+        def __init__(self, cls, *args, **kwargs):
+            pass
+
+    class ActorWG:
+        world_size = 1
+
+        def update_weights(self, *, global_steps, mode):
+            return [None]
+
+        def execute_checkpoint_engine(self, methods):
+            return [None]
+
+    class FakeRay:
+        @staticmethod
+        def remote(cls):
+            return cls
+
+        @staticmethod
+        def get(value):
+            return value
+
+    class Replica:
+        workers = ["worker-0"]
+
+        async def release_kv_cache(self):
+            return None
+
+        async def resume_kv_cache(self):
+            return None
+
+        async def validate_server_runtime(self):
+            return {"global_steps": 6}
+
+    config = type("Config", (), {"backend": "nccl"})()
+    cls = checkpoint_manager_class(
+        ray=FakeRay,
+        RayClassWithInitArgs=FakeCIA,
+        RayWorkerGroup=FakeRolloutWG,
+        MultiTaskCheckpointEngineWorker=object,
+    )
+    ce = cls(config=config, actor_wg=ActorWG(), replicas=[])
+    key = ReplicaKey("task-a", "borrowed-0")
+    ce.register_pending(key, [Replica()], operation_id="op-add")
+
+    with pytest.raises(RuntimeError, match="published parameter version"):
+        asyncio.run(
+            ce.bootstrap_target(key, operation_id="op-add", loaded_version=7)
+        )
+    assert key not in ce._bootstrap_ready()
+
 
 def rollouter_class():
     class Parent:
