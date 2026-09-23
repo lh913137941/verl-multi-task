@@ -608,6 +608,74 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     assert manager.next_replica_rank == 1
 
 
+def checkpoint_manager_class():
+    class Parent:
+        def __init__(self, config=None, actor_wg=None, replicas=None):
+            self.replicas = list(replicas or [])
+
+        def remove_replicas(self, replicas):
+            for replica in replicas:
+                if replica in self.replicas:
+                    self.replicas.remove(replica)
+
+    return isolated(
+        "checkpoint/checkpoint_engine_manager.py",
+        "MultiTaskCheckpointEngineManager",
+        Parent,
+        ReplicaKey=ReplicaKey,
+        OperationEvidence=OperationEvidence,
+        EvidenceType=EvidenceType,
+    )
+
+
+def test_ce_pending_bootstrap_is_not_effective_until_weight_ready():
+    ce = checkpoint_manager_class()(replicas=["native"])
+    key = ReplicaKey("task-a", "borrowed-0")
+    ce.register_pending(key, ["borrowed"], operation_id="op-add")
+
+    assert ce.pending_bootstrap[key] == (("borrowed",), "op-add")
+    assert key not in ce.effective_replicas
+    assert ce.replicas == ["native"]
+
+    with pytest.raises(ValueError, match="only from WEIGHT_READY"):
+        ce.commit_pending(
+            key,
+            OperationEvidence("op-add", EvidenceType.SERVICE_COMMITTED, 1),
+            loaded_version=7,
+        )
+    assert ce.replicas == ["native"]
+
+    ce.commit_pending(
+        key,
+        OperationEvidence("op-add", EvidenceType.WEIGHT_READY, 2),
+        loaded_version=7,
+    )
+    assert key not in ce.pending_bootstrap
+    assert ce.effective_replicas[key] == (("borrowed",), 7)
+    assert ce.replicas == ["native", "borrowed"]
+
+    ce.commit_pending(
+        key,
+        OperationEvidence("op-add", EvidenceType.WEIGHT_READY, 2),
+        loaded_version=7,
+    )
+
+
+def test_ce_pending_bootstrap_rejects_operation_rebind():
+    ce = checkpoint_manager_class()(replicas=[])
+    key = ReplicaKey("task-a", "borrowed-0")
+    ce.register_pending(key, ["borrowed"], operation_id="op-1")
+
+    with pytest.raises(ValueError, match="conflicting pending bootstrap"):
+        ce.register_pending(key, ["borrowed"], operation_id="op-2")
+
+    with pytest.raises(ValueError, match="another operation"):
+        ce.commit_pending(
+            key,
+            OperationEvidence("op-2", EvidenceType.WEIGHT_READY, 1),
+            loaded_version=3,
+        )
+
 def rollouter_class():
     class Parent:
         def __init__(self, *args, **kwargs):
