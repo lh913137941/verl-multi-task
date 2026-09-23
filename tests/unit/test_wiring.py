@@ -163,6 +163,26 @@ def test_admitted_request_blocks_removal_until_verified_continuation():
     assert key not in lb.routes
 
 
+def test_continuation_requires_an_active_drain_and_does_not_mutate_on_reject():
+    key = ReplicaKey("task-a", "r0")
+    lb = load_balancer_class()({"s0": object()}, initial_routes={key: "s0"})
+    lb.acquire_server("request-1")
+
+    with pytest.raises(ValueError, match="active drain operation"):
+        lb.confirm_continuation("request-1", "client-1", "prefix-1")
+
+    assert lb.query_attempt("request-1") is AttemptState.ADMITTED
+    assert lb.requests_for_server("s0") == ("request-1",)
+
+
+def test_one_server_cannot_be_rebound_to_another_drain_operation():
+    key = ReplicaKey("task-a", "r0")
+    lb = load_balancer_class()({"s0": object()}, initial_routes={key: "s0"})
+    lb.begin_drain(key, "op-1")
+
+    with pytest.raises(ValueError, match="another operation"):
+        lb.begin_drain(key, "op-2")
+
 def test_finish_remove_settles_verified_continuation_without_late_release():
     key = ReplicaKey("task-a", "r0")
     lb = load_balancer_class()({"s0": object()}, initial_routes={key: "s0"})
