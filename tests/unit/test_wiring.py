@@ -410,6 +410,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         ReplicaKind=ReplicaKind,
         ReplicaState=ReplicaState,
         Lease=Lease,
+        asyncio=asyncio,
         time=time,
         _ALLOWED=allowed,
     )
@@ -433,6 +434,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         "operation_id": "op-add",
         "lease_id": "borrower-lease",
         "borrower_task_id": "task-a",
+        "borrower_replica_id": "borrowed-0",
         "selected_slots": [
             {
                 "claim_id": "claim-0",
@@ -474,6 +476,23 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
 
     with pytest.raises(NotImplementedError, match="PG/bundle actor backend"):
         asyncio.run(manager.create_borrowed_replica(valid_spec))
+
+    record = manager.borrowed_operations["borrower-lease"]
+    assert record["state"] == "FAILED"
+    assert record["replica_rank"] == 0
+    assert record["claim_ids"] == ["claim-0"]
+    assert record["source_lease_ids"] == ["source-lease-0"]
+    assert manager.next_replica_rank == 1
+
+    # Exact replay returns the same failure boundary and does not allocate rank 1.
+    with pytest.raises(NotImplementedError, match="PG/bundle actor backend"):
+        asyncio.run(manager.create_borrowed_replica(valid_spec))
+    assert manager.next_replica_rank == 1
+
+    conflicting = dict(valid_spec, operation_id="op-other")
+    with pytest.raises(ValueError, match="conflicting borrowed create replay"):
+        asyncio.run(manager.create_borrowed_replica(conflicting))
+    assert manager.next_replica_rank == 1
 
 
 def rollouter_class():

@@ -1,5 +1,6 @@
 """Native Fully Async server manager plus the Manager-owned M view."""
 
+import asyncio
 import time
 
 import ray
@@ -44,6 +45,11 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         self.replica_state: dict[ReplicaKey, ReplicaState] = {}
         self.replica_kind: dict[ReplicaKey, ReplicaKind] = {}
         self._runtime_inventory: dict[ReplicaKey, object] = {}
+        self.next_replica_rank = 0
+        self.retired_replica_ranks: set[int] = set()
+        self._allocated_replica_ranks: set[int] = set()
+        self.borrowed_operations: dict[str, dict] = {}
+        self.replica_operation_lock = asyncio.Lock()
 
     async def _initialize_llm_servers(self, start_rank: int = 0):
         await super()._initialize_llm_servers(start_rank=start_rank)
@@ -58,6 +64,10 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 state=ReplicaState.ACTIVE,
                 runtime=replica,
             )
+            if type(rank) is not int or rank < 0:
+                raise ValueError("native replica_rank must be a nonnegative integer")
+            self._allocated_replica_ranks.add(rank)
+            self.next_replica_rank = max(self.next_replica_rank, rank + 1)
 
     async def _init_global_load_balancer(self) -> None:
         initial_routes = {
@@ -160,7 +170,12 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         if not isinstance(spec, dict):
             raise TypeError("borrowed placement spec must be a dict")
 
-        for field_name in ("operation_id", "lease_id", "borrower_task_id"):
+        for field_name in (
+            "operation_id",
+            "lease_id",
+            "borrower_task_id",
+            "borrower_replica_id",
+        ):
             value = spec.get(field_name)
             if not isinstance(value, str) or not value:
                 raise ValueError(f"borrowed placement requires nonempty {field_name}")
@@ -245,12 +260,101 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         normalized["expires_at"] = lease.expires_at
         return normalized
 
+    def _allocate_replica_rank_locked(self, requested_rank: int | None) -> int:
+        """Allocate a task-local rank exactly once while replica_operation_lock is held."""
+        if requested_rank is not None:
+            if requested_rank in self.retired_replica_ranks:
+                raise ValueError("retired replica_rank cannot be reused")
+            if requested_rank in self._allocated_replica_ranks:
+                raise ValueError("replica_rank is already allocated")
+            rank = requested_rank
+            self.next_replica_rank = max(self.next_replica_rank, rank + 1)
+        else:
+            rank = self.next_replica_rank
+            while rank in self._allocated_replica_ranks or rank in self.retired_replica_ranks:
+                rank += 1
+            self.next_replica_rank = rank + 1
+        self._allocated_replica_ranks.add(rank)
+        return rank
+
+    @staticmethod
+    def _borrowed_receipt(record: dict) -> dict:
+        result = record.get("result")
+        if result is not None:
+            return dict(result)
+        return {
+            "operation_id": record["operation_id"],
+            "lease_id": record["lease_id"],
+            "replica_rank": record["replica_rank"],
+            "state": record["state"],
+            "released": False,
+            "error": record.get("error"),
+        }
+
     async def create_borrowed_replica(self, spec: dict) -> dict:
-        """Validate the placement contract, then stop at the unverified GPU boundary."""
-        self.validate_borrowed_spec(spec)
-        raise NotImplementedError(
-            "borrowed runtime creation requires verified PG/bundle actor backend"
-        )
+        """Idempotently register create intent, then stop at the unverified GPU boundary.
+
+        The durable-in-process identity/rank fence is useful before the actor backend
+        exists: a retry of the same borrower lease cannot allocate a second rank, and
+        a conflicting replay cannot reach future Ray side effects.
+        """
+        normalized = self.validate_borrowed_spec(spec)
+        lease_id = normalized["lease_id"]
+
+        async with self.replica_operation_lock:
+            existing = self.borrowed_operations.get(lease_id)
+            if existing is not None:
+                if (
+                    existing["operation_id"] != normalized["operation_id"]
+                    or existing["spec"] != normalized
+                ):
+                    raise ValueError("conflicting borrowed create replay")
+                if existing["state"] == "FAILED":
+                    error = existing.get("error") or {}
+                    if error.get("type") == "NotImplementedError":
+                        raise NotImplementedError(error.get("message", "borrowed create failed"))
+                    raise RuntimeError(error.get("message", "borrowed create failed"))
+                if existing.get("result") is not None:
+                    return self._borrowed_receipt(existing)
+                raise RuntimeError("borrowed create is already in progress")
+
+            rank = self._allocate_replica_rank_locked(normalized.get("replica_rank"))
+            normalized = dict(normalized)
+            normalized["replica_rank"] = rank
+            record = {
+                "operation_id": normalized["operation_id"],
+                "lease_id": lease_id,
+                "borrower_task_id": normalized["borrower_task_id"],
+                "replica_rank": rank,
+                "claim_ids": [claim["claim_id"] for claim in normalized["claims"]],
+                "source_lease_ids": list(normalized["lease_ids"]),
+                "state": "CREATING",
+                "cancel_requested": False,
+                "replica": None,
+                "worker_handles": [],
+                "server_handles": [],
+                "created_actor_names": [],
+                "result": None,
+                "error": None,
+                # Manager-local replay fence; never serialized to GS.
+                "spec": normalized,
+            }
+            self.borrowed_operations[lease_id] = record
+
+        try:
+            raise NotImplementedError(
+                "borrowed runtime creation requires verified PG/bundle actor backend"
+            )
+        except BaseException as exc:
+            async with self.replica_operation_lock:
+                current = self.borrowed_operations[lease_id]
+                current["state"] = "FAILED"
+                current["error"] = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                current["result"] = self._borrowed_receipt(current)
+            raise
 
     def create_hidden(self, *args, **kwargs):
         raise NotImplementedError("RuntimeBackend.create_hidden requires verified native backend")
