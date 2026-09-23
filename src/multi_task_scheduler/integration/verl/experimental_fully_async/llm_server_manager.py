@@ -306,7 +306,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             if existing is not None:
                 if (
                     existing["operation_id"] != normalized["operation_id"]
-                    or existing["spec"] != normalized
+                    or existing["request_spec"] != normalized
                 ):
                     raise ValueError("conflicting borrowed create replay")
                 if existing["state"] == "FAILED":
@@ -318,9 +318,14 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                     return self._borrowed_receipt(existing)
                 raise RuntimeError("borrowed create is already in progress")
 
+            request_spec = dict(normalized)
+            request_spec["claims"] = [dict(claim) for claim in normalized["claims"]]
+            request_spec["lease_ids"] = list(normalized["lease_ids"])
             rank = self._allocate_replica_rank_locked(normalized.get("replica_rank"))
-            normalized = dict(normalized)
-            normalized["replica_rank"] = rank
+            resolved_spec = dict(normalized)
+            resolved_spec["claims"] = [dict(claim) for claim in normalized["claims"]]
+            resolved_spec["lease_ids"] = list(normalized["lease_ids"])
+            resolved_spec["replica_rank"] = rank
             record = {
                 "operation_id": normalized["operation_id"],
                 "lease_id": lease_id,
@@ -336,8 +341,11 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 "created_actor_names": [],
                 "result": None,
                 "error": None,
-                # Manager-local replay fence; never serialized to GS.
-                "spec": normalized,
+                # Manager-local replay fence and resolved placement; neither is
+                # serialized to GS. Keeping them separate lets replica_rank=None
+                # retries recover the first allocated rank without false conflict.
+                "request_spec": request_spec,
+                "resolved_spec": resolved_spec,
             }
             self.borrowed_operations[lease_id] = record
 
