@@ -9,8 +9,6 @@ from multi_task_scheduler.checkpoint.checkpoint_engine_worker import (
     MultiTaskCheckpointEngineWorker,
 )
 from multi_task_scheduler.orchestration.contracts import (
-    EvidenceType,
-    OperationEvidence,
     ReplicaKind,
 )
 from .http_server import MultiTaskvLLMHttpServer
@@ -43,32 +41,23 @@ class MultiTaskvLLMReplica(vLLMReplica):
         self.placement_claims = lease.claims
 
     def prepare_create(self) -> dict:
-        return {
-            "replica_kind": self.replica_kind.value,
-            "runtime_epoch": self.runtime_epoch,
-        }
-
-    def mark_weight_ready(self, operation_id: str) -> OperationEvidence:
-        return OperationEvidence.now(
-            operation_id,
-            EvidenceType.WEIGHT_READY,
+        raise NotImplementedError(
+            "replica creation requires verified native runtime backend"
         )
 
-    def prepare_exit(self, operation_id: str) -> OperationEvidence:
-        return OperationEvidence.now(
-            operation_id,
-            EvidenceType.EXIT_READY,
+    def mark_weight_ready(self, operation_id: str):
+        raise NotImplementedError(
+            "weight readiness requires verified replay/bootstrap backend"
         )
 
-    def release_gpu(
-        self,
-        operation_id: str,
-        gpu_uuids,
-    ) -> OperationEvidence:
-        return OperationEvidence.now(
-            operation_id,
-            EvidenceType.RELEASED,
-            released_gpu_uuids=tuple(gpu_uuids),
+    def prepare_exit(self, operation_id: str):
+        raise NotImplementedError(
+            "exit readiness requires verified vLLM sleep/drain backend"
+        )
+
+    def release_gpu(self, operation_id: str, gpu_uuids):
+        raise NotImplementedError(
+            "GPU release evidence requires verified runtime destroy backend"
         )
 
     def _setup_env_cuda_visible_devices(self, *args, **kwargs):
@@ -77,14 +66,9 @@ class MultiTaskvLLMReplica(vLLMReplica):
                 raise ValueError(
                     "borrowed replica requires placement claims"
                 )
-            return super()._setup_env_cuda_visible_devices(*args, **kwargs)
         return super()._setup_env_cuda_visible_devices(*args, **kwargs)
 
     def abort_target(self, request_ids):
-        return [
-            {
-                "request_id": request_id,
-                "aborted": True,
-            }
-            for request_id in request_ids
-        ]
+        raise NotImplementedError(
+            "targeted abort requires verified FORCE_VERIFIED backend"
+        )
