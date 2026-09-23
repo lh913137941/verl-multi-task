@@ -311,6 +311,26 @@ def test_taskrunner_executes_add_and_commits_terminal_record():
     assert spec["selected_slots"][0]["rank"] == 0
 
 
+def test_taskrunner_borrowed_spec_rebuilds_rank_view_from_claim_order():
+    command = OperationCommand(
+        "op-rank",
+        OperationKind.ADD,
+        ReplicaKey("task-a", "r0"),
+        "l1",
+    )
+    claim = dict(taskrunner_lease().claims[0])
+    claim["rank"] = 99
+    claim["node_rank"] = 7
+    claim["local_rank"] = 11
+    lease = Lease("l1", (claim,), 0)
+
+    spec = taskrunner_class()._build_borrowed_spec(command, lease)
+
+    slot = spec["selected_slots"][0]
+    assert slot["rank"] == 0
+    assert slot["node_rank"] == 0
+    assert slot["local_rank"] == 0
+
 def test_taskrunner_add_requires_matching_lease_snapshot_before_launch():
     runner = taskrunner_class()()
     runner.task_session = "task-a"

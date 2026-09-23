@@ -74,9 +74,11 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         selected_slots = []
         for rank, claim in enumerate(lease.claims):
             slot = dict(claim)
-            slot.setdefault("rank", rank)
-            slot.setdefault("node_rank", 0)
-            slot.setdefault("local_rank", rank)
+            # Donor/source rank metadata is not borrower topology. First release
+            # is single-node, so rebuild the borrower rank view unconditionally.
+            slot["rank"] = rank
+            slot["node_rank"] = 0
+            slot["local_rank"] = rank
             selected_slots.append(slot)
 
         return {
