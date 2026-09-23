@@ -16,9 +16,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
     """Reuse native routing/counters and add exact request lifecycle facts."""
 
     def __init__(self, servers, max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
-                 full_determinism=False, *, group_scheduler=None,
-                 initial_routes=None):
-        self.group_scheduler = group_scheduler
+                 full_determinism=False, *, initial_routes=None):
         super().__init__(servers, max_cache_size=max_cache_size,
                          full_determinism=full_determinism)
         self.routes: dict[ReplicaKey, str] = {}

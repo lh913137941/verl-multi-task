@@ -60,7 +60,6 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         self.llm_server_manager = await MultiTaskLLMServerManager.create(
             config=self.config,
             worker_group=self.get_hybrid_worker_group(),
-            group_scheduler=self.group_scheduler,
             task_session=self.task_session,
         )
         self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(

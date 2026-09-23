@@ -35,10 +35,8 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         worker_group=None,
         rollout_resource_pool=None,
         *,
-        group_scheduler=None,
         task_session=None,
     ):
-        self.group_scheduler = group_scheduler
         self.task_session = task_session
         self.rollout_replica_class = MultiTaskvLLMReplica
         super().__init__(config, worker_group, rollout_resource_pool)
@@ -72,7 +70,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
             max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
             full_determinism=getattr(self.rollout_config, "full_determinism", False),
-            group_scheduler=self.group_scheduler,
             initial_routes=initial_routes,
         )
 
