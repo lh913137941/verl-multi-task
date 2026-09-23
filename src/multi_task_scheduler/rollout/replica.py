@@ -189,7 +189,24 @@ class MultiTaskvLLMReplica(vLLMReplica):
                 }
             )
         self.placement_claims = tuple(dict(claim) for claim in spec["claims"])
+        token = self._short_identity(
+            f"{spec['lease_id']}:{spec['operation_id']}:{self.runtime_epoch}"
+        )
+        self.borrowed_server_name_prefix = f"vllm_borrowed_{token}_"
+        self.borrowed_server_names = (
+            f"{self.borrowed_server_name_prefix}server_{self.replica_rank}_0",
+        )
         return tuple(plan)
+
+    def _get_server_name_prefix(self) -> str:
+        if self.replica_kind is ReplicaKind.BORROWED:
+            prefix = getattr(self, "borrowed_server_name_prefix", None)
+            if not prefix:
+                raise RuntimeError(
+                    "borrowed server name prefix is unavailable before placement planning"
+                )
+            return prefix
+        return super()._get_server_name_prefix()
 
     async def _get_master_addr_port_for_slot(self, pg, bundle_index: int):
         """Create a borrower communication root on the selected borrower bundle."""
@@ -359,6 +376,122 @@ class MultiTaskvLLMReplica(vLLMReplica):
                     "borrowed CE creation failed and actor cleanup is unverified"
                 ) from cleanup_exc
             self.workers = []
+            raise exc
+
+    async def validate_server_runtime(self) -> dict:
+        """Verify the one-node borrower server and vLLM engine before RUNTIME_READY."""
+        if self.replica_kind is not ReplicaKind.BORROWED:
+            raise ValueError("borrowed server validation is BORROWED-only")
+        if self.nnodes != 1 or len(self.servers) != 1:
+            raise RuntimeError("first release borrowed runtime requires exactly one server")
+        if not self.placement_claims:
+            raise RuntimeError("borrowed runtime has no placement claims")
+
+        health = await self.servers[0].runtime_health.remote()
+        if not isinstance(health, dict):
+            raise TypeError("server runtime health returned a non-dict result")
+        expected_node = self.placement_claims[0]["node_id"]
+        if health.get("node_id") != expected_node:
+            raise RuntimeError("borrowed server landed on unexpected node")
+        if health.get("replica_rank") != self.replica_rank:
+            raise RuntimeError("borrowed server replica_rank mismatch")
+        if health.get("node_rank") != 0 or health.get("nnodes") != 1:
+            raise RuntimeError("borrowed server topology mismatch")
+        if not health.get("engine_ready"):
+            raise RuntimeError("borrowed vLLM engine is not healthy")
+        if not health.get("server_address") or not health.get("server_port"):
+            raise RuntimeError("borrowed HTTP server address is incomplete")
+        if self._server_handle is not self.servers[0]:
+            raise RuntimeError("borrowed primary server handle is inconsistent")
+        if not self._server_address:
+            raise RuntimeError("borrowed primary server address is missing")
+
+        self.borrowed_server_health = dict(health)
+        return self.borrowed_server_health
+
+    async def _shutdown_servers_verified(self) -> None:
+        servers = list(getattr(self, "servers", []) or [])
+        names = tuple(getattr(self, "borrowed_server_names", ()) or ())
+        if servers:
+            shutdown_refs = [server.shutdown_runtime.remote() for server in servers]
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*shutdown_refs, return_exceptions=True),
+                    timeout=30.0,
+                )
+            except BaseException:
+                # Graceful shutdown is best-effort. Actor death below is the
+                # authoritative cleanup condition for the first release.
+                pass
+            for server in servers:
+                try:
+                    ray.kill(server, no_restart=True)
+                except BaseException:
+                    pass
+        await self._wait_actor_names_dead(names)
+        self.servers = []
+        self._server_handle = None
+        self._server_address = None
+
+    async def cleanup_borrowed_runtime(self) -> None:
+        """Destroy locally owned borrower server/workers without touching donor PGs."""
+        if self.replica_kind is not ReplicaKind.BORROWED:
+            raise ValueError("borrowed cleanup is BORROWED-only")
+        errors = []
+        try:
+            await self._shutdown_servers_verified()
+        except BaseException as exc:
+            errors.append(exc)
+        try:
+            await self._kill_workers_verified(
+                list(getattr(self, "workers", []) or []),
+                tuple(getattr(self, "borrowed_worker_names", ()) or ()),
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        self.workers = []
+        if errors:
+            raise RuntimeError("borrowed runtime cleanup is unverified") from errors[0]
+
+    async def init_from_lease(
+        self,
+        spec: dict,
+        pg_by_id: dict[str, object],
+    ) -> dict:
+        """Build and validate a hidden borrower runtime on existing donor PGs.
+
+        This method is a low-level transaction primitive. Manager does not call
+        it yet; target-only weight bootstrap and service publication remain a
+        separate unimplemented gate.
+        """
+        self.validate_placement(spec)
+        self.rollout_mode = RolloutMode.STANDALONE
+        self.nnodes = 1
+        self.gpus_per_replica_node = self.world_size
+        self.borrowed_runtime_state = "CREATING"
+
+        try:
+            await self._create_workers_from_claims(spec, pg_by_id)
+            await self.launch_servers()
+            health = await self.validate_server_runtime()
+            self.borrowed_runtime_state = "RUNTIME_READY"
+            return {
+                "state": self.borrowed_runtime_state,
+                "replica_rank": self.replica_rank,
+                "worker_names": tuple(self.borrowed_worker_names),
+                "server_names": tuple(self.borrowed_server_names),
+                "server_address": self._server_address,
+                "health": dict(health),
+            }
+        except BaseException as exc:
+            try:
+                await self.cleanup_borrowed_runtime()
+            except BaseException as cleanup_exc:
+                self.borrowed_runtime_state = "FAILED"
+                raise RuntimeError(
+                    "borrowed runtime creation failed and cleanup is unverified"
+                ) from cleanup_exc
+            self.borrowed_runtime_state = "FAILED"
             raise exc
 
     def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:

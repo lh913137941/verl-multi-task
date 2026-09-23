@@ -632,6 +632,74 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     assert manager.next_replica_rank == 1
 
 
+def test_http_server_health_and_shutdown_use_real_engine_boundaries():
+    class Engine:
+        def __init__(self):
+            self.healthy = False
+            self.drained = False
+            self.shutdown_called = False
+
+        async def check_health(self):
+            self.healthy = True
+
+        async def wait_for_requests_to_drain(self):
+            self.drained = True
+
+        def shutdown(self):
+            self.shutdown_called = True
+
+    fake_ray = type(
+        "ServerRay",
+        (),
+        {
+            "get_runtime_context": staticmethod(
+                lambda: type("Context", (), {"get_node_id": lambda self: "node-a"})()
+            )
+        },
+    )
+
+    class Parent:
+        pass
+
+    cls = isolated(
+        "rollout/http_server.py",
+        "MultiTaskvLLMHttpServer",
+        Parent,
+        asyncio=asyncio,
+        ray=fake_ray,
+    )
+
+    async def scenario():
+        server = cls()
+        server.nnodes = 1
+        server.node_rank = 0
+        server.replica_rank = 5
+        server._server_address = "127.0.0.1"
+        server._server_port = 12345
+        server.global_steps = None
+        server._submission_paused = False
+        server._resume_event = asyncio.Event()
+        server._resume_event.set()
+        server.engine = Engine()
+        server._server_task = asyncio.create_task(asyncio.sleep(3600))
+
+        health = await server.runtime_health()
+        assert health["node_id"] == "node-a"
+        assert health["engine_ready"] is True
+        assert server.engine.healthy is True
+
+        engine = server.engine
+        receipt = await server.shutdown_runtime()
+        assert receipt["shutdown"] is True
+        assert engine.drained is True
+        assert engine.shutdown_called is True
+        assert server.engine is None
+        assert server._server_port is None
+        assert server._server_task.done()
+
+    asyncio.run(scenario())
+
+
 def replica_class():
     class Parent:
         def __init__(
@@ -1000,6 +1068,147 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
         asyncio.run(failed._create_workers_from_claims(spec, {"pg": "PG"}))
     assert killed
     assert failed.workers == []
+
+
+def test_init_from_lease_reaches_runtime_ready_only_after_server_health():
+    class Parent:
+        def __init__(
+            self,
+            replica_rank,
+            config,
+            model_config,
+            gpus_per_node=8,
+            is_reward_model=False,
+            is_teacher_model=False,
+            name_suffix="",
+        ):
+            self.replica_rank = replica_rank
+            self.config = config
+            self.model_config = model_config
+            self.world_size = 1
+            self.gpus_per_node = gpus_per_node
+            self.gpus_per_replica_node = 1
+            self.nnodes = 1
+            self.is_reward_model = is_reward_model
+            self.is_teacher_model = is_teacher_model
+            self.name_suffix = name_suffix
+            self.workers = []
+            self.servers = []
+            self._server_handle = None
+            self._server_address = None
+
+        async def launch_servers(self):
+            health = {
+                "node_id": "node",
+                "replica_rank": self.replica_rank,
+                "node_rank": 0,
+                "nnodes": 1,
+                "server_address": "127.0.0.1",
+                "server_port": 8000,
+                "engine_ready": True,
+                "global_steps": None,
+            }
+            server = type(
+                "Server",
+                (),
+                {
+                    "runtime_health": AsyncRemoteMethod(lambda: health),
+                    "shutdown_runtime": AsyncRemoteMethod(lambda: {"shutdown": True}),
+                },
+            )()
+            self.servers = [server]
+            self._server_handle = server
+            self._server_address = "127.0.0.1:8000"
+
+    fake_ray = type("ReplicaRay", (), {"remote": staticmethod(lambda cls: cls)})
+    cls = isolated(
+        "rollout/replica.py",
+        "MultiTaskvLLMReplica",
+        Parent,
+        ReplicaKind=ReplicaKind,
+        FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
+        RayClassWithInitArgs=object,
+        RayWorkerGroup=object,
+        ResourcePoolManager=object,
+        RolloutMode=type("RolloutMode", (), {"STANDALONE": "standalone"}),
+        PlacementGroupSchedulingStrategy=object,
+        get_master_addr_port=object,
+        get_device_name=lambda: "cuda",
+        MultiTaskCheckpointEngineWorker=object,
+        MultiTaskvLLMHttpServer=object,
+        hashlib=__import__("hashlib"),
+        asyncio=asyncio,
+        list_actors=lambda **kwargs: [],
+        ray=fake_ray,
+    )
+    config = type(
+        "Config",
+        (),
+        {
+            "tensor_model_parallel_size": 1,
+            "data_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+        },
+    )()
+    replica = cls(
+        replica_rank=6,
+        config=config,
+        model_config=object(),
+        replica_kind=ReplicaKind.BORROWED,
+        runtime_epoch=2,
+    )
+    worker = type(
+        "Worker",
+        (),
+        {
+            "runtime_placement": AsyncRemoteMethod(
+                lambda: {
+                    "node_id": "node",
+                    "accelerator_id": "0",
+                    "gpu_uuid": "GPU-x",
+                    "visible_devices": "0",
+                }
+            )
+        },
+    )()
+
+    async def fake_create(spec, pg_by_id):
+        replica.build_borrowed_worker_plan(spec)
+        replica.workers = [worker]
+        replica.borrowed_worker_names = ("worker-0",)
+        await replica.validate_worker_placement()
+        return object()
+
+    replica._create_workers_from_claims = fake_create
+    spec = {
+        "operation_id": "op",
+        "lease_id": "lease",
+        "replica_rank": 6,
+        "placement_epoch": 2,
+        "world_size": 1,
+        "max_colocate_count": FIRST_RELEASE_MAX_COLOCATE_COUNT,
+        "claims": [
+            {
+                "claim_id": "claim-0",
+                "rank": 0,
+                "pg_id": "pg",
+                "bundle_index": 0,
+                "node_id": "node",
+                "gpu_uuid": "GPU-x",
+                "node_rank": 0,
+                "local_rank": 0,
+                "gpu_fraction": FIRST_RELEASE_RAY_GPU_FRACTION,
+                "cpu_request": 1.0,
+            }
+        ],
+    }
+
+    receipt = asyncio.run(replica.init_from_lease(spec, {"pg": "PG"}))
+
+    assert receipt["state"] == "RUNTIME_READY"
+    assert receipt["server_address"] == "127.0.0.1:8000"
+    assert receipt["health"]["engine_ready"] is True
+    assert replica.borrowed_runtime_state == "RUNTIME_READY"
 
 
 def checkpoint_manager_class():
