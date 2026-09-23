@@ -1363,6 +1363,7 @@ def test_ce_pending_bootstrap_rejects_operation_rebind():
             loaded_version=3,
         )
 
+
 def test_ce_target_bootstrap_syncs_only_pending_target_and_is_idempotent():
     calls = []
 
@@ -1523,6 +1524,95 @@ def test_ce_target_bootstrap_requires_server_version_confirmation():
         )
     assert key not in ce._bootstrap_ready()
 
+
+
+def test_ce_can_advance_one_effective_member_version():
+    ce = checkpoint_manager_class()(replicas=[])
+    key = ReplicaKey("task-a", "r0")
+    ce.add_effective(key, ["replica"], loaded_version=2)
+
+    ce.mark_loaded_version(key, 3)
+
+    assert ce.effective_replicas[key] == (("replica",), 3)
+
+
+def test_rollouter_idle_detection_treats_unknown_capacity_as_zero():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    rollouter.max_concurrent_samples = None
+    assert rollouter.committed_capacity == 0
+    assert rollouter.collect_idle_candidates() == ()
+
+
+def test_standalone_replica_rejects_unverified_sleep_and_wake():
+    path = SOURCE / "rollout/replica.py"
+    tree = ast.parse(path.read_text())
+    replica = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "MultiTaskvLLMReplica"
+    )
+    methods = {
+        node.name: node
+        for node in replica.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for method_name in ("sleep", "wake_up"):
+        method = methods[method_name]
+        assert any(
+            isinstance(node, ast.Raise)
+            and isinstance(node.exc, ast.Call)
+            and isinstance(node.exc.func, ast.Name)
+            and node.exc.func.id == "NotImplementedError"
+            for node in ast.walk(method)
+        ), f"{method_name} must fail explicitly before a verified backend exists"
+
+
+def test_group_scheduler_binds_donate_to_lease_donor_rank():
+    path = SOURCE / "scheduler/group_scheduler.py"
+    tree = ast.parse(path.read_text())
+    scheduler = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "GroupScheduler"
+    )
+    scheduler.decorator_list = []
+    module = ast.Module(
+        body=[scheduler],
+        type_ignores=[],
+    )
+    env = {
+        "ReplicaKey": ReplicaKey,
+        "ActorHandle": object,
+        "Lease": Lease,
+        "OperationCommand": OperationCommand,
+        "OperationEvidence": OperationEvidence,
+        "OperationKind": OperationKind,
+        "OperationRecord": OperationRecord,
+        "RUNTIME_KIND": "test",
+        "EvidenceType": EvidenceType,
+        "time": time,
+        "ray": type("Ray", (), {"remote": staticmethod(lambda **kwargs: (lambda cls: cls))}),
+    }
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), env)
+    cls = env["GroupScheduler"]
+    lease = Lease(
+        "l1",
+        ({
+            "claim_id": "claim-1",
+            "source_lease_id": "source-1",
+            "donor_task_id": "task-a",
+            "donor_replica_rank": 1,
+            "pg_id": "pg",
+            "bundle_index": 1,
+            "node_id": "n0",
+            "gpu_uuid": "u1",
+            "gpu_fraction": 0.5,
+            "cpu_request": 1.0,
+        },),
+    )
+
+    assert cls._target_matches_donor(ReplicaKey("task-a", "native-1"), lease)
+    assert cls._target_matches_donor(ReplicaKey("task-a", "r1"), lease)
+    assert not cls._target_matches_donor(ReplicaKey("task-a", "native-0"), lease)
 
 def rollouter_class():
     class Parent:

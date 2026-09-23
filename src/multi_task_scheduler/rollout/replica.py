@@ -515,6 +515,18 @@ class MultiTaskvLLMReplica(vLLMReplica):
             "weight readiness requires verified replay/bootstrap backend"
         )
 
+    async def sleep(self, *args, **kwargs):
+        """Do not expose vLLM STANDALONE's silent sleep no-op as success."""
+        raise NotImplementedError(
+            "native replica sleep requires a verified STANDALONE release backend"
+        )
+
+    async def wake_up(self, *args, **kwargs):
+        """Do not expose vLLM STANDALONE's silent wake-up no-op as success."""
+        raise NotImplementedError(
+            "native replica wake_up requires a verified STANDALONE restore backend"
+        )
+
     def prepare_exit(self, operation_id: str):
         raise NotImplementedError(
             "exit readiness requires verified vLLM sleep/drain backend"

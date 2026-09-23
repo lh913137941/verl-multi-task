@@ -31,6 +31,7 @@ class GroupScheduler:
         # GS keeps intent so later RELEASED evidence can be bound back to the
         # exact operation and lease instead of accepting a bare GPU list.
         self.operation_commands: dict[str, OperationCommand] = {}
+        self.borrower_targets: dict[str, ReplicaKey] = {}
         self.release_evidence: dict[tuple[str, str], OperationEvidence] = {}
         self.release_history: dict[str, list[str]] = {}
         # Internal derived phase: donor RELEASED has made the reserved claims
@@ -118,13 +119,24 @@ class GroupScheduler:
             if command.kind is OperationKind.DONATE:
                 if command.target.task_session != donor_task_id:
                     raise ValueError("DONATE target does not own the lease claims")
+                if not self._target_matches_donor(command.target, lease):
+                    raise ValueError("DONATE target does not match the lease donor replica")
                 if command.lease_id in self.handoff_ready_leases:
                     raise ValueError("lease handoff is already ready")
-            elif command.kind in {OperationKind.ADD, OperationKind.REMOVE}:
+            elif command.kind is OperationKind.ADD:
                 if command.lease_id not in self.handoff_ready_leases:
                     raise ValueError(
                         f"{command.kind.value} requires donor RELEASED handoff"
                     )
+                existing_target = self.borrower_targets.get(command.lease_id)
+                if existing_target is not None and existing_target != command.target:
+                    raise ValueError("lease already has another borrower target")
+            elif command.kind is OperationKind.REMOVE:
+                if command.lease_id not in self.handoff_ready_leases:
+                    raise ValueError("REMOVE requires donor RELEASED handoff")
+                expected_target = self.borrower_targets.get(command.lease_id)
+                if expected_target is None or expected_target != command.target:
+                    raise ValueError("REMOVE target does not match the borrowed replica")
             elif command.kind is OperationKind.RESTORE:
                 if any(
                     self.active_gpu_owner.get(gpu_uuid) == command.lease_id
@@ -133,8 +145,6 @@ class GroupScheduler:
                     raise ValueError(
                         "RESTORE requires borrower claims to be fully returned"
                     )
-
-            self.operation_commands[command.operation_id] = command
 
         task_runner = self.task_runners.get(command.target.task_session)
         if task_runner is None:
@@ -148,7 +158,19 @@ class GroupScheduler:
         )
         if not isinstance(result, OperationRecord):
             raise TypeError("TaskRunner returned a non-OperationRecord")
+        if previous is None:
+            self.operation_commands[command.operation_id] = command
+            if command.kind is OperationKind.ADD:
+                self.borrower_targets[command.lease_id] = command.target
         return result
+
+    @staticmethod
+    def _target_matches_donor(target: ReplicaKey, lease: Lease) -> bool:
+        """Match first-release donor identity without trusting a handle from GS."""
+        claim = lease.claims[0]
+        rank = claim["donor_replica_rank"]
+        replica_id = target.replica_id
+        return replica_id in {f"r{rank}", f"native-{rank}"}
 
     def open_lease(self, lease: Lease) -> Lease:
         """GS-internal ledger action; scheduler policy calls this before command issue."""

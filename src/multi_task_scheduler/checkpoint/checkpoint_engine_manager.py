@@ -156,6 +156,19 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         for key, (replicas, _old_version) in tuple(self._members().items()):
             self._members()[key] = (replicas, loaded_version)
 
+    def mark_loaded_version(self, key: ReplicaKey, loaded_version: int) -> None:
+        """Advance one CE member after a target-only WEIGHT_READY commit."""
+        if not isinstance(key, ReplicaKey):
+            raise TypeError("key must be ReplicaKey")
+        if type(loaded_version) is not int or loaded_version < 0:
+            raise ValueError("loaded_version must be a nonnegative integer")
+        try:
+            replicas, _old_version = self._members()[key]
+        except KeyError as exc:
+            raise KeyError(f"unknown effective replica {key!r}") from exc
+        self._members()[key] = (replicas, loaded_version)
+
+
     async def bootstrap_target(
         self,
         key: ReplicaKey,

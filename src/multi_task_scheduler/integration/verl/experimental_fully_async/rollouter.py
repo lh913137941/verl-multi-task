@@ -77,7 +77,8 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
 
     @property
     def committed_capacity(self) -> int:
-        return int(getattr(self, "max_concurrent_samples", 0))
+        value = getattr(self, "max_concurrent_samples", None)
+        return 0 if value is None else int(value)
 
     @property
     def production_window_open(self) -> bool:
