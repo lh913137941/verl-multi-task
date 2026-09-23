@@ -255,7 +255,7 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             EvidenceType.SERVICE_COMMITTED,
         )
 
-    def finalize_release(self, operation: OperationRecord) -> OperationEvidence:
+    async def finalize_release(self, operation: OperationRecord) -> OperationEvidence:
         """Close M only from verified runtime release evidence.
 
         R/C/E were already committed before this phase. If the runtime backend
@@ -281,7 +281,7 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                 )
                 target_state = ReplicaState.DORMANT
             else:
-                evidence = manager.destroy(
+                evidence = await manager.destroy(
                     target,
                     operation_id=operation.operation_id,
                 )

@@ -1649,7 +1649,11 @@ def test_rollouter_release_failure_quarantines_drained_replica():
     rollouter._pending_operation_targets["op"] = key
 
     with pytest.raises(NotImplementedError, match="sleep backend unavailable"):
-        rollouter.finalize_release(OperationRecord("op", OperationStatus.RUNNING))
+        asyncio.run(
+            rollouter.finalize_release(
+                OperationRecord("op", OperationStatus.RUNNING)
+            )
+        )
     assert rollouter.llm_server_manager.replica_state[key] is ReplicaState.QUARANTINED
 
 
@@ -1680,12 +1684,56 @@ def test_rollouter_verified_native_release_commits_dormant():
     rollouter.llm_server_manager = Manager()
     rollouter._pending_operation_targets["op"] = key
 
-    evidence = rollouter.finalize_release(
-        OperationRecord("op", OperationStatus.RUNNING)
+    evidence = asyncio.run(
+        rollouter.finalize_release(
+            OperationRecord("op", OperationStatus.RUNNING)
+        )
     )
     assert evidence.type is EvidenceType.RELEASED
     assert rollouter.llm_server_manager.replica_state[key] is ReplicaState.DORMANT
     assert "op" not in rollouter._pending_operation_targets
+
+def test_rollouter_verified_borrowed_destroy_commits_released():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "borrowed-0")
+
+    class Manager:
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.DRAINING}
+            self.replica_kind = {key: ReplicaKind.BORROWED}
+            self.destroy_calls = []
+
+        def replica_meta(self, target):
+            return self.replica_kind[target], self.replica_state[target]
+
+        def transition_replica(self, target, state):
+            self.replica_state[target] = state
+
+        async def destroy(self, target, *, operation_id):
+            self.destroy_calls.append((target, operation_id))
+            return OperationEvidence(
+                operation_id,
+                EvidenceType.RELEASED,
+                1,
+                ("u0",),
+            )
+
+    manager = Manager()
+    rollouter.llm_server_manager = manager
+    rollouter._pending_operation_targets["op"] = key
+
+    evidence = asyncio.run(
+        rollouter.finalize_release(
+            OperationRecord("op", OperationStatus.RUNNING)
+        )
+    )
+
+    assert evidence.type is EvidenceType.RELEASED
+    assert manager.destroy_calls == [(key, "op")]
+    assert manager.replica_state[key] is ReplicaState.RELEASED
+    assert "op" not in rollouter._pending_operation_targets
+
 
 def test_rollouter_force_fails_before_mutating_m_without_verified_backend():
     cls = rollouter_class()
