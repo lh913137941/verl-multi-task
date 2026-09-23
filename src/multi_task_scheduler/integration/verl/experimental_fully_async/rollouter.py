@@ -85,16 +85,31 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         return not bool(getattr(self, "paused", False))
 
     def collect_idle_candidates(self) -> tuple[tuple[ReplicaKey, ReplicaKind], ...]:
+        """Return only ACTIVE replicas whose removal preserves committed C.
+
+        Native ``max_concurrent_samples`` is capped by ``max_required_samples``.
+        Compute how many ACTIVE replicas are required to preserve the currently
+        committed capacity and report only the surplus. This stays Rollouter-local
+        and deliberately does not read LB/R.
+        """
         if self.production_window_open or self.committed_capacity <= 0:
             return ()
         manager = getattr(self, "llm_server_manager", None)
         if manager is None:
             return ()
-        return tuple(
+
+        per_replica = int(getattr(self, "concurrent_samples_per_replica", 0))
+        if per_replica <= 0:
+            return ()
+
+        active = [
             (key, manager.replica_kind[key])
             for key, state in manager.replica_state.items()
             if state is ReplicaState.ACTIVE
-        )
+        ]
+        required_active = (self.committed_capacity + per_replica - 1) // per_replica
+        surplus_count = max(0, len(active) - required_active)
+        return tuple(active[:surplus_count])
 
     def submit_idle_report(self):
         if self.group_scheduler is None:

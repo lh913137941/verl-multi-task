@@ -351,6 +351,7 @@ def rollouter_class():
         def __init__(self, *args, **kwargs):
             self.paused = True
             self.max_concurrent_samples = 8
+            self.concurrent_samples_per_replica = 4
 
     return isolated(
         f"{INTEGRATION}/rollouter.py",
@@ -367,19 +368,27 @@ def rollouter_class():
     )
 
 
-def test_rollouter_idle_detection_does_not_read_lb():
+def test_rollouter_idle_detection_preserves_committed_capacity_without_reading_lb():
     cls = rollouter_class()
     rollouter = cls(object(), object())
-    key = ReplicaKey("task-a", "r0")
+    keys = [ReplicaKey("task-a", f"r{i}") for i in range(3)]
     rollouter.llm_server_manager = type(
         "M",
         (),
         {
-            "replica_state": {key: ReplicaState.ACTIVE},
-            "replica_kind": {key: ReplicaKind.NATIVE},
+            "replica_state": {key: ReplicaState.ACTIVE for key in keys},
+            "replica_kind": {key: ReplicaKind.NATIVE for key in keys},
         },
     )()
-    assert rollouter.collect_idle_candidates() == ((key, ReplicaKind.NATIVE),)
+
+    # committed C=8 and per-replica capacity=4 require two ACTIVE replicas.
+    assert rollouter.collect_idle_candidates() == ((keys[0], ReplicaKind.NATIVE),)
+
+    # With only the required replicas left there is no safe idle candidate.
+    rollouter.llm_server_manager.replica_state.pop(keys[0])
+    rollouter.llm_server_manager.replica_kind.pop(keys[0])
+    assert rollouter.collect_idle_candidates() == ()
+
     rollouter.paused = False
     assert rollouter.collect_idle_candidates() == ()
 
