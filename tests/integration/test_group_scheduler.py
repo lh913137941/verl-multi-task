@@ -19,7 +19,11 @@ pytestmark = pytest.mark.ray_integration
 
 @ray.remote
 class Runner:
-    def submit_operation(self, command):
+    def submit_operation(self, command, *, lease=None):
+        if not isinstance(lease, Lease):
+            raise TypeError("GroupScheduler must forward the resolved Lease snapshot")
+        if lease.lease_id != command.lease_id:
+            raise ValueError("forwarded Lease does not match command")
         return OperationRecord(command.operation_id)
 
 

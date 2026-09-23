@@ -90,6 +90,7 @@ def taskrunner_class():
         "MultiTaskFullyAsyncTaskRunner",
         Parent,
         OperationJournal=OperationJournal,
+        Lease=Lease,
         OperationCommand=OperationCommand,
         OperationRecord=OperationRecord,
         OperationStatus=OperationStatus,
@@ -222,6 +223,27 @@ def test_wrong_server_release_does_not_change_native_inflight_count():
     assert lb.query_attempt("request-1") is AttemptState.ADMITTED
 
 
+def taskrunner_lease():
+    return Lease(
+        "l1",
+        (
+            {
+                "claim_id": "claim-0",
+                "source_lease_id": "source-lease-0",
+                "donor_task_id": "donor-task",
+                "donor_replica_rank": 0,
+                "pg_id": "pg",
+                "bundle_index": 0,
+                "node_id": "n0",
+                "gpu_uuid": "u0",
+                "node_rank": 0,
+                "local_rank": 0,
+            },
+        ),
+        0,
+    )
+
+
 def test_taskrunner_minimal_journal_surface_and_replay_does_not_relaunch():
     cls = taskrunner_class()
     runner = cls()
@@ -236,8 +258,9 @@ def test_taskrunner_minimal_journal_surface_and_replay_does_not_relaunch():
         ReplicaKey("task-a", "r0"),
         "l1",
     )
-    assert runner.submit_operation(command).status is OperationStatus.ACCEPTED
-    assert runner.submit_operation(command).status is OperationStatus.ACCEPTED
+    lease = taskrunner_lease()
+    assert runner.submit_operation(command, lease=lease).status is OperationStatus.ACCEPTED
+    assert runner.submit_operation(command, lease=lease).status is OperationStatus.ACCEPTED
     assert launched == ["op"]
     assert runner.query_operation("missing").status is OperationStatus.UNKNOWN
 
@@ -249,8 +272,12 @@ def test_taskrunner_executes_add_and_commits_terminal_record():
     runner._control_ready = True
     runner._launch_operation = lambda operation_id: None
 
+    prepared = []
+
     class Rollouter:
-        prepare_replica = RemoteMethod(lambda target: None)
+        prepare_replica = RemoteMethod(
+            lambda target, **kwargs: prepared.append((target, kwargs)) or None
+        )
 
     class Trainer:
         bootstrap_and_publish = RemoteMethod(
@@ -268,12 +295,44 @@ def test_taskrunner_executes_add_and_commits_terminal_record():
         ReplicaKey("task-a", "r0"),
         "l1",
     )
-    runner.submit_operation(command)
+    runner.submit_operation(command, lease=taskrunner_lease())
     runner._execute_operation("op")
 
     record = runner.query_operation("op")
     assert record.status is OperationStatus.SUCCEEDED
     assert record.result == EvidenceType.SERVICE_COMMITTED.value
+    assert prepared[0][0] == command.target
+    assert prepared[0][1]["operation_id"] == "op"
+    spec = prepared[0][1]["spec"]
+    assert spec["lease_id"] == "l1"
+    assert spec["lease_ids"] == ["source-lease-0"]
+    assert spec["borrower_task_id"] == "task-a"
+    assert spec["borrower_replica_id"] == "r0"
+    assert spec["selected_slots"][0]["rank"] == 0
+
+
+def test_taskrunner_add_requires_matching_lease_snapshot_before_launch():
+    runner = taskrunner_class()()
+    runner.task_session = "task-a"
+    runner._control_ready = True
+    runner._launch_operation = lambda operation_id: None
+    command = OperationCommand(
+        "op-add",
+        OperationKind.ADD,
+        ReplicaKey("task-a", "r0"),
+        "l1",
+    )
+
+    with pytest.raises(ValueError, match="Lease snapshot"):
+        runner.submit_operation(command)
+
+    wrong = Lease(
+        "other",
+        taskrunner_lease().claims,
+        0,
+    )
+    with pytest.raises(ValueError, match="command.lease_id"):
+        runner.submit_operation(command, lease=wrong)
 
 
 def test_release_failure_after_service_commit_keeps_operation_unknown_and_fenced():

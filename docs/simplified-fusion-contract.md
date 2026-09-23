@@ -16,7 +16,7 @@ Lifecycle states are exactly `CREATING`, `ACTIVE`, `DRAINING`, `DORMANT`, `RELEA
 
 ## Public lifecycle structures
 
-Only `OperationCommand(operation_id, kind, target, lease_id, force?)`, `OperationRecord(operation_id, status, result?)`, `OperationEvidence(operation_id, type, timestamp, released_gpu_uuids=())`, and `Lease(lease_id, claims, expires_at)` cross component ownership boundaries. `ReplicaKey` is shared identity, not a lifecycle record. Lease progression is GS-internal; `expires_at` is not release proof.
+Only `OperationCommand(operation_id, kind, target, lease_id, force?)`, `OperationRecord(operation_id, status, result?)`, `OperationEvidence(operation_id, type, timestamp, released_gpu_uuids=())`, and `Lease(lease_id, claims, expires_at)` cross component ownership boundaries. `ReplicaKey` is shared identity, not a lifecycle record. Lease progression is GS-internal; `expires_at` is not release proof. The external operation command stays lease-id-only: GS resolves that id once and forwards the immutable `Lease` snapshot alongside the internal GS→TaskRunner call so ADD can derive placement without adding another public DTO or giving Manager/LB a GS dependency.
 
 ## Key rules
 

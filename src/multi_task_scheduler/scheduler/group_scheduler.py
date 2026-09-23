@@ -117,7 +117,10 @@ class GroupScheduler:
                 "no TaskRunner is attached under target.task_session; "
                 "first release uses the attached task id as task_session"
             )
-        result = ray.get(task_runner.submit_operation.remote(command), timeout=30)
+        result = ray.get(
+            task_runner.submit_operation.remote(command, lease=lease),
+            timeout=30,
+        )
         if not isinstance(result, OperationRecord):
             raise TypeError("TaskRunner returned a non-OperationRecord")
         return result

@@ -140,12 +140,31 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             raise RuntimeError("LLM server manager is not initialized")
         return await manager.create_borrowed_replica(spec)
 
-    def prepare_replica(self, replica_key: ReplicaKey):
+    async def prepare_replica(
+        self,
+        replica_key: ReplicaKey,
+        *,
+        operation_id: str,
+        spec: dict,
+    ):
         if not isinstance(replica_key, ReplicaKey):
             raise TypeError("prepare_replica requires ReplicaKey")
-        raise NotImplementedError(
-            "prepare_replica requires verified borrowed-runtime backend"
-        )
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("prepare_replica requires operation_id")
+        if not isinstance(spec, dict):
+            raise TypeError("prepare_replica requires placement spec")
+        if spec.get("operation_id") != operation_id:
+            raise ValueError("placement spec belongs to another operation")
+        if spec.get("borrower_task_id") != replica_key.task_session:
+            raise ValueError("placement spec belongs to another task_session")
+        if spec.get("borrower_replica_id") != replica_key.replica_id:
+            raise ValueError("placement spec belongs to another replica")
+
+        previous_target = self._pending_operation_targets.get(operation_id)
+        if previous_target is not None and previous_target != replica_key:
+            raise ValueError("operation_id is already bound to another replica")
+        self._pending_operation_targets[operation_id] = replica_key
+        return await self.create_borrowed_replica(spec)
 
     async def prepare_exit(
         self,

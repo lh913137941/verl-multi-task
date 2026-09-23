@@ -15,6 +15,7 @@ from verl.trainer.ppo.utils import Role
 from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
 from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
+    Lease,
     OperationCommand,
     OperationEvidence,
     OperationKind,
@@ -44,6 +45,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         self._attached_to_gs = False
         self._journal_lock = threading.RLock()
         self._operation_threads: dict[str, threading.Thread] = {}
+        self._operation_leases: dict[str, Lease] = {}
 
     def _ensure_journal(self) -> OperationJournal:
         if not hasattr(self, "_operation_journal"):
@@ -57,6 +59,39 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             status=record.status,
             result=record.result,
         )
+
+    @staticmethod
+    def _build_borrowed_spec(
+        command: OperationCommand,
+        lease: Lease,
+    ) -> dict:
+        """Resolve lease_id into one internal placement spec without changing the command wire."""
+        if command.kind is not OperationKind.ADD:
+            raise ValueError("borrowed placement spec is valid only for ADD")
+        if lease.lease_id != command.lease_id:
+            raise ValueError("operation lease snapshot does not match command.lease_id")
+
+        selected_slots = []
+        for rank, claim in enumerate(lease.claims):
+            slot = dict(claim)
+            slot.setdefault("rank", rank)
+            slot.setdefault("node_rank", 0)
+            slot.setdefault("local_rank", rank)
+            selected_slots.append(slot)
+
+        return {
+            "operation_id": command.operation_id,
+            "lease_id": lease.lease_id,
+            "lease_ids": list(lease.source_lease_ids),
+            "borrower_task_id": command.target.task_session,
+            "borrower_replica_id": command.target.replica_id,
+            "replica_rank": None,
+            "selected_slots": selected_slots,
+            "world_size": len(selected_slots),
+            "max_colocate_count": 1,
+            "expires_at": lease.expires_at,
+            "placement_epoch": command.target.runtime_epoch,
+        }
 
     @staticmethod
     def _require_evidence(
@@ -91,9 +126,21 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         self._operation_threads[operation_id] = worker
         worker.start()
 
-    def submit_operation(self, command: OperationCommand) -> OperationRecord:
+    def submit_operation(
+        self,
+        command: OperationCommand,
+        *,
+        lease: Lease | None = None,
+    ) -> OperationRecord:
         if not isinstance(command, OperationCommand):
             raise TypeError("submit_operation requires OperationCommand")
+        if lease is not None:
+            if not isinstance(lease, Lease):
+                raise TypeError("lease snapshot must be Lease")
+            if lease.lease_id != command.lease_id:
+                raise ValueError("lease snapshot does not match command.lease_id")
+        if command.kind is OperationKind.ADD and lease is None:
+            raise ValueError("ADD requires the GS-resolved Lease snapshot")
 
         launch = False
         with self._journal_lock:
@@ -105,6 +152,13 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             journal = self._ensure_journal()
             existing = journal.query(command.operation_id)
             record = journal.begin(command)
+
+            if lease is not None:
+                previous_lease = self._operation_leases.get(command.operation_id)
+                if previous_lease is not None and previous_lease != lease:
+                    raise ValueError("conflicting lease snapshot replay")
+                self._operation_leases.setdefault(command.operation_id, lease)
+
             snapshot = self._snapshot_record(record)
             launch = existing is None
 
@@ -146,7 +200,17 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             rollouter = self.components["rollouter"]
 
             if command.kind is OperationKind.ADD:
-                ray.get(rollouter.prepare_replica.remote(command.target))
+                lease = self._operation_leases.get(operation_id)
+                if lease is None:
+                    raise RuntimeError("ADD lost its immutable Lease snapshot")
+                placement_spec = self._build_borrowed_spec(command, lease)
+                ray.get(
+                    rollouter.prepare_replica.remote(
+                        command.target,
+                        operation_id=operation_id,
+                        spec=placement_spec,
+                    )
+                )
                 evidence = ray.get(trainer.bootstrap_and_publish.remote(operation))
                 final_evidence = self._require_evidence(
                     evidence,
