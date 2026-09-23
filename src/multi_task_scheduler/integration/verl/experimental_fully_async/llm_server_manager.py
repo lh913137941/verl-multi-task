@@ -1,11 +1,13 @@
 """Native Fully Async server manager plus the Manager-owned M view."""
 
+import time
+
 import ray
 
 from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncLLMServerManager
 from verl.workers.rollout.router import DEFAULT_ROUTING_CACHE_SIZE
 
-from multi_task_scheduler.orchestration.contracts import ReplicaKey, ReplicaKind, ReplicaState
+from multi_task_scheduler.orchestration.contracts import Lease, ReplicaKey, ReplicaKind, ReplicaState
 from multi_task_scheduler.rollout.load_balancer import MultiTaskGlobalRequestLoadBalancer
 from multi_task_scheduler.rollout.replica import MultiTaskvLLMReplica
 
@@ -155,6 +157,103 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             self.server_addresses.append(address)
             self.server_handles.append(handle)
         return runtime
+
+    def validate_borrowed_spec(self, spec: dict) -> dict:
+        """Normalize and validate first-release borrowed placement before Ray side effects."""
+        if not isinstance(spec, dict):
+            raise TypeError("borrowed placement spec must be a dict")
+
+        for field_name in ("operation_id", "lease_id", "borrower_task_id"):
+            value = spec.get(field_name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"borrowed placement requires nonempty {field_name}")
+
+        borrower_task_id = spec["borrower_task_id"]
+        if self.task_session and borrower_task_id != self.task_session:
+            raise ValueError("borrowed placement targets another task_session")
+
+        has_claims = spec.get("claims") is not None
+        has_selected_slots = spec.get("selected_slots") is not None
+        if has_claims == has_selected_slots:
+            raise ValueError(
+                "borrowed placement requires exactly one of claims or selected_slots"
+            )
+        raw_claims = spec["claims"] if has_claims else spec["selected_slots"]
+        if not isinstance(raw_claims, (list, tuple)) or not raw_claims:
+            raise ValueError("borrowed placement requires nonempty claims")
+
+        world_size = spec.get("world_size", spec.get("borrower_world_size"))
+        if type(world_size) is not int or world_size <= 0:
+            raise ValueError("borrowed placement world_size must be a positive integer")
+        if world_size != len(raw_claims):
+            raise ValueError("borrowed placement world_size must equal len(claims)")
+
+        max_colocate_count = spec.get("max_colocate_count", 1)
+        if type(max_colocate_count) is not int or max_colocate_count <= 0:
+            raise ValueError("max_colocate_count must be a positive integer")
+
+        placement_epoch = spec.get("placement_epoch", 0)
+        if type(placement_epoch) is not int or placement_epoch < 0:
+            raise ValueError("placement_epoch must be a nonnegative integer")
+
+        replica_rank = spec.get("replica_rank")
+        if replica_rank is not None and (
+            type(replica_rank) is not int or replica_rank < 0
+        ):
+            raise ValueError("replica_rank must be a nonnegative integer or None")
+
+        lease = Lease(
+            spec["lease_id"],
+            tuple(raw_claims),
+            spec.get("expires_at", 0),
+        )
+        if lease.expires_at and time.time() >= lease.expires_at:
+            raise ValueError("borrowed placement lease is expired")
+
+        claims = [dict(claim) for claim in lease.claims]
+        for rank, claim in enumerate(claims):
+            supplied_rank = claim.get("rank", rank)
+            if type(supplied_rank) is not int or supplied_rank != rank:
+                raise ValueError(
+                    "borrowed claim ranks must cover 0..world_size-1 in list order"
+                )
+            claim["rank"] = rank
+
+            node_rank = claim.get("node_rank")
+            local_rank = claim.get("local_rank")
+            if type(node_rank) is not int or node_rank != 0:
+                raise ValueError("first release requires single-node node_rank=0")
+            if type(local_rank) is not int or local_rank != rank:
+                raise ValueError(
+                    "first release requires local_rank to match rank on one node"
+                )
+
+        if len({claim["node_id"] for claim in claims}) != 1:
+            raise ValueError("first release borrowed placement must be single-node")
+
+        requested_source_leases = spec.get("lease_ids")
+        if requested_source_leases is not None:
+            if not isinstance(requested_source_leases, (list, tuple)):
+                raise TypeError("lease_ids must be a list/tuple when provided")
+            if set(requested_source_leases) != set(lease.source_lease_ids):
+                raise ValueError("lease_ids do not match claim source leases")
+
+        normalized = dict(spec)
+        normalized.pop("selected_slots", None)
+        normalized["claims"] = claims
+        normalized["lease_ids"] = list(lease.source_lease_ids)
+        normalized["world_size"] = world_size
+        normalized["max_colocate_count"] = max_colocate_count
+        normalized["placement_epoch"] = placement_epoch
+        normalized["expires_at"] = lease.expires_at
+        return normalized
+
+    async def create_borrowed_replica(self, spec: dict) -> dict:
+        """Validate the placement contract, then stop at the unverified GPU boundary."""
+        self.validate_borrowed_spec(spec)
+        raise NotImplementedError(
+            "borrowed runtime creation requires verified PG/bundle actor backend"
+        )
 
     def create_hidden(self, *args, **kwargs):
         raise NotImplementedError("RuntimeBackend.create_hidden requires verified native backend")

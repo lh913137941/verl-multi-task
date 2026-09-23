@@ -1,6 +1,7 @@
 import ast
 import asyncio
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
     AttemptState,
+    Lease,
     OperationCommand,
     OperationEvidence,
     OperationKind,
@@ -348,6 +350,8 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         ReplicaKey=ReplicaKey,
         ReplicaKind=ReplicaKind,
         ReplicaState=ReplicaState,
+        Lease=Lease,
+        time=time,
         _ALLOWED=allowed,
     )
     manager = cls(object())
@@ -364,6 +368,53 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     assert manager.rollout_replicas == []
     assert manager.server_addresses == []
     assert manager.server_handles == []
+
+    manager.task_session = "task-a"
+    valid_spec = {
+        "operation_id": "op-add",
+        "lease_id": "borrower-lease",
+        "borrower_task_id": "task-a",
+        "selected_slots": [
+            {
+                "claim_id": "claim-0",
+                "source_lease_id": "source-lease-0",
+                "donor_task_id": "donor-task",
+                "donor_replica_rank": 0,
+                "pg_id": "pg",
+                "bundle_index": 0,
+                "node_id": "n0",
+                "gpu_uuid": "u0",
+                "node_rank": 0,
+                "local_rank": 0,
+                "gpu_fraction": 1.0,
+                "cpu_request": 1.0,
+            }
+        ],
+        "world_size": 1,
+        "max_colocate_count": 1,
+        "replica_rank": None,
+        "expires_at": 0,
+        "placement_epoch": 0,
+    }
+    normalized = manager.validate_borrowed_spec(valid_spec)
+    assert "selected_slots" not in normalized
+    assert normalized["claims"][0]["rank"] == 0
+    assert normalized["lease_ids"] == ["source-lease-0"]
+
+    wrong_task = dict(valid_spec, borrower_task_id="task-b")
+    with pytest.raises(ValueError, match="another task_session"):
+        manager.validate_borrowed_spec(wrong_task)
+
+    wrong_world = dict(valid_spec, world_size=2)
+    with pytest.raises(ValueError, match="world_size"):
+        manager.validate_borrowed_spec(wrong_world)
+
+    expired = dict(valid_spec, expires_at=time.time() - 1)
+    with pytest.raises(ValueError, match="expired"):
+        manager.validate_borrowed_spec(expired)
+
+    with pytest.raises(NotImplementedError, match="PG/bundle actor backend"):
+        asyncio.run(manager.create_borrowed_replica(valid_spec))
 
 
 def rollouter_class():

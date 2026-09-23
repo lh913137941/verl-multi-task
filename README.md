@@ -110,7 +110,8 @@ Lease(lease_id, claims, expires_at)
 - RELEASED 必须与已登记的 `operation_id → lease_id` 对应，并完整覆盖 lease 的 GPU UUID 集合；
 - native 参数同步继续复用原生实现，但进入同一个 Trainer G；
 - Queue exactly-once 仍是原生样本之上的逻辑 key + digest 薄层；
-- 空泡上报只选择“移除后仍能保持当前 committed capacity”的 ACTIVE surplus replica，不再把所有 ACTIVE replica 都当作可捐候选。
+- 空泡上报只选择“移除后仍能保持当前 committed capacity”的 ACTIVE surplus replica，不再把所有 ACTIVE replica 都当作可捐候选；
+- borrowed placement 入口已在任何 Ray Actor 副作用前校验 borrower/source lease、claim、world_size、单节点 rank/local_rank、整卡约束和过期时间；校验通过后仍停在显式 `NotImplementedError`，直到 PG/bundle actor 创建经过真实环境验证。
 
 ## 明确未完成的 GPU/runtime 能力
 

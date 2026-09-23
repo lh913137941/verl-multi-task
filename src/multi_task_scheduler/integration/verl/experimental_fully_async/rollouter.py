@@ -134,6 +134,13 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             timeout=30,
         )
 
+    async def create_borrowed_replica(self, spec: dict) -> dict:
+        """Thin runtime entry; Manager owns placement validation and creation."""
+        manager = getattr(self, "llm_server_manager", None)
+        if manager is None:
+            raise RuntimeError("LLM server manager is not initialized")
+        return await manager.create_borrowed_replica(spec)
+
     def prepare_replica(self, replica_key: ReplicaKey):
         if not isinstance(replica_key, ReplicaKey):
             raise TypeError("prepare_replica requires ReplicaKey")
