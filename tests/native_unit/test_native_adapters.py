@@ -20,6 +20,8 @@ from multi_task_scheduler.integration.verl.experimental_fully_async.message_queu
 )
 from multi_task_scheduler.integration.verl.experimental_fully_async.rollouter import (
     MultiTaskFullyAsyncRollouter,
+    _ContinuationAwareServer,
+    _continuation_prefix_digest,
 )
 from multi_task_scheduler.integration.verl.experimental_fully_async.task_runner import (
     MultiTaskFullyAsyncTaskRunner,
@@ -122,3 +124,51 @@ def test_message_queue_deduplicates_completed_native_samples():
     with pytest.raises(DuplicateCompletionError):
         asyncio.run(queue.put_sample_once(conflicting))
     assert asyncio.run(queue.get_queue_size()) == 1
+
+
+class _AsyncRemote:
+    def __init__(self, fn):
+        self._fn = fn
+
+    async def remote(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
+
+
+def test_continuation_proxy_records_aborted_prefix_before_native_retry():
+    calls = []
+
+    class Output:
+        stop_reason = "aborted"
+        token_ids = [31, 32]
+
+    class Server:
+        generate = _AsyncRemote(
+            lambda **kwargs: calls.append(("generate", tuple(kwargs["prompt_ids"]))) or Output()
+        )
+
+    class LB:
+        confirm_continuation = _AsyncRemote(
+            lambda request_id, client_id, prefix_digest: calls.append(
+                ("confirm", request_id, client_id, prefix_digest)
+            )
+        )
+
+    proxy = _ContinuationAwareServer(Server(), LB(), "req-1", "task-a")
+    output = asyncio.run(
+        proxy.generate.remote(
+            request_id="backend-id",
+            prompt_ids=[11, 12],
+            sampling_params={},
+        )
+    )
+
+    assert output.stop_reason == "aborted"
+    assert calls == [
+        ("generate", (11, 12)),
+        (
+            "confirm",
+            "req-1",
+            "task-a",
+            _continuation_prefix_digest([11, 12], [31, 32]),
+        ),
+    ]

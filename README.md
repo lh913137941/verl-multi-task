@@ -119,14 +119,14 @@ Lease(lease_id, claims, expires_at)
 
 ## 明确未完成的 GPU/runtime 能力
 
-以下能力仍必须在真实 VERL/vLLM/CUDA/NCCL 组合完成验证后实现；当前代码继续
+以下能力仍必须在真实 VERL/vLLM/CUDA/NCCL 组合完成验证后实现；未接通的路径继续
 显式抛出 `NotImplementedError`，不会用假 handle 或合成证据伪造成功：
 
 - borrowed hidden runtime 创建与 lease-aware GPU 绑定；
 - native DONATE 的真实 sleep/release；
 - target-only 参数 bootstrap / replay；
 - RESTORE 的真实 wake 与参数恢复；
-- FORCE_VERIFIED 的 targeted abort + Client continuation；
+- FORCE_VERIFIED 已接通 VERL 原生 partial-rollout abort/resume：仅 borrowed、`partial_rollout=true` 且存在其他活动 server 时允许进入；目标 replica 的真实 abort 输出必须先触发 Client continuation 证明，LB 无 `ADMITTED` request 后才形成 `EXIT_READY`；
 - sleep/destroy 后基于真实进程/设备事实生成 RELEASED。
 
 因此 `multitask.enabled=true` 目前表示“启用 092203 控制面与 native subclass

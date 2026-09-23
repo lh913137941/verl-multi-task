@@ -24,7 +24,7 @@ ADD: hidden create -> under G install current weights and join E -> commit R/C/M
 
 DONATE/REMOVE: ACTIVE -> DRAINING -> close admission and settle requests -> under G remove E/commit service -> verified native sleep gives DORMANT, verified borrowed destroy gives RELEASED. GS advances usage rights only after `RELEASED` exactly covers lease GPU UUIDs. DONATE `RELEASED` makes the already-reserved borrower lease handoff-ready but does not free its bundle/GPU to another lease; borrowed REMOVE `RELEASED` returns that physical ownership to the global free pool.
 
-FORCE_VERIFIED is borrowed-only and needs verified partial rollout plus Client continuation proof. Timeout is never success. Target abort/continuation remains explicit `NotImplementedError` until GPU/runtime validation exists.
+FORCE_VERIFIED is borrowed-only. It reuses VERL's native Fully Async partial-rollout path: after the target is removed from admission, the borrowed replica executes the real vLLM abort primitive; the continuation-aware client records proof when it receives an `aborted/abort` output, then VERL retries with `prompt + partial token_ids` on another active server. `EXIT_READY` is returned only when `partial_rollout=true`, another server is available, target abort succeeds, and LB has no remaining `ADMITTED` request. Timeout is never success.
 
 RESTORE wakes the same native runtime, restores current parameters and re-enters E/R/C/M. A partial restore returns to DORMANT only after proven re-sleep, otherwise QUARANTINED.
 
