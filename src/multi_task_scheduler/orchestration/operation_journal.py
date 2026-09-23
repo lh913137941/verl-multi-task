@@ -14,7 +14,7 @@ _TERMINAL = {
     OperationStatus.FAILED,
     OperationStatus.UNKNOWN,
 }
-_RESOLVED = {OperationStatus.SUCCEEDED, OperationStatus.FAILED}
+_RESOLVED = _TERMINAL
 
 
 class OperationJournal:
