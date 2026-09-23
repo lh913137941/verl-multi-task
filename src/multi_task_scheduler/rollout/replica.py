@@ -3,8 +3,10 @@
 import hashlib
 
 import ray
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
+from verl.single_controller.ray.base import get_master_addr_port
 from verl.utils.device import get_device_name
 from verl.workers.rollout.replica import RolloutMode
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
@@ -186,6 +188,95 @@ class MultiTaskvLLMReplica(vLLMReplica):
             )
         self.placement_claims = tuple(dict(claim) for claim in spec["claims"])
         return tuple(plan)
+
+    async def _get_master_addr_port_for_slot(self, pg, bundle_index: int):
+        """Create a borrower communication root on the selected borrower bundle."""
+        return await get_master_addr_port.options(
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg,
+                placement_group_bundle_index=bundle_index,
+            )
+        ).remote()
+
+    async def _create_workers_from_claims(
+        self,
+        spec: dict,
+        pg_by_id: dict[str, object],
+    ) -> RayWorkerGroup:
+        """Create borrower-owned CE actors on the exact claimed PG bundles.
+
+        This low-level primitive is intentionally not wired into Manager yet.
+        Manager continues to stop before Ray side effects until bootstrap and
+        actor-exit verification are available as one complete transaction.
+        """
+        plan = self.build_borrowed_worker_plan(spec)
+        expected_pg_ids = {item["pg_id"] for item in plan}
+        if set(pg_by_id) != expected_pg_ids:
+            raise ValueError("placement-group handles do not exactly cover claims")
+
+        first = plan[0]
+        master_addr, master_port = await self._get_master_addr_port_for_slot(
+            pg_by_id[first["pg_id"]],
+            first["bundle_index"],
+        )
+        base = self.get_ray_class_with_init_args()
+        workers = []
+        names = []
+        try:
+            for item in plan:
+                actor_args = RayClassWithInitArgs(
+                    base.cls,
+                    *base.args,
+                    **base.kwargs,
+                )
+                env_vars = dict(item["env_vars"])
+                env_vars["MASTER_ADDR"] = str(master_addr)
+                env_vars["MASTER_PORT"] = str(master_port)
+                actor_args.update_options(
+                    {
+                        "name": item["actor_name"],
+                        "num_cpus": item["num_cpus"],
+                        "runtime_env": {"env_vars": env_vars},
+                    }
+                )
+                worker = actor_args(
+                    placement_group=pg_by_id[item["pg_id"]],
+                    placement_group_bundle_idx=item["bundle_index"],
+                    use_gpu=True,
+                    num_gpus=item["num_gpus"],
+                    device_name=get_device_name(),
+                )
+                workers.append(worker)
+                names.append(item["actor_name"])
+
+            bind_args = RayClassWithInitArgs(
+                base.cls,
+                *base.args,
+                **base.kwargs,
+            )
+            worker_group = RayWorkerGroup.from_detached(
+                worker_handles=workers,
+                ray_cls_with_init=bind_args,
+                name_prefix=self._worker_prefix(spec),
+                use_gpu=True,
+                device_name=get_device_name(),
+            )
+            self.workers = list(worker_group.workers)
+            self.borrowed_worker_names = tuple(names)
+            return worker_group
+        except BaseException as exc:
+            cleanup_errors = []
+            for created in workers:
+                try:
+                    ray.kill(created, no_restart=True)
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(cleanup_exc)
+            self.workers = []
+            if cleanup_errors:
+                raise RuntimeError(
+                    "borrowed CE creation failed and actor cleanup is unverified"
+                ) from exc
+            raise
 
     def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
         return RayClassWithInitArgs(

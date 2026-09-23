@@ -789,6 +789,179 @@ def test_borrowed_worker_plan_rejects_donor_topology_or_wrong_identity():
         replica.build_borrowed_worker_plan(donor_layout)
 
 
+def test_worker_gpu_uuid_probe_maps_ray_index_without_guessing():
+    class Parent:
+        pass
+
+    fake_subprocess = type(
+        "Subprocess",
+        (),
+        {
+            "check_output": staticmethod(
+                lambda *args, **kwargs: "0, GPU-a\n1, GPU-b\n"
+            )
+        },
+    )
+    cls = isolated(
+        "checkpoint/checkpoint_engine_worker.py",
+        "MultiTaskCheckpointEngineWorker",
+        Parent,
+        subprocess=fake_subprocess,
+        os=__import__("os"),
+        ray=object(),
+        get_resource_name=lambda: "GPU",
+        get_visible_devices_keyword=lambda: "CUDA_VISIBLE_DEVICES",
+    )
+
+    assert cls._resolve_nvidia_gpu_uuid("1") == "GPU-b"
+    assert cls._resolve_nvidia_gpu_uuid("GPU-direct") == "GPU-direct"
+    with pytest.raises(NotImplementedError, match="MIG"):
+        cls._resolve_nvidia_gpu_uuid("MIG-abc")
+    with pytest.raises(RuntimeError, match="cannot map"):
+        cls._resolve_nvidia_gpu_uuid("opaque-id")
+
+
+def test_create_workers_from_claims_clones_actor_options_per_rank():
+    class Parent:
+        def __init__(
+            self,
+            replica_rank,
+            config,
+            model_config,
+            gpus_per_node=8,
+            is_reward_model=False,
+            is_teacher_model=False,
+            name_suffix="",
+        ):
+            self.replica_rank = replica_rank
+            self.config = config
+            self.model_config = model_config
+            self.world_size = 1
+            self.gpus_per_node = gpus_per_node
+            self.gpus_per_replica_node = 1
+            self.nnodes = 1
+            self.is_reward_model = is_reward_model
+            self.is_teacher_model = is_teacher_model
+            self.name_suffix = name_suffix
+            self.workers = []
+            self.servers = []
+
+    created = []
+
+    class FakeCIA:
+        def __init__(self, cls, *args, **kwargs):
+            self.cls = cls
+            self.args = args
+            self.kwargs = kwargs
+            self.options = {}
+
+        def update_options(self, options):
+            self.options.update(options)
+
+        def __call__(self, **kwargs):
+            handle = {
+                "options": dict(self.options),
+                "placement": dict(kwargs),
+            }
+            created.append(handle)
+            return handle
+
+    class FakeWG:
+        def __init__(self, workers):
+            self.workers = list(workers)
+
+        @classmethod
+        def from_detached(cls, *, worker_handles, **kwargs):
+            return cls(worker_handles)
+
+    fake_ray = type(
+        "ReplicaRay",
+        (),
+        {
+            "remote": staticmethod(lambda cls: cls),
+            "kill": staticmethod(lambda *args, **kwargs: None),
+        },
+    )
+    cls = isolated(
+        "rollout/replica.py",
+        "MultiTaskvLLMReplica",
+        Parent,
+        ReplicaKind=ReplicaKind,
+        FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
+        RayClassWithInitArgs=FakeCIA,
+        RayWorkerGroup=FakeWG,
+        ResourcePoolManager=object,
+        RolloutMode=object,
+        PlacementGroupSchedulingStrategy=object,
+        get_master_addr_port=object,
+        get_device_name=lambda: "cuda",
+        MultiTaskCheckpointEngineWorker=object,
+        MultiTaskvLLMHttpServer=object,
+        hashlib=__import__("hashlib"),
+        ray=fake_ray,
+    )
+    config = type(
+        "Config",
+        (),
+        {
+            "tensor_model_parallel_size": 1,
+            "data_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+        },
+    )()
+    replica = cls(
+        replica_rank=4,
+        config=config,
+        model_config=object(),
+        replica_kind=ReplicaKind.BORROWED,
+        runtime_epoch=0,
+    )
+    async def fake_master(pg, bundle_index):
+        assert pg == "PG"
+        assert bundle_index == 2
+        return "127.0.0.1", "23456"
+
+    replica._get_master_addr_port_for_slot = fake_master
+    spec = {
+        "operation_id": "op",
+        "lease_id": "lease",
+        "replica_rank": 4,
+        "placement_epoch": 0,
+        "world_size": 1,
+        "max_colocate_count": FIRST_RELEASE_MAX_COLOCATE_COUNT,
+        "claims": [
+            {
+                "claim_id": "claim-0",
+                "rank": 0,
+                "pg_id": "pg",
+                "bundle_index": 2,
+                "node_id": "node",
+                "gpu_uuid": "GPU-x",
+                "node_rank": 0,
+                "local_rank": 0,
+                "gpu_fraction": FIRST_RELEASE_RAY_GPU_FRACTION,
+                "cpu_request": 1.0,
+            }
+        ],
+    }
+
+    group = asyncio.run(replica._create_workers_from_claims(spec, {"pg": "PG"}))
+
+    assert group.workers == created
+    assert len(created) == 1
+    assert created[0]["placement"]["placement_group"] == "PG"
+    assert created[0]["placement"]["placement_group_bundle_idx"] == 2
+    assert created[0]["placement"]["num_gpus"] == FIRST_RELEASE_RAY_GPU_FRACTION
+    env = created[0]["options"]["runtime_env"]["env_vars"]
+    assert env["MASTER_ADDR"] == "127.0.0.1"
+    assert env["MASTER_PORT"] == "23456"
+    assert env["WORLD_SIZE"] == "1"
+    assert env["RANK"] == "0"
+    assert replica.borrowed_worker_names == (
+        created[0]["options"]["name"],
+    )
+
+
 def checkpoint_manager_class():
     class Parent:
         def __init__(self, config=None, actor_wg=None, replicas=None):
