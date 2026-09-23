@@ -106,8 +106,8 @@ Lease(lease_id, claims, expires_at)
 - 原生 STANDALONE replicas 初始化完成后登记为 `NATIVE/ACTIVE`，供 M 和空泡判断读取；
 - LB 复用当前 VERL router API，并补逐 request `ADMITTED/TERMINATED/SETTLED`；
 - 自然 release 进入 `SETTLED`；已验证 continuation 先进入 `TERMINATED`，随后由迟到 release 或退出提交收敛到 `SETTLED`；
-- GS 维护最小 Lease 账本，RELEASED 必须与已登记的 `operation_id → lease_id`
-  对应，并完整覆盖 lease 的 GPU UUID 集合；
+- GS 维护最小 Lease 账本，claim_id 永久绑定原 lease；首版整卡下同一 PG/bundle 与 GPU UUID 在 RELEASED 前不能被第二个 lease 重复授权；
+- RELEASED 必须与已登记的 `operation_id → lease_id` 对应，并完整覆盖 lease 的 GPU UUID 集合；
 - native 参数同步继续复用原生实现，但进入同一个 Trainer G；
 - Queue exactly-once 仍是原生样本之上的逻辑 key + digest 薄层；
 - 空泡上报只选择“移除后仍能保持当前 committed capacity”的 ACTIVE surplus replica，不再把所有 ACTIVE replica 都当作可捐候选。

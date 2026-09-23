@@ -168,9 +168,36 @@ class Lease:
         claims = tuple(dict(claim) for claim in self.claims)
         if not claims:
             raise ValueError("Lease requires at least one claim")
+        normalized_claims = []
         for claim in claims:
             if not claim:
                 raise ValueError("lease claims must be nonempty")
+
+            claim_id = claim.get("claim_id")
+            if not isinstance(claim_id, str) or not claim_id:
+                raise ValueError("each claim requires a nonempty claim_id")
+
+            source_lease_id = claim.get("source_lease_id")
+            legacy_source_lease_id = claim.get("lease_id")
+            if source_lease_id is None:
+                source_lease_id = legacy_source_lease_id
+            elif (
+                legacy_source_lease_id is not None
+                and legacy_source_lease_id != source_lease_id
+            ):
+                raise ValueError("claim lease_id conflicts with source_lease_id")
+            if not isinstance(source_lease_id, str) or not source_lease_id:
+                raise ValueError("each claim requires a nonempty source_lease_id")
+
+            donor_task_id = claim.get("donor_task_id")
+            if not isinstance(donor_task_id, str) or not donor_task_id:
+                raise ValueError("each claim requires a nonempty donor_task_id")
+            donor_replica_rank = claim.get("donor_replica_rank")
+            if type(donor_replica_rank) is not int or donor_replica_rank < 0:
+                raise ValueError(
+                    "each claim requires a nonnegative integer donor_replica_rank"
+                )
+
             for field_name in ("pg_id", "node_id", "gpu_uuid"):
                 value = claim.get(field_name)
                 if not isinstance(value, str) or not value:
@@ -184,6 +211,16 @@ class Lease:
             cpu_request = claim.get("cpu_request", 0.0)
             if type(cpu_request) not in (int, float) or float(cpu_request) < 0:
                 raise ValueError("cpu_request must be nonnegative")
+
+            normalized = dict(claim)
+            normalized["source_lease_id"] = source_lease_id
+            normalized.pop("lease_id", None)
+            normalized_claims.append(normalized)
+
+        claims = tuple(normalized_claims)
+        claim_ids = [claim["claim_id"] for claim in claims]
+        if len(set(claim_ids)) != len(claim_ids):
+            raise ValueError("lease claims must not repeat claim_id")
         uuids = [claim["gpu_uuid"] for claim in claims]
         if len(set(uuids)) != len(uuids):
             raise ValueError("lease claims must not repeat gpu_uuid")
@@ -202,6 +239,23 @@ class Lease:
             raise ValueError("expires_at must be >= 0 (0 means no fixed expiry)")
         object.__setattr__(self, "claims", claims)
         object.__setattr__(self, "expires_at", float(self.expires_at))
+
+    @property
+    def claim_ids(self) -> tuple[str, ...]:
+        return tuple(str(claim["claim_id"]) for claim in self.claims)
+
+    @property
+    def source_lease_ids(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(str(claim["source_lease_id"]) for claim in self.claims)
+        )
+
+    @property
+    def bundle_keys(self) -> tuple[tuple[str, int], ...]:
+        return tuple(
+            (str(claim["pg_id"]), int(claim["bundle_index"]))
+            for claim in self.claims
+        )
 
     @property
     def gpu_uuids(self) -> tuple[str, ...]:

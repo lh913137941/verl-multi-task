@@ -17,6 +17,10 @@ from multi_task_scheduler.orchestration.contracts import (
 
 def claim(**overrides):
     value = {
+        "claim_id": "claim-0",
+        "source_lease_id": "source-lease-0",
+        "donor_task_id": "donor-task",
+        "donor_replica_rank": 0,
         "pg_id": "pg",
         "bundle_index": 0,
         "node_id": "n0",
@@ -75,12 +79,31 @@ def test_lease_has_claims_and_expiry_without_public_state():
     assert not hasattr(lease, "state")
 
 
-def test_lease_requires_ray_bundle_and_physical_validation_keys():
-    for field in ("pg_id", "bundle_index", "node_id", "gpu_uuid"):
+def test_lease_requires_claim_source_owner_and_physical_validation_keys():
+    for field in (
+        "claim_id",
+        "source_lease_id",
+        "donor_task_id",
+        "donor_replica_rank",
+        "pg_id",
+        "bundle_index",
+        "node_id",
+        "gpu_uuid",
+    ):
         invalid = claim()
         invalid.pop(field)
         with pytest.raises(ValueError):
             Lease("l1", (invalid,), 0)
+
+
+def test_lease_normalizes_legacy_claim_lease_id_to_source_lease_id():
+    legacy = claim()
+    legacy["lease_id"] = legacy.pop("source_lease_id")
+    lease = Lease("borrower-lease", (legacy,), 0)
+    assert lease.claims[0]["source_lease_id"] == "source-lease-0"
+    assert "lease_id" not in lease.claims[0]
+    assert lease.claim_ids == ("claim-0",)
+    assert lease.source_lease_ids == ("source-lease-0",)
 
 
 def test_first_release_lease_is_whole_gpu_and_has_unique_bundle_and_uuid():
@@ -91,7 +114,7 @@ def test_first_release_lease_is_whole_gpu_and_has_unique_bundle_and_uuid():
             "l1",
             (
                 claim(),
-                claim(bundle_index=1),
+                claim(claim_id="claim-1", bundle_index=1),
             ),
             0,
         )
@@ -100,7 +123,7 @@ def test_first_release_lease_is_whole_gpu_and_has_unique_bundle_and_uuid():
             "l1",
             (
                 claim(),
-                claim(gpu_uuid="u1"),
+                claim(claim_id="claim-1", gpu_uuid="u1"),
             ),
             0,
         )

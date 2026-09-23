@@ -23,11 +23,21 @@ class Runner:
         return OperationRecord(command.operation_id)
 
 
-def claim(uuid="u0"):
+def claim(
+    uuid="u0",
+    *,
+    claim_id="claim-0",
+    source_lease_id="source-lease-0",
+    bundle_index=0,
+):
     return {
+        "claim_id": claim_id,
+        "source_lease_id": source_lease_id,
+        "donor_task_id": "donor-task",
+        "donor_replica_rank": 0,
         "gpu_uuid": uuid,
         "pg_id": "pg",
-        "bundle_index": 0,
+        "bundle_index": bundle_index,
         "node_id": "n0",
     }
 
@@ -75,6 +85,70 @@ def test_group_scheduler_minimal_lease_and_forwarding():
             "released": True,
         }
         assert ray.get(gs.advance_lease.remote("l1", evidence)) == result
+    finally:
+        ray.shutdown()
+
+
+def test_group_scheduler_fences_active_claims_until_verified_release():
+    ray.init(num_cpus=2, ignore_reinit_error=True)
+    try:
+        gs = GroupScheduler.remote()
+        runner = Runner.remote()
+        ray.get(gs.attach_task.remote("task-a", runner))
+
+        first = Lease("l1", (claim(),), 0)
+        ray.get(gs.open_lease.remote(first))
+
+        overlapping = Lease(
+            "l2",
+            (
+                claim(
+                    claim_id="claim-2",
+                    source_lease_id="source-lease-2",
+                ),
+            ),
+            0,
+        )
+        with pytest.raises(ValueError, match="already active"):
+            ray.get(gs.open_lease.remote(overlapping))
+
+        command = OperationCommand(
+            "op-release",
+            OperationKind.DONATE,
+            ReplicaKey("task-a", "r0"),
+            "l1",
+        )
+        ray.get(gs.submit_operation.remote(command))
+        ray.get(
+            gs.advance_lease.remote(
+                "l1",
+                OperationEvidence(
+                    "op-release",
+                    EvidenceType.RELEASED,
+                    1,
+                    ("u0",),
+                ),
+            )
+        )
+
+        # The physical slot can be re-authorized only after RELEASED, while
+        # claim ids themselves remain globally unique ledger identities.
+        assert ray.get(gs.open_lease.remote(overlapping)) == overlapping
+
+        reused_claim_id = Lease(
+            "l3",
+            (
+                claim(
+                    uuid="u1",
+                    claim_id="claim-0",
+                    source_lease_id="source-lease-3",
+                    bundle_index=1,
+                ),
+            ),
+            0,
+        )
+        with pytest.raises(ValueError, match="claim_id"):
+            ray.get(gs.open_lease.remote(reused_claim_id))
     finally:
         ray.shutdown()
 

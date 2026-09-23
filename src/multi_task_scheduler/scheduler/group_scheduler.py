@@ -33,6 +33,12 @@ class GroupScheduler:
         self.operation_commands: dict[str, OperationCommand] = {}
         self.release_evidence: dict[tuple[str, str], OperationEvidence] = {}
         self.release_history: dict[str, list[str]] = {}
+        # claim_id is globally unique for the lifetime of this GS ledger.
+        # Bundle/GPU ownership is active-only and is released only by verified
+        # RELEASED evidence.
+        self.claim_id_owner: dict[str, str] = {}
+        self.active_bundle_owner: dict[tuple[str, int], str] = {}
+        self.active_gpu_owner: dict[str, str] = {}
 
     def runtime_kind(self) -> str:
         return RUNTIME_KIND
@@ -125,8 +131,34 @@ class GroupScheduler:
             if existing != lease:
                 raise ValueError("conflicting lease replay")
             return existing
+
+        for claim_id in lease.claim_ids:
+            owner = self.claim_id_owner.get(claim_id)
+            if owner is not None and owner != lease.lease_id:
+                raise ValueError(
+                    f"claim_id {claim_id!r} already belongs to lease {owner!r}"
+                )
+        for bundle_key in lease.bundle_keys:
+            owner = self.active_bundle_owner.get(bundle_key)
+            if owner is not None and owner != lease.lease_id:
+                raise ValueError(
+                    f"PG bundle {bundle_key!r} is already active under lease {owner!r}"
+                )
+        for gpu_uuid in lease.gpu_uuids:
+            owner = self.active_gpu_owner.get(gpu_uuid)
+            if owner is not None and owner != lease.lease_id:
+                raise ValueError(
+                    f"GPU {gpu_uuid!r} is already active under lease {owner!r}"
+                )
+
         self.leases[lease.lease_id] = lease
         self.release_history.setdefault(lease.lease_id, [])
+        for claim_id in lease.claim_ids:
+            self.claim_id_owner[claim_id] = lease.lease_id
+        for bundle_key in lease.bundle_keys:
+            self.active_bundle_owner[bundle_key] = lease.lease_id
+        for gpu_uuid in lease.gpu_uuids:
+            self.active_gpu_owner[gpu_uuid] = lease.lease_id
         return lease
 
     def advance_lease(self, lease_id: str, evidence: OperationEvidence) -> dict:
@@ -162,6 +194,16 @@ class GroupScheduler:
 
         self.release_evidence[evidence_key] = evidence
         self.release_history.setdefault(lease_id, []).append(evidence.operation_id)
+
+        # Capacity becomes reusable only after the exact RELEASED proof above.
+        # claim_id remains permanently bound to its original lease identity.
+        for bundle_key in lease.bundle_keys:
+            if self.active_bundle_owner.get(bundle_key) == lease_id:
+                self.active_bundle_owner.pop(bundle_key, None)
+        for gpu_uuid in lease.gpu_uuids:
+            if self.active_gpu_owner.get(gpu_uuid) == lease_id:
+                self.active_gpu_owner.pop(gpu_uuid, None)
+
         return {
             "lease_id": lease_id,
             "operation_id": evidence.operation_id,
