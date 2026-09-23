@@ -449,8 +449,10 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
                     "tensor_model_parallel_size": 1,
                     "data_parallel_size": 1,
                     "pipeline_model_parallel_size": 1,
+                    "n_gpus_per_node": 1,
                 },
             )()
+            self.model_config = object()
 
     allowed = {
         ReplicaState.CREATING: {
@@ -515,16 +517,42 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
             ),
         },
     )
+    class FakeBorrowedRuntime:
+        def __init__(self, **kwargs):
+            self.replica_rank = kwargs["replica_rank"]
+            self.workers = ["worker-0"]
+            self.servers = ["server-0"]
+            self.borrowed_worker_names = ("worker-name",)
+            self.borrowed_server_names = ("server-name",)
+            self._server_address = "s-borrowed"
+            self._server_handle = "h-borrowed"
+            self.borrowed_cleanup_verified = False
+            self.cleaned = False
+
+        async def init_from_lease(self, spec, pg_by_id):
+            assert pg_by_id == {"pg": fake_pg}
+            return {
+                "state": "RUNTIME_READY",
+                "replica_rank": self.replica_rank,
+                "server_address": self._server_address,
+            }
+
+        async def cleanup_borrowed_runtime(self):
+            self.cleaned = True
+            self.borrowed_cleanup_verified = True
+
     cls = isolated(
         f"{INTEGRATION}/llm_server_manager.py",
         "MultiTaskLLMServerManager",
         Parent,
-        MultiTaskvLLMReplica=object(),
+        MultiTaskvLLMReplica=FakeBorrowedRuntime,
         MultiTaskGlobalRequestLoadBalancer=object(),
         ReplicaKey=ReplicaKey,
         ReplicaKind=ReplicaKind,
         ReplicaState=ReplicaState,
         Lease=Lease,
+        EvidenceType=EvidenceType,
+        OperationEvidence=OperationEvidence,
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
         FIRST_RELEASE_RAY_GPU_FRACTION=FIRST_RELEASE_RAY_GPU_FRACTION,
         asyncio=asyncio,
@@ -630,30 +658,41 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     resolved_pgs = manager._resolve_placement_groups(normalized["claims"])
     assert resolved_pgs == {"pg": fake_pg}
 
-    with pytest.raises(NotImplementedError, match="PG/bundle actor backend"):
-        asyncio.run(manager.create_borrowed_replica(valid_spec))
+    receipt = asyncio.run(manager.create_borrowed_replica(valid_spec))
 
     record = manager.borrowed_operations["borrower-lease"]
-    assert record["state"] == "FAILED"
+    assert receipt["state"] == "RUNTIME_READY"
+    assert receipt["server_address"] == "s-borrowed"
+    assert record["state"] == "RUNTIME_READY"
     assert record["replica_rank"] == 0
     borrowed_key = ReplicaKey("task-a", "borrowed-0", 0)
     assert record["replica_key"] == borrowed_key
     assert manager.replica_kind[borrowed_key] is ReplicaKind.BORROWED
-    assert manager.replica_state[borrowed_key] is ReplicaState.QUARANTINED
+    assert manager.replica_state[borrowed_key] is ReplicaState.CREATING
+    assert manager.inspect_runtime(borrowed_key) is record["replica"]
+    assert record["created_actor_names"] == ["worker-name", "server-name"]
     assert record["claim_ids"] == ["claim-0"]
     assert record["source_lease_ids"] == ["source-lease-0"]
     assert manager.next_replica_rank == 1
 
-    # Exact replay returns the same failure boundary and does not allocate rank 1.
-    with pytest.raises(NotImplementedError, match="PG/bundle actor backend"):
-        asyncio.run(manager.create_borrowed_replica(valid_spec))
+    # Exact replay returns the same hidden runtime receipt without another rank.
+    assert asyncio.run(manager.create_borrowed_replica(valid_spec)) == receipt
     assert manager.next_replica_rank == 1
 
     # A retry may carry the rank recovered from the manager's first record.
     resolved_retry = dict(valid_spec, replica_rank=0)
-    with pytest.raises(NotImplementedError, match="PG/bundle actor backend"):
-        asyncio.run(manager.create_borrowed_replica(resolved_retry))
+    assert asyncio.run(manager.create_borrowed_replica(resolved_retry)) == receipt
     assert manager.next_replica_rank == 1
+
+    release = asyncio.run(
+        manager.destroy(borrowed_key, operation_id="op-remove")
+    )
+    assert release.type is EvidenceType.RELEASED
+    assert release.released_gpu_uuids == ("u0",)
+    assert record["replica"].cleaned is True
+    assert asyncio.run(
+        manager.destroy(borrowed_key, operation_id="op-remove")
+    ) == release
 
     wrong_rank = dict(valid_spec, replica_rank=7)
     with pytest.raises(ValueError, match="conflicting borrowed create replay"):

@@ -469,6 +469,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
         self.nnodes = 1
         self.gpus_per_replica_node = self.world_size
         self.borrowed_runtime_state = "CREATING"
+        self.borrowed_cleanup_verified = False
 
         try:
             await self._create_workers_from_claims(spec, pg_by_id)
@@ -486,7 +487,9 @@ class MultiTaskvLLMReplica(vLLMReplica):
         except BaseException as exc:
             try:
                 await self.cleanup_borrowed_runtime()
+                self.borrowed_cleanup_verified = True
             except BaseException as cleanup_exc:
+                self.borrowed_cleanup_verified = False
                 self.borrowed_runtime_state = "FAILED"
                 raise RuntimeError(
                     "borrowed runtime creation failed and cleanup is unverified"

@@ -11,7 +11,9 @@ from verl.workers.rollout.router import DEFAULT_ROUTING_CACHE_SIZE
 from multi_task_scheduler.orchestration.contracts import (
     FIRST_RELEASE_MAX_COLOCATE_COUNT,
     FIRST_RELEASE_RAY_GPU_FRACTION,
+    EvidenceType,
     Lease,
+    OperationEvidence,
     ReplicaKey,
     ReplicaKind,
     ReplicaState,
@@ -405,6 +407,43 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             resolved[pg_id] = pg
 
         return resolved
+
+    def _new_borrowed_runtime(self, resolved_spec: dict):
+        return self.rollout_replica_class(
+            replica_rank=resolved_spec["replica_rank"],
+            config=self.rollout_config,
+            model_config=self.model_config,
+            gpus_per_node=self.rollout_config.n_gpus_per_node,
+            replica_kind=ReplicaKind.BORROWED,
+            placement_claims=resolved_spec["claims"],
+            runtime_epoch=resolved_spec["placement_epoch"],
+            max_colocate_count=resolved_spec["max_colocate_count"],
+        )
+
+    async def create_hidden(
+        self,
+        resolved_spec: dict,
+        pg_by_id: dict[str, object],
+    ) -> tuple[object, dict]:
+        """Create one hidden borrower runtime; R/C/E remain untouched."""
+        runtime = self._new_borrowed_runtime(resolved_spec)
+        receipt = await runtime.init_from_lease(resolved_spec, pg_by_id)
+        if not isinstance(receipt, dict) or receipt.get("state") != "RUNTIME_READY":
+            raise RuntimeError("borrowed runtime did not reach RUNTIME_READY")
+        if receipt.get("replica_rank") != resolved_spec["replica_rank"]:
+            raise RuntimeError("borrowed runtime returned a conflicting replica_rank")
+        return runtime, dict(receipt)
+
+    def _borrowed_record_for_key(self, key: ReplicaKey) -> dict:
+        matches = [
+            record
+            for record in self.borrowed_operations.values()
+            if record.get("replica_key") == key
+        ]
+        if len(matches) != 1:
+            raise KeyError(f"expected one borrowed operation for {key!r}")
+        return matches[0]
+
     async def create_borrowed_replica(self, spec: dict) -> dict:
         """Idempotently register create intent, then stop at the unverified GPU boundary.
 
@@ -474,20 +513,60 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             }
             self.borrowed_operations[lease_id] = record
 
+        runtime = None
         try:
             pg_by_id = self._resolve_placement_groups(resolved_spec["claims"])
             if set(pg_by_id) != {claim["pg_id"] for claim in resolved_spec["claims"]}:
                 raise RuntimeError("placement-group resolution returned incomplete coverage")
-            raise NotImplementedError(
-                "borrowed runtime creation requires verified PG/bundle actor backend"
+
+            runtime, runtime_receipt = await self.create_hidden(
+                resolved_spec,
+                pg_by_id,
             )
+            async with self.replica_operation_lock:
+                current = self.borrowed_operations[lease_id]
+                replica_key = current["replica_key"]
+                current["replica"] = runtime
+                current["worker_handles"] = list(getattr(runtime, "workers", ()) or ())
+                current["server_handles"] = list(getattr(runtime, "servers", ()) or ())
+                current["created_actor_names"] = list(
+                    tuple(getattr(runtime, "borrowed_worker_names", ()) or ())
+                    + tuple(getattr(runtime, "borrowed_server_names", ()) or ())
+                )
+                current["state"] = "RUNTIME_READY"
+                current["error"] = None
+                current["result"] = {
+                    "operation_id": current["operation_id"],
+                    "lease_id": current["lease_id"],
+                    "replica_rank": current["replica_rank"],
+                    "state": "RUNTIME_READY",
+                    "released": False,
+                    "server_address": runtime_receipt.get("server_address"),
+                }
+                self._runtime_inventory[replica_key] = runtime
+                return self._borrowed_receipt(current)
         except BaseException as exc:
             async with self.replica_operation_lock:
                 current = self.borrowed_operations[lease_id]
                 replica_key = current["replica_key"]
+                cleanup_verified = bool(
+                    runtime is not None
+                    and getattr(runtime, "borrowed_cleanup_verified", False)
+                )
                 if self.replica_state.get(replica_key) is ReplicaState.CREATING:
-                    self.transition_replica(replica_key, ReplicaState.QUARANTINED)
-                current["state"] = "FAILED"
+                    self.transition_replica(
+                        replica_key,
+                        (
+                            ReplicaState.RELEASED
+                            if cleanup_verified
+                            else ReplicaState.QUARANTINED
+                        ),
+                    )
+                if cleanup_verified:
+                    self.retired_replica_ranks.add(current["replica_rank"])
+                current["state"] = (
+                    "RELEASED" if cleanup_verified else "FAILED"
+                )
                 current["error"] = {
                     "type": type(exc).__name__,
                     "message": str(exc),
@@ -495,17 +574,57 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 current["result"] = self._borrowed_receipt(current)
             raise
 
-    def create_hidden(self, *args, **kwargs):
-        raise NotImplementedError("RuntimeBackend.create_hidden requires verified native backend")
-
     def sleep(self, *args, **kwargs):
         raise NotImplementedError("RuntimeBackend.sleep requires verified native backend")
 
     def wake_weights(self, *args, **kwargs):
         raise NotImplementedError("RuntimeBackend.wake_weights requires verified native backend")
 
-    def destroy(self, *args, **kwargs):
-        raise NotImplementedError("RuntimeBackend.destroy requires verified native backend")
+    async def destroy(
+        self,
+        key: ReplicaKey,
+        *,
+        operation_id: str,
+    ) -> OperationEvidence:
+        """Destroy a borrowed runtime and return only verified RELEASED evidence."""
+        if not isinstance(key, ReplicaKey):
+            raise TypeError("destroy requires ReplicaKey")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("destroy requires operation_id")
+        if self.replica_kind.get(key) is not ReplicaKind.BORROWED:
+            raise ValueError("destroy is valid only for BORROWED replicas")
+        if self.replica_state.get(key) not in {
+            ReplicaState.CREATING,
+            ReplicaState.DRAINING,
+        }:
+            raise ValueError("destroy requires CREATING or DRAINING borrowed replica")
+
+        record = self._borrowed_record_for_key(key)
+        previous = record.get("destroy_evidence")
+        if previous is not None:
+            if previous.operation_id != operation_id:
+                raise ValueError("borrowed runtime was destroyed by another operation")
+            return previous
+
+        runtime = self._runtime_inventory.get(key)
+        if runtime is None:
+            raise RuntimeError("borrowed runtime handle is unavailable for verified destroy")
+
+        await runtime.cleanup_borrowed_runtime()
+        gpu_uuids = tuple(
+            claim["gpu_uuid"]
+            for claim in record["resolved_spec"]["claims"]
+        )
+        evidence = OperationEvidence.now(
+            operation_id,
+            EvidenceType.RELEASED,
+            released_gpu_uuids=gpu_uuids,
+        )
+        record["destroy_evidence"] = evidence
+        record["state"] = "RELEASED"
+        record["released"] = True
+        self.retired_replica_ranks.add(record["replica_rank"])
+        return evidence
 
     def query_runtime(self, key: ReplicaKey):
         return self.inspect_runtime(key)
