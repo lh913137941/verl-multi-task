@@ -185,14 +185,6 @@ class Lease:
                 raise ValueError("each claim requires a nonempty claim_id")
 
             source_lease_id = claim.get("source_lease_id")
-            legacy_source_lease_id = claim.get("lease_id")
-            if source_lease_id is None:
-                source_lease_id = legacy_source_lease_id
-            elif (
-                legacy_source_lease_id is not None
-                and legacy_source_lease_id != source_lease_id
-            ):
-                raise ValueError("claim lease_id conflicts with source_lease_id")
             if not isinstance(source_lease_id, str) or not source_lease_id:
                 raise ValueError("each claim requires a nonempty source_lease_id")
 
@@ -232,7 +224,6 @@ class Lease:
             normalized["gpu_fraction"] = float(gpu_fraction)
             normalized["cpu_request"] = float(cpu_request)
             normalized["source_lease_id"] = source_lease_id
-            normalized.pop("lease_id", None)
             normalized_claims.append(normalized)
 
         claims = tuple(normalized_claims)
