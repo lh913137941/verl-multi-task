@@ -1,6 +1,6 @@
 # Simplified fusion contract (092203 current)
 
-Current first release: experimental Fully Async, pure STANDALONE, non-PD vLLM, single-node whole-GPU lending, DP=1, PP=1 and verified TP only. Native replicas keep their runtime across DONATE/RESTORE; borrowed replicas create an independent borrower runtime and are destroyed on REMOVE. Unverified GPU primitives must raise `NotImplementedError`.
+Current first release: experimental Fully Async, pure STANDALONE, non-PD vLLM, single-node whole-GPU lending, DP=1, PP=1 and verified TP only. Physical whole-GPU exclusivity is enforced by GS ownership of the PG bundle/GPU UUID, not by Ray's fractional actor accounting. The first release fixes `max_colocate_count=2`, so each donor/borrower CE actor requests `gpu_fraction=0.5` and one CPU from a bundle; this accounting share does not authorize fractional physical-GPU lending. Native replicas keep their runtime across DONATE/RESTORE; borrowed replicas create an independent borrower runtime and are destroyed on REMOVE. Unverified GPU primitives must raise `NotImplementedError`.
 
 ## Ownership
 
@@ -22,7 +22,7 @@ Only `OperationCommand(operation_id, kind, target, lease_id, force?)`, `Operatio
 
 ADD: hidden create -> under G install current weights and join E -> commit R/C/M -> ACTIVE.
 
-DONATE/REMOVE: ACTIVE -> DRAINING -> close admission and settle requests -> under G remove E/commit service -> verified native sleep gives DORMANT, verified borrowed destroy gives RELEASED. GS transfers usage rights only after `RELEASED` exactly covers lease GPU UUIDs.
+DONATE/REMOVE: ACTIVE -> DRAINING -> close admission and settle requests -> under G remove E/commit service -> verified native sleep gives DORMANT, verified borrowed destroy gives RELEASED. GS advances usage rights only after `RELEASED` exactly covers lease GPU UUIDs. DONATE `RELEASED` makes the already-reserved borrower lease handoff-ready but does not free its bundle/GPU to another lease; borrowed REMOVE `RELEASED` returns that physical ownership to the global free pool.
 
 FORCE_VERIFIED is borrowed-only and needs verified partial rollout plus Client continuation proof. Timeout is never success. Target abort/continuation remains explicit `NotImplementedError` until GPU/runtime validation exists.
 
