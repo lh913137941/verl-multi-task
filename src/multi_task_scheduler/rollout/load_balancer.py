@@ -24,6 +24,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         self.attempt_state: dict[str, AttemptState] = {}
         self.draining_servers: set[str] = set()
         self.draining_operations: dict[str, str] = {}
+        self.ready_operations: dict[str, tuple[ReplicaKey, str, OperationEvidence]] = {}
         for key, server_id in dict(initial_routes or {}).items():
             if not isinstance(key, ReplicaKey):
                 raise TypeError("initial route key must be ReplicaKey")
@@ -85,6 +86,54 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         return any(self.attempt_state.get(r) is AttemptState.ADMITTED
                    for r in self.requests_for_server(server_id))
 
+    def commit_ready(
+        self,
+        key: ReplicaKey,
+        server_id: str,
+        server_handle,
+        operation_id: str,
+    ) -> OperationEvidence:
+        """Atomically publish one fully bootstrapped server into R."""
+        if not isinstance(key, ReplicaKey):
+            raise TypeError("commit_ready key must be ReplicaKey")
+        if not isinstance(server_id, str) or not server_id:
+            raise ValueError("commit_ready requires nonempty server_id")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("commit_ready requires nonempty operation_id")
+
+        previous = self.ready_operations.get(operation_id)
+        if previous is not None:
+            previous_key, previous_server, evidence = previous
+            if previous_key != key or previous_server != server_id:
+                raise ValueError("conflicting ready operation replay")
+            if self.routes.get(key) != server_id or server_id not in self._servers:
+                raise RuntimeError("ready operation ledger disagrees with routing state")
+            return evidence
+
+        existing_route = self.routes.get(key)
+        if existing_route is not None and existing_route != server_id:
+            raise ValueError("ReplicaKey already routes to another server")
+        for existing_operation, (existing_key, existing_server, _evidence) in self.ready_operations.items():
+            if existing_key == key and existing_operation != operation_id:
+                raise ValueError("ReplicaKey was published by another operation")
+            if existing_server == server_id and existing_key != key:
+                raise ValueError("server_id is already owned by another ReplicaKey")
+
+        self.add_servers({server_id: server_handle})
+        self.routes[key] = server_id
+        evidence = OperationEvidence.now(
+            operation_id,
+            EvidenceType.SERVICE_COMMITTED,
+        )
+        self.ready_operations[operation_id] = (key, server_id, evidence)
+        return evidence
+
+    def query_ready_operation(self, operation_id: str):
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("operation_id must be a nonempty string")
+        entry = self.ready_operations.get(operation_id)
+        return None if entry is None else entry[2]
+
     def server_for_replica(self, key: ReplicaKey):
         if not isinstance(key, ReplicaKey):
             raise TypeError("key must be ReplicaKey")
@@ -134,6 +183,11 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         self.draining_servers.discard(server_id)
         self.draining_operations.pop(server_id, None)
         self.routes.pop(key, None)
+        for operation_id, (ready_key, _server_id, _evidence) in tuple(
+            self.ready_operations.items()
+        ):
+            if ready_key == key:
+                self.ready_operations.pop(operation_id, None)
 
     def gc_settled_requests(self, request_ids):
         for request_id in request_ids:

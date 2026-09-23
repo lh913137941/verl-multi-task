@@ -169,6 +169,39 @@ def test_admitted_request_blocks_removal_until_verified_continuation():
     assert key not in lb.routes
 
 
+def test_lb_commit_ready_is_atomic_and_idempotent():
+    key = ReplicaKey("task-a", "borrowed-0")
+    handle = object()
+    lb = load_balancer_class()({})
+
+    evidence = lb.commit_ready(key, "s-new", handle, "op-add")
+    assert evidence.type is EvidenceType.SERVICE_COMMITTED
+    assert evidence.operation_id == "op-add"
+    assert lb.server_for_replica(key) == "s-new"
+    assert lb._servers["s-new"] is handle
+    assert lb.query_ready_operation("op-add") == evidence
+
+    assert lb.commit_ready(key, "s-new", handle, "op-add") == evidence
+    with pytest.raises(ValueError, match="conflicting ready operation replay"):
+        lb.commit_ready(
+            ReplicaKey("task-a", "other"),
+            "s-other",
+            object(),
+            "op-add",
+        )
+
+
+def test_lb_finish_remove_clears_ready_operation_ledger():
+    key = ReplicaKey("task-a", "borrowed-0")
+    lb = load_balancer_class()({})
+    lb.commit_ready(key, "s-new", object(), "op-add")
+
+    lb.finish_remove(key)
+
+    assert lb.server_for_replica(key) is None
+    assert lb.query_ready_operation("op-add") is None
+
+
 def test_continuation_requires_an_active_drain_and_does_not_mutate_on_reject():
     key = ReplicaKey("task-a", "r0")
     lb = load_balancer_class()({"s0": object()}, initial_routes={key: "s0"})
