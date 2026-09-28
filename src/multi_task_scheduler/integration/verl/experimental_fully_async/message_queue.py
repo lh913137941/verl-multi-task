@@ -4,15 +4,25 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from dataclasses import dataclass
 
 import ray
 from verl.experimental.fully_async_policy.message_queue import MessageQueue
 
 from verl.single_controller.ray.base import _unwrap_ray_remote
-from multi_task_scheduler.orchestration.exactly_once import (
-    CompletionEvidence,
-    DuplicateCompletionError,
-)
+@dataclass(frozen=True)
+class CompletionEvidence:
+    task_session: str
+    logical_sample_id: str
+    payload_digest: str
+    enqueue_seq: int
+    dropped_oldest: bool
+    original_return_value: bool
+
+
+class DuplicateCompletionError(RuntimeError):
+    pass
+
 
 logger = logging.getLogger(__name__)
 
