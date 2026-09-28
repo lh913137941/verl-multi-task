@@ -157,8 +157,9 @@ VERL_MULTITASK_GPU_MODEL_PATH=/path/to/local/model \
 python -m pytest -q -s -m gpu_integration tests/integration/test_native_sleep_gpu.py
 ```
 
-当前会话环境无法拉取并执行当前分支的完整 pytest，也没有可用的 GitHub Actions
-结果；历史轻量测试记录不能替代本轮修改后的验证。因此 README 只记录已落库的测试
-入口，不声明当前 HEAD 的 unit/native/GPU 已通过。
+当前分支已由 GitHub Actions 执行 `python -m pytest -q tests/unit`；截至
+`4d6e12c6a21d84881eb942aeec489654105599c5` 的 unit workflow 为 success。
+这只证明依赖轻量的控制面/unit 回归网为绿；native Ray/VERL 与真实 CUDA/vLLM/NCCL
+验收仍必须按上面的分层命令单独执行，不能由 unit 结果替代。
 
 详细设计以当前 092203 设计文档和 `docs/simplified-fusion-contract.md` 为准。
