@@ -10,7 +10,6 @@ from verl.workers.rollout.router import DEFAULT_ROUTING_CACHE_SIZE
 
 from multi_task_scheduler.orchestration.contracts import (
     FIRST_RELEASE_MAX_COLOCATE_COUNT,
-    FIRST_RELEASE_RAY_GPU_FRACTION,
     EvidenceType,
     Lease,
     OperationEvidence,
