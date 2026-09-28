@@ -8,7 +8,7 @@ from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncT
 from verl.utils.config import omega_conf_to_dataclass
 
 from multi_task_scheduler.checkpoint.checkpoint_engine_manager import MultiTaskCheckpointEngineManager
-from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
+from verl.single_controller.ray.base import _unwrap_ray_remote
 from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
     OperationEvidence,
@@ -20,7 +20,7 @@ from multi_task_scheduler.orchestration.replica_sync_gate import GateKind, Repli
 
 
 @ray.remote(num_cpus=10)
-class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
+class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
     def __init__(self, *args, task_session=None, **kwargs):
         self.task_session = task_session
         super().__init__(*args, **kwargs)
