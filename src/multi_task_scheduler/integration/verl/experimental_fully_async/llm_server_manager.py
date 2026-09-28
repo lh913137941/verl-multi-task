@@ -542,7 +542,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 # Runtime cleanup success is a resource fact, not create
                 # success. Keep the operation FAILED so exact replay raises the
                 # original failure instead of synthesizing RUNTIME_READY.
-                current["released"] = cleanup_verified
                 current["error"] = {
                     "type": type(exc).__name__,
                     "message": str(exc),
@@ -650,5 +649,4 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             released_gpu_uuids=gpu_uuids,
         )
         record["destroy_evidence"] = evidence
-        record["released"] = True
         return evidence
