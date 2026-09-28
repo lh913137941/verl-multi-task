@@ -271,7 +271,7 @@ def test_continuation_requires_an_active_drain_and_does_not_mutate_on_reject():
     lb = load_balancer_class()({"s0": object()}, initial_routes={key: "s0"})
     lb.acquire_server("request-1")
 
-    with pytest.raises(ValueError, match="active drain operation"):
+    with pytest.raises(KeyError, match="active drain operation"):
         lb.confirm_continuation("request-1", "client-1", "prefix-1")
 
     assert lb.query_attempt("request-1") is AttemptState.ADMITTED
