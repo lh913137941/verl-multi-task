@@ -31,18 +31,30 @@ def _blocked(message: str) -> int:
     return 2
 
 
-def _init_ray():
+def _init_ray(timeout_s: float):
     try:
         import ray
     except Exception as exc:
         raise RuntimeError(f"Ray is unavailable: {exc}") from exc
-    if not ray.is_initialized():
-        ray.init(
-            address=os.environ.get("RAY_ADDRESS", "auto"),
-            ignore_reinit_error=True,
-            log_to_driver=True,
-        )
-    return ray
+    if ray.is_initialized():
+        return ray
+
+    deadline = time.monotonic() + timeout_s
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            ray.init(
+                address=os.environ.get("RAY_ADDRESS", "auto"),
+                ignore_reinit_error=True,
+                log_to_driver=True,
+            )
+            return ray
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.5)
+    raise RuntimeError(
+        f"could not attach to Ray before timeout; last_error={last_error}"
+    )
 
 
 def _discover(ray, timeout_s: float):
@@ -185,7 +197,7 @@ def main() -> int:
     run_id = uuid.uuid4().hex[:10]
     result = {"schema_version": 1, "scenario": args.scenario, "run_id": run_id, "events": []}
     try:
-        ray = _init_ray()
+        ray = _init_ray(args.attach_timeout_s)
         from multi_task_scheduler.orchestration.contracts import (
             OperationCommand,
             OperationKind,
