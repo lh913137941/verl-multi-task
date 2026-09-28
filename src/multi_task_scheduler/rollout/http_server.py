@@ -95,18 +95,18 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         pre-DONATE weights.  Admission remains closed until a full wake succeeds.
         """
         engine = self._require_sleep_engine()
-        self._submission_paused = True
-        self._resume_event.clear()
 
         # Reuse VERL's own compatibility decision (MTP/LoRA/NPU may only
-        # support level 1). Whole-GPU lending requires level 2, so do not emit
-        # RELEASED evidence when the underlying rollout cannot safely discard
-        # its weights.
+        # support level 1). Whole-GPU lending requires level 2, so fail before
+        # mutating the local admission gate when this runtime cannot satisfy it.
         sleep_level = self._resolve_sleep_level()
         if sleep_level != 2:
             raise NotImplementedError(
                 "whole-GPU DONATE requires a vLLM configuration safe for level-2 sleep"
             )
+
+        self._submission_paused = True
+        self._resume_event.clear()
 
         # Normal DONATE has already drained at R. Close the local gate and wait
         # again at the runtime boundary; with no requests left, vLLM's portable
