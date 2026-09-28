@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
-import logging
 from dataclasses import dataclass
 
 import ray
@@ -30,9 +30,6 @@ class DuplicateCompletionError(RuntimeError):
     """Same logical sample was re-submitted with a different payload digest."""
 
 
-logger = logging.getLogger(__name__)
-
-
 @ray.remote(num_cpus=2, max_concurrency=20)
 class MultiTaskMessageQueue(_unwrap_ray_remote(MessageQueue)):
     """Reuse native queue behavior and add one internal completion ledger."""
@@ -43,6 +40,7 @@ class MultiTaskMessageQueue(_unwrap_ray_remote(MessageQueue)):
         self.task_session = task_session
         self._completion_evidence: dict[tuple[str, str], CompletionEvidence] = {}
         self._next_completion_seq = 0
+        self._completion_lock = asyncio.Lock()
         super().__init__(config, max_queue_size=max_queue_size)
 
     @staticmethod
@@ -65,7 +63,7 @@ class MultiTaskMessageQueue(_unwrap_ray_remote(MessageQueue)):
         logical_sample_id, payload_digest = self._decode_identity(sample)
         key = (self.task_session, logical_sample_id)
 
-        async with self._lock:
+        async with self._completion_lock:
             existing = self._completion_evidence.get(key)
             if existing is not None:
                 if existing.payload_digest != payload_digest:
@@ -75,22 +73,14 @@ class MultiTaskMessageQueue(_unwrap_ray_remote(MessageQueue)):
                     )
                 return existing
 
-            dropped_oldest = len(self.queue) >= self.max_queue_size
-            if dropped_oldest:
-                self.queue.popleft()
-                self.dropped_samples += 1
-                logger.warning("Queue full, dropped sample")
-
-            self.queue.append(sample)
-            self.total_produced += 1
-            self._consumer_condition.notify_all()
+            original_return_value = await super().put_sample(sample)
             evidence = CompletionEvidence(
                 task_session=self.task_session,
                 logical_sample_id=logical_sample_id,
                 payload_digest=payload_digest,
                 enqueue_seq=self._next_completion_seq,
-                dropped_oldest=dropped_oldest,
-                original_return_value=not dropped_oldest,
+                dropped_oldest=not original_return_value,
+                original_return_value=original_return_value,
             )
             self._next_completion_seq += 1
             self._completion_evidence[key] = evidence
