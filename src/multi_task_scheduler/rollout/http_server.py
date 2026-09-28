@@ -90,6 +90,14 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
             raise RuntimeError("vLLM engine is not initialized")
         return engine
 
+    def _receipt(self, **state) -> dict:
+        return {
+            "replica_rank": self.replica_rank,
+            "node_rank": self.node_rank,
+            "global_steps": self.global_steps,
+            **state,
+        }
+
     def _multitask_sleep_stage(self) -> str:
         return getattr(self, "_multitask_sleep_stage_value", "awake")
 
@@ -112,13 +120,7 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
                 raise RuntimeError("level-2 sleep ledger disagrees with vLLM engine")
             self._submission_paused = True
             self._resume_event.clear()
-            return {
-                "replica_rank": self.replica_rank,
-                "node_rank": self.node_rank,
-                "sleep_level": 2,
-                "sleeping": True,
-                "global_steps": self.global_steps,
-            }
+            return self._receipt(sleep_level=2, sleeping=True)
         if stage == "weights":
             # Keep admission fenced; VERL owns KV restore/reset semantics.
             self._submission_paused = True
@@ -181,13 +183,7 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         if tags == ["weights"] and stage == "weights":
             if not sleeping_before:
                 raise RuntimeError("weights-wake ledger disagrees with vLLM engine")
-            return {
-                "replica_rank": self.replica_rank,
-                "node_rank": self.node_rank,
-                "sleeping": True,
-                "fully_awake": False,
-                "global_steps": self.global_steps,
-            }
+            return self._receipt(sleeping=True, fully_awake=False)
         if tags is None and stage == "level2":
             raise RuntimeError(
                 "full native wake requires weights-only RESTORE preparation"
@@ -218,13 +214,7 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         if sleeping:
             if tags == ["weights"]:
                 self._set_multitask_sleep_stage("weights")
-            return {
-                "replica_rank": self.replica_rank,
-                "node_rank": self.node_rank,
-                "sleeping": True,
-                "fully_awake": False,
-                "global_steps": self.global_steps,
-            }
+            return self._receipt(sleeping=True, fully_awake=False)
 
         # No request can cross the local gate while stale cache state is
         # cleared and the fully resident engine is health-checked. CE's staged
@@ -236,10 +226,4 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         self._set_multitask_sleep_stage("awake")
         self._submission_paused = False
         self._resume_event.set()
-        return {
-            "replica_rank": self.replica_rank,
-            "node_rank": self.node_rank,
-            "sleeping": False,
-            "fully_awake": True,
-            "global_steps": self.global_steps,
-        }
+        return self._receipt(sleeping=False, fully_awake=True)
