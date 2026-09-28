@@ -2048,6 +2048,31 @@ def native_manager_class():
     )
 
 
+def test_standalone_server_waits_for_requests_already_past_local_gate():
+    server = http_server_class()()
+    server._admitting = 1
+
+    async def exercise():
+        async def finish_admission():
+            await asyncio.sleep(0.02)
+            server._admitting = 0
+
+        task = asyncio.create_task(finish_admission())
+        await server._wait_admission_barrier(timeout_s=0.2)
+        await task
+
+    asyncio.run(exercise())
+    assert server._admitting == 0
+
+
+def test_standalone_server_admission_barrier_timeout_is_not_success():
+    server = http_server_class()()
+    server._admitting = 1
+
+    with pytest.raises(RuntimeError, match="admission barrier timed out"):
+        asyncio.run(server._wait_admission_barrier(timeout_s=0.01))
+
+
 def test_standalone_server_level2_sleep_and_two_phase_wake_keep_admission_fenced():
     calls = []
 
