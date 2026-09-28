@@ -525,7 +525,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
 
             async with self.replica_operation_lock:
                 current = self.borrowed_operations[lease_id]
-                replica_key = current["replica_key"]
                 cleanup_verified = bool(
                     runtime is not None
                     and getattr(runtime, "borrowed_cleanup_verified", False)
