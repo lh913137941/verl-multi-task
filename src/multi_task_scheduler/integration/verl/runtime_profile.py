@@ -65,6 +65,8 @@ def validate_runtime_profile(config) -> bool:
         ("actor_rollout_ref.rollout.mode", "async"),
         ("actor_rollout_ref.rollout.name", "vllm"),
         ("actor_rollout_ref.rollout.calculate_log_probs", True),
+        ("actor_rollout_ref.rollout.enable_sleep_mode", True),
+        ("actor_rollout_ref.rollout.free_cache_engine", True),
         ("data.train_batch_size", 0),
         ("data.gen_batch_size", 1),
     ):
