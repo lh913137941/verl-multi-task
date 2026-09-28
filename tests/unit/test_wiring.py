@@ -1367,9 +1367,12 @@ def replica_class():
         ResourcePoolManager=object,
         RolloutMode=object,
         get_device_name=lambda: "cuda",
-        MultiTaskCheckpointEngineWorker=object,
+        get_resource_name=lambda: "GPU",
+        get_visible_devices_keyword=lambda: "CUDA_VISIBLE_DEVICES",
         MultiTaskvLLMHttpServer=object,
         hashlib=__import__("hashlib"),
+        os=__import__("os"),
+        subprocess=__import__("subprocess"),
         ray=fake_ray,
     )
 
@@ -1483,10 +1486,21 @@ def test_borrowed_worker_plan_rejects_donor_topology_or_wrong_identity():
         replica.build_borrowed_worker_plan(donor_layout)
 
 
-def test_worker_gpu_uuid_probe_maps_ray_index_without_guessing():
-    class Parent:
-        pass
+def test_worker_gpu_uuid_probe_uses_native_worker_ray_call_context():
+    accelerator = {"value": "1"}
 
+    class Context:
+        def get_accelerator_ids(self):
+            return {"GPU": [accelerator["value"]]}
+
+        def get_node_id(self):
+            return "node-a"
+
+    fake_ray = type(
+        "ProbeRay",
+        (),
+        {"get_runtime_context": staticmethod(lambda: Context())},
+    )
     fake_subprocess = type(
         "Subprocess",
         (),
@@ -1497,22 +1511,29 @@ def test_worker_gpu_uuid_probe_maps_ray_index_without_guessing():
         },
     )
     cls = isolated(
-        "checkpoint/checkpoint_engine_worker.py",
-        "MultiTaskCheckpointEngineWorker",
-        Parent,
-        subprocess=fake_subprocess,
+        "rollout/replica.py",
+        "MultiTaskvLLMReplica",
+        object,
+        ReplicaKind=ReplicaKind,
+        FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
+        MultiTaskvLLMHttpServer=object,
+        hashlib=__import__("hashlib"),
         os=__import__("os"),
-        ray=object(),
+        subprocess=fake_subprocess,
+        ray=fake_ray,
         get_resource_name=lambda: "GPU",
         get_visible_devices_keyword=lambda: "CUDA_VISIBLE_DEVICES",
     )
 
-    assert cls._resolve_nvidia_gpu_uuid("1") == "GPU-b"
-    assert cls._resolve_nvidia_gpu_uuid("GPU-direct") == "GPU-direct"
+    assert cls._runtime_placement_probe(None)["gpu_uuid"] == "GPU-b"
+    accelerator["value"] = "GPU-direct"
+    assert cls._runtime_placement_probe(None)["gpu_uuid"] == "GPU-direct"
+    accelerator["value"] = "MIG-abc"
     with pytest.raises(NotImplementedError, match="MIG"):
-        cls._resolve_nvidia_gpu_uuid("MIG-abc")
+        cls._runtime_placement_probe(None)
+    accelerator["value"] = "opaque-id"
     with pytest.raises(RuntimeError, match="cannot map"):
-        cls._resolve_nvidia_gpu_uuid("opaque-id")
+        cls._runtime_placement_probe(None)
 
 
 def test_create_workers_from_claims_clones_actor_options_per_rank():
@@ -1546,8 +1567,8 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
     class FakeHandle:
         def __init__(self, record, *, gpu_uuid="GPU-x"):
             self.record = record
-            self.runtime_placement = AsyncRemoteMethod(
-                lambda: {
+            self.__ray_call__ = AsyncRemoteMethod(
+                lambda _probe: {
                     "node_id": "node",
                     "accelerator_id": "0",
                     "gpu_uuid": gpu_uuid,
@@ -1610,8 +1631,7 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
         PlacementGroupSchedulingStrategy=object,
         get_master_addr_port=object,
         get_device_name=lambda: "cuda",
-        MultiTaskCheckpointEngineWorker=object,
-        MultiTaskvLLMHttpServer=object,
+                MultiTaskvLLMHttpServer=object,
         hashlib=__import__("hashlib"),
         asyncio=asyncio,
         list_actors=lambda **kwargs: [],
@@ -1760,8 +1780,7 @@ def test_init_from_lease_reaches_runtime_ready_only_after_server_health():
         PlacementGroupSchedulingStrategy=object,
         get_master_addr_port=object,
         get_device_name=lambda: "cuda",
-        MultiTaskCheckpointEngineWorker=object,
-        MultiTaskvLLMHttpServer=object,
+                MultiTaskvLLMHttpServer=object,
         hashlib=__import__("hashlib"),
         asyncio=asyncio,
         list_actors=lambda **kwargs: [],
@@ -1787,8 +1806,8 @@ def test_init_from_lease_reaches_runtime_ready_only_after_server_health():
         "Worker",
         (),
         {
-            "runtime_placement": AsyncRemoteMethod(
-                lambda: {
+            "__ray_call__": AsyncRemoteMethod(
+                lambda _probe: {
                     "node_id": "node",
                     "accelerator_id": "0",
                     "gpu_uuid": "GPU-x",
@@ -1846,10 +1865,12 @@ def checkpoint_manager_class(**extra_scope):
             self.replicas = list(replicas or [])
             self.build_calls = []
 
+        def add_replicas(self, replicas):
+            self.replicas.extend(replicas)
+
         def remove_replicas(self, replicas):
-            for replica in replicas:
-                if replica in self.replicas:
-                    self.replicas.remove(replica)
+            replicas = set(replicas)
+            self.replicas = [r for r in self.replicas if r not in replicas]
 
         def build_process_group(self, rollout):
             self.build_calls.append(rollout)
@@ -1860,6 +1881,7 @@ def checkpoint_manager_class(**extra_scope):
         "EvidenceType": EvidenceType,
         "ReplicaKind": ReplicaKind,
         "asyncio": asyncio,
+        "CheckpointEngineWorker": object,
         **extra_scope,
     }
     return isolated(
@@ -1888,7 +1910,7 @@ def test_ce_pending_bootstrap_is_not_effective_until_weight_ready():
     assert ce.replicas == ["native"]
 
     # Model the CE-owned confirmation; real transfer ordering is tested below.
-    ce._bootstrap_ready()[key] = (
+    ce._bootstrap_ready_map[key] = (
         "op-add", 7, OperationEvidence("op-add", EvidenceType.WEIGHT_READY, 2)
     )
     ce.commit_pending(
@@ -1988,8 +2010,7 @@ def test_ce_target_bootstrap_syncs_only_pending_target_and_is_idempotent():
         ray=FakeRay,
         RayClassWithInitArgs=FakeCIA,
         RayWorkerGroup=FakeRolloutWG,
-        MultiTaskCheckpointEngineWorker=object,
-    )
+            )
     ce = cls(config=config, actor_wg=ActorWG(), replicas=["native"])
     key = ReplicaKey("task-a", "borrowed-0")
     replica = Replica()
@@ -2092,8 +2113,7 @@ def test_ce_native_restore_wakes_weights_under_bootstrap_and_restores_kv_before_
         ray=FakeRay,
         RayClassWithInitArgs=FakeCIA,
         RayWorkerGroup=FakeRolloutWG,
-        MultiTaskCheckpointEngineWorker=object,
-    )
+            )
     ce = cls(config=config, actor_wg=ActorWG(), replicas=[])
     key = ReplicaKey("task-a", "native-0")
     replica = Replica()
@@ -2178,8 +2198,7 @@ def test_ce_native_restore_failure_resleeps_before_escaping():
         ray=FakeRay,
         RayClassWithInitArgs=FakeCIA,
         RayWorkerGroup=FakeRolloutWG,
-        MultiTaskCheckpointEngineWorker=object,
-    )
+            )
     ce = cls(config=config, actor_wg=ActorWG(), replicas=[])
     key = ReplicaKey("task-a", "native-0")
     ce.register_pending(key, [Replica()], operation_id="op-restore")
@@ -2246,8 +2265,7 @@ def test_ce_target_bootstrap_requires_server_version_confirmation():
         ray=FakeRay,
         RayClassWithInitArgs=FakeCIA,
         RayWorkerGroup=FakeRolloutWG,
-        MultiTaskCheckpointEngineWorker=object,
-    )
+            )
     ce = cls(config=config, actor_wg=ActorWG(), replicas=[])
     key = ReplicaKey("task-a", "borrowed-0")
     ce.register_pending(key, [Replica()], operation_id="op-add")
@@ -2256,7 +2274,7 @@ def test_ce_target_bootstrap_requires_server_version_confirmation():
         asyncio.run(
             ce.bootstrap_target(key, operation_id="op-add", loaded_version=7)
         )
-    assert key not in ce._bootstrap_ready()
+    assert key not in ce._bootstrap_ready_map
 
 
 
@@ -2280,7 +2298,7 @@ def test_ce_commit_requires_confirmed_bootstrap_version(version):
     key = ReplicaKey("task-a", "borrowed-0")
     evidence = OperationEvidence("op-add", EvidenceType.WEIGHT_READY, 2)
     ce.register_pending(key, ["borrowed"], operation_id="op-add")
-    ce._bootstrap_ready()[key] = ("op-add", 7, evidence)
+    ce._bootstrap_ready_map[key] = ("op-add", 7, evidence)
     with pytest.raises(ValueError):
         ce.commit_pending(key, evidence, loaded_version=version)
     assert ce.effective_replicas == {}
@@ -2292,11 +2310,11 @@ def test_ce_remove_invalidates_bootstrap_result_for_reused_key():
     key = ReplicaKey("task-a", "borrowed-0")
     evidence = OperationEvidence("op-add", EvidenceType.WEIGHT_READY, 2)
     ce.register_pending(key, ["old-runtime"], operation_id="op-add")
-    ce._bootstrap_ready()[key] = ("op-add", 7, evidence)
+    ce._bootstrap_ready_map[key] = ("op-add", 7, evidence)
     ce.commit_pending(key, evidence, loaded_version=7)
     ce.remove_effective(key)
     ce.register_pending(key, ["new-runtime"], operation_id="op-next")
-    assert key not in ce._bootstrap_ready()
+    assert key not in ce._bootstrap_ready_map
     assert ce.replicas == []
 
 
@@ -2305,7 +2323,7 @@ def test_ce_committed_replay_rejects_replaced_evidence():
     key = ReplicaKey("task-a", "borrowed-0")
     evidence = OperationEvidence("op-add", EvidenceType.WEIGHT_READY, 2)
     ce.register_pending(key, ["runtime"], operation_id="op-add")
-    ce._bootstrap_ready()[key] = ("op-add", 7, evidence)
+    ce._bootstrap_ready_map[key] = ("op-add", 7, evidence)
     ce.commit_pending(key, evidence, loaded_version=7)
     with pytest.raises(ValueError, match="confirmed bootstrap"):
         ce.commit_pending(
@@ -2892,18 +2910,18 @@ def test_native_runtime_health_probe_confirms_server_and_ce_worker_node():
     class Server:
         runtime_health = AsyncRemoteMethod(lambda: dict(health))
 
-    class Worker:
-        runtime_placement = AsyncRemoteMethod(
-            lambda: {"node_id": "node-0", "gpu_uuid": "u0"}
-        )
-
     cls = replica_class()
     replica = cls.__new__(cls)
     replica.replica_kind = ReplicaKind.NATIVE
     replica.replica_rank = 2
     replica.nnodes = 1
     replica.servers = [Server()]
-    replica.workers = [Worker()]
+    replica.workers = [object()]
+
+    async def worker_placements():
+        return ({"node_id": "node-0", "gpu_uuid": "u0"},)
+
+    replica.worker_placements = worker_placements
     replica._server_handle = replica.servers[0]
     replica._server_address = "127.0.0.1:8000"
 
@@ -2939,14 +2957,14 @@ def test_native_replica_requires_verified_server_receipts_for_sleep_and_wake():
 def test_manager_native_sleep_binds_released_evidence_to_runtime_gpu_uuids():
     key = ReplicaKey("task-a", "native-0")
 
-    class Worker:
-        def __init__(self, gpu_uuid):
-            self.runtime_placement = AsyncRemoteMethod(
-                lambda: {"node_id": "n0", "gpu_uuid": gpu_uuid}
-            )
-
     class Runtime:
-        workers = [Worker("u0"), Worker("u1")]
+        workers = [object(), object()]
+
+        async def worker_placements(self):
+            return (
+                {"node_id": "n0", "gpu_uuid": "u0"},
+                {"node_id": "n0", "gpu_uuid": "u1"},
+            )
 
         async def sleep(self):
             return (
@@ -2969,13 +2987,11 @@ def test_manager_native_release_replay_returns_identical_evidence():
     key = ReplicaKey("task-a", "native-0")
     sleep_calls = []
 
-    class Worker:
-        runtime_placement = AsyncRemoteMethod(
-            lambda: {"node_id": "n0", "gpu_uuid": "u0"}
-        )
-
     class Runtime:
-        workers = [Worker()]
+        workers = [object()]
+
+        async def worker_placements(self):
+            return ({"node_id": "n0", "gpu_uuid": "u0"},)
 
         async def sleep(self):
             sleep_calls.append("sleep")
