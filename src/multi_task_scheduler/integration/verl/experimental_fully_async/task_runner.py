@@ -72,15 +72,11 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         if lease.lease_id != command.lease_id:
             raise ValueError("operation lease snapshot does not match command.lease_id")
 
-        selected_slots = []
-        for rank, claim in enumerate(lease.claims):
-            slot = dict(claim)
-            # Donor/source rank metadata is not borrower topology. First release
-            # is single-node, so rebuild the borrower rank view unconditionally.
-            slot["rank"] = rank
-            slot["node_rank"] = 0
-            slot["local_rank"] = rank
-            selected_slots.append(slot)
+        # Donor/source rank metadata is not borrower topology.
+        selected_slots = [
+            dict(claim, rank=rank, node_rank=0, local_rank=rank)
+            for rank, claim in enumerate(lease.claims)
+        ]
 
         return {
             "operation_id": command.operation_id,
