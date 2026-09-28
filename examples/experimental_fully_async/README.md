@@ -43,10 +43,13 @@ DP=1、PP=1、non-PD vLLM；TP 必须能在单节点放下并经实际组合验�
    python -m pytest -q -s -m gpu_integration \
      tests/integration/test_native_sleep_gpu.py
    ```
-   该测试要求真实生成成功、CE worker 报告物理 GPU UUID、level-2 sleep 后
-   `nvidia-smi` 显存显著下降，并确认 weights-only wake 仍处于 partial sleeping。
-   它只证明 sleep/wake primitive，不证明 current-Vpub RESTORE；完整 RESTORE 仍必须由
-   Trainer/CheckpointEngine sender 实际装参并验证 `global_steps == Vpub` 后再验收。
+   同一文件包含两层验收：1 GPU 用例要求真实生成成功、CE worker 报告物理 GPU UUID、
+   Manager 生成精确 `RELEASED`、level-2 sleep 后 `nvidia-smi` 显存显著下降，并确认
+   weights-only wake 仍处于 partial sleeping；若至少有 2 张 GPU，还会运行 current-Vpub
+   RESTORE 用例，用真实 FSDP TrainingWorker + NCCL sender 在 level-2 后重新装入完整参数，
+   验证 `global_steps == 17`，并证明生成请求在 final wake 前保持 parked、final wake 后
+   才继续且生成结果与 sleep 前一致。只有第二个用例成功才可作为 RESTORE 数据路径的
+   GPU 证据，但它仍不等价于完整 GS→TaskRunner 借还业务闭环。
 
 记录完整命令、组合配置、两仓源码版本、环境依赖、实际导入路径、节点/GPU 数量、
 Actor 类型、GPU UUID、sleep 前后显存和日志。若没有实际触发中断/续推或 current-Vpub
