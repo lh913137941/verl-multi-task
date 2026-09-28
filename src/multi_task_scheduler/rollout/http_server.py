@@ -189,9 +189,23 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         self._submission_paused = True
         self._resume_event.clear()
         sleeping_before = bool(await engine.is_sleeping())
+        if tags == ["weights"] and stage == "weights":
+            if not sleeping_before:
+                raise RuntimeError("weights-wake ledger disagrees with vLLM engine")
+            return {
+                "replica_rank": self.replica_rank,
+                "node_rank": self.node_rank,
+                "sleeping": True,
+                "fully_awake": False,
+                "global_steps": self.global_steps,
+            }
         if tags is None and stage == "level2":
             raise RuntimeError(
                 "full native wake requires weights-only RESTORE preparation"
+            )
+        if tags is None and stage == "weights" and sleeping_before:
+            raise RuntimeError(
+                "full native wake requires CE KV restore before admission commit"
             )
         if not sleeping_before:
             # CE target bootstrap wakes KV cache itself.  The final no-tag wake
@@ -248,7 +262,7 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
                 raise RuntimeError(
                     "CE bootstrap requires weights-only wake before KV release"
                 )
-            # After level-2 -> wake_weights, KV memory is already absent.  CE
+            # After level-2 -> weights-only wake, KV memory is already absent.  CE
             # bootstrap should transfer current weights directly rather than
             # issuing another sleep/wake cycle.
             return {"kv_cache_released": True, "already_sleeping": True}
@@ -273,28 +287,3 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
                 "global_steps": self.global_steps,
             }
         return await super().resume_kv_cache()
-
-    async def wake_weights(self) -> dict:
-        """Allocate weight memory only; parameters must be refreshed before full wake."""
-        engine = self._require_sleep_engine()
-        if self._multitask_sleep_stage() == "weights":
-            if not await engine.is_sleeping():
-                raise RuntimeError("weights-wake ledger disagrees with vLLM engine")
-            self._submission_paused = True
-            self._resume_event.clear()
-            return {
-                "replica_rank": self.replica_rank,
-                "node_rank": self.node_rank,
-                "sleeping": True,
-                "fully_awake": False,
-                "global_steps": self.global_steps,
-            }
-        if self._multitask_sleep_stage() != "level2":
-            raise RuntimeError("weights-only wake requires a proven level-2 sleep")
-        receipt = await self.wake_up(tags=["weights"])
-        if receipt["fully_awake"] or not receipt["sleeping"]:
-            raise RuntimeError(
-                "weights-only wake unexpectedly made the vLLM engine fully awake"
-            )
-        return receipt
-
