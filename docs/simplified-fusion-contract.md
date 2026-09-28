@@ -28,7 +28,7 @@ FORCE_VERIFIED is borrowed-only. It reuses VERL's native Fully Async partial-rol
 
 RESTORE wakes the same native runtime, restores current parameters and re-enters E/R/C/M. A partial restore returns to DORMANT only after proven re-sleep, otherwise QUARANTINED.
 
-Current branch status: natural borrowed REMOVE is the only lifecycle path admitted end-to-end. ADD, native DONATE, RESTORE and FORCE are rejected by TaskRunner before journal/worker creation because their native/GPU completion boundary is not yet verified; Rollouter also keeps FORCE fail-closed before M/R mutation or abort. Lower-level borrowed create/destroy, CE target bootstrap and continuation wiring remain available for isolated validation and do not by themselves certify those end-to-end operations.
+Current branch status: natural borrowed REMOVE is the only lifecycle path admitted end-to-end. ADD, native DONATE, RESTORE and FORCE are rejected by TaskRunner before journal/worker creation because their native/GPU completion boundary is not yet verified; Rollouter also keeps FORCE fail-closed before M/R mutation or abort. Lower-level borrowed create/destroy, CE target bootstrap, continuation wiring, and native vLLM level-2 sleep / staged wake primitives are available for isolated validation and do not by themselves certify those end-to-end operations. In particular, a level-2 RESTORE must install the complete current Vpub between weights-only wake and final KV wake; advancing a version tag without reconstructing discarded weights is not sufficient.
 
 Idle detection is Rollouter-local: production window + C + read-only Manager M. LB request state does not decide bubbles. Rollouter reports metadata directly to GS; draining starts only after GS issues a lifecycle operation.
 
