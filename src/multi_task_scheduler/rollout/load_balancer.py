@@ -129,6 +129,8 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             raise ValueError("commit_ready requires nonempty server_id")
         if not isinstance(operation_id, str) or not operation_id:
             raise ValueError("commit_ready requires nonempty operation_id")
+        if server_handle is None:
+            raise ValueError("commit_ready requires server_handle")
 
         previous = self.ready_operations.get(operation_id)
         if previous is not None:
@@ -142,6 +144,9 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         existing_route = self.routes.get(key)
         if existing_route is not None and existing_route != server_id:
             raise ValueError("ReplicaKey already routes to another server")
+        existing_handle = self._servers.get(server_id)
+        if existing_handle is not None and existing_handle != server_handle:
+            raise ValueError("server_id is already bound to another handle")
         for existing_operation, (existing_key, existing_server, _evidence) in self.ready_operations.items():
             if existing_key == key and existing_operation != operation_id:
                 raise ValueError("ReplicaKey was published by another operation")
