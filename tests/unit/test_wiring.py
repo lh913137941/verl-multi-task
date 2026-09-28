@@ -1972,9 +1972,15 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         asyncio.run(manager.create_borrowed_replica(duplicate_identity))
     assert manager.next_replica_rank == next_rank_before
 
-    wrong_rank = dict(valid_spec, replica_rank=7)
-    with pytest.raises(ValueError, match="conflicting borrowed create replay"):
-        asyncio.run(manager.create_borrowed_replica(wrong_rank))
+    # Caller-supplied replica_rank is compatibility metadata, not an owner
+    # identity fact. Manager strips it before replay comparison and keeps the
+    # already allocated rank from its own record.
+    non_authoritative_rank = dict(valid_spec, replica_rank=7)
+    assert (
+        asyncio.run(manager.create_borrowed_replica(non_authoritative_rank))
+        == receipt
+    )
+    assert manager.next_replica_rank == assigned_rank + 1
 
     conflicting = dict(valid_spec, operation_id="op-other")
     with pytest.raises(ValueError, match="conflicting borrowed create replay"):
