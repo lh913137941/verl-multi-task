@@ -19,7 +19,7 @@ from multi_task_scheduler.orchestration.contracts import (
     ReplicaKind,
 )
 
-RUNTIME_KIND = "verl-multi-task:experimental_fully_async_standalone:092203"
+RUNTIME_KIND = "verl-multi-task:experimental_fully_async_standalone:092203-r2"
 _RELEASE_KINDS = {OperationKind.DONATE, OperationKind.REMOVE}
 
 
