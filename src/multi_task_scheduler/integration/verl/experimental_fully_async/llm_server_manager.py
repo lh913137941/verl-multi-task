@@ -207,13 +207,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         if self.task_session and borrower_task_id != self.task_session:
             raise ValueError("borrowed placement targets another task_session")
 
-        has_claims = spec.get("claims") is not None
-        has_selected_slots = spec.get("selected_slots") is not None
-        if has_claims == has_selected_slots:
-            raise ValueError(
-                "borrowed placement requires exactly one of claims or selected_slots"
-            )
-        raw_claims = spec["claims"] if has_claims else spec["selected_slots"]
+        raw_claims = spec.get("claims")
         if not isinstance(raw_claims, (list, tuple)) or not raw_claims:
             raise ValueError("borrowed placement requires nonempty claims")
 
@@ -284,7 +278,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             raise ValueError("first release borrowed placement must be single-node")
 
         normalized = dict(spec)
-        normalized.pop("selected_slots", None)
         normalized["claims"] = claims
         normalized["world_size"] = world_size
         normalized["max_colocate_count"] = max_colocate_count
