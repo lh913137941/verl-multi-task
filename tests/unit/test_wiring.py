@@ -2015,7 +2015,7 @@ def test_ce_target_bootstrap_syncs_only_pending_target_and_is_idempotent():
         workers = ["worker-0"]
 
         async def release_kv_cache(self):
-            calls.append(("release-kv",))
+            raise AssertionError("native RESTORE already has KV released after weights-only wake")
 
         async def resume_kv_cache(self):
             calls.append(("resume-kv",))
@@ -2142,8 +2142,7 @@ def test_ce_native_restore_wakes_weights_under_bootstrap_and_restores_kv_before_
         ce.bootstrap_target(key, operation_id="op-restore", loaded_version=13)
     )
     assert evidence.type is EvidenceType.WEIGHT_READY
-    assert calls.index(("wake", ("weights",))) < calls.index(("release-kv",))
-    assert calls.index(("release-kv",)) < calls.index(("target-update", 13))
+    assert calls.index(("wake", ("weights",))) < calls.index(("target-update", 13))
     assert calls.index(("target-update", 13)) < calls.index(("resume-kv",))
     assert calls.index(("resume-kv",)) < calls.index(("health",))
 
@@ -2515,10 +2514,10 @@ def test_standalone_server_level2_sleep_and_two_phase_wake_keep_admission_fenced
     assert server._submission_paused is True
     assert server._resume_event.is_set is False
 
-    kv_receipt = asyncio.run(server.resume_kv_cache())
-    assert kv_receipt["kv_cache_resumed"] is True
-    assert server._submission_paused is True
-    assert server._resume_event.is_set is False
+    # VERL's inherited resume_kv_cache() restores KV/reset cache while the
+    # MultiTask admission gate remains closed. Model that completed native step
+    # here; this test only owns the final MultiTask admission commit.
+    server.engine.sleeping = False
 
     wake_receipt = asyncio.run(server.wake_up())
     assert wake_receipt["fully_awake"] is True
@@ -2529,64 +2528,6 @@ def test_standalone_server_level2_sleep_and_two_phase_wake_keep_admission_fenced
     assert ("wake_up", ("weights",)) in calls
     assert ("reset_prefix_cache", True) in calls
     assert calls[-2:] == [("health",), ("gate", "set")]
-
-
-def test_standalone_server_resume_kv_keeps_restore_admission_fenced():
-    calls = []
-
-    class Event:
-        def __init__(self):
-            self.is_set = False
-
-        def clear(self):
-            self.is_set = False
-            calls.append(("gate", "clear"))
-
-        def set(self):
-            self.is_set = True
-            calls.append(("gate", "set"))
-
-    class Engine:
-        def __init__(self):
-            self.sleeping = True
-
-        async def is_sleeping(self):
-            return self.sleeping
-
-        async def wake_up(self, *, tags=None):
-            calls.append(("wake_up", tuple(tags) if tags is not None else None))
-            if tags == ["kv_cache"]:
-                self.sleeping = False
-
-        async def reset_prefix_cache(self, *, reset_connector):
-            calls.append(("reset_prefix_cache", reset_connector))
-
-    server = http_server_class()()
-    server.nnodes = 1
-    server.node_rank = 0
-    server.replica_rank = 0
-    server.global_steps = 5
-    server.config = type(
-        "Config",
-        (),
-        {"enable_sleep_mode": True, "free_cache_engine": True},
-    )()
-    server.engine = Engine()
-    server._multitask_sleep_stage_value = "weights"
-    server._submission_paused = True
-    server._resume_event = Event()
-
-    receipt = asyncio.run(server.resume_kv_cache())
-    assert receipt["kv_cache_resumed"] is True
-    assert receipt["admission_paused"] is True
-    assert server._submission_paused is True
-    assert server._resume_event.is_set is False
-    assert server._multitask_sleep_stage() == "weights"
-    assert calls == [
-        ("gate", "clear"),
-        ("wake_up", ("kv_cache",)),
-        ("reset_prefix_cache", True),
-    ]
 
 
 def test_standalone_server_weights_stage_rollback_returns_to_level2_sleep():
@@ -2674,27 +2615,6 @@ def test_standalone_server_rejects_configs_that_cannot_use_level2_sleep():
         asyncio.run(server.sleep())
     assert server._submission_paused is False
     assert server._resume_event.clear_calls == 0
-
-
-def test_restore_partial_wake_makes_release_kv_cache_idempotent():
-    class Engine:
-        async def is_sleeping(self):
-            return True
-
-    server = http_server_class()()
-    server.nnodes = 1
-    server.node_rank = 0
-    server.replica_rank = 0
-    server.config = type(
-        "Config",
-        (),
-        {"enable_sleep_mode": True, "free_cache_engine": True},
-    )()
-    server.engine = Engine()
-    server._multitask_sleep_stage_value = "weights"
-
-    receipt = asyncio.run(server.release_kv_cache())
-    assert receipt == {"kv_cache_released": True, "already_sleeping": True}
 
 
 def test_standalone_sleep_and_weights_wake_are_idempotent_by_stage():
