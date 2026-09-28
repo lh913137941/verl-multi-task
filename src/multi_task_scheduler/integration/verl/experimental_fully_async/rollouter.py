@@ -68,10 +68,12 @@ class _ContinuationAwareServer:
                 self._client_id,
                 prefix_digest,
             )
-        except KeyError:
+        except Exception as exc:
             # Native Fully Async also aborts for ordinary weight-sync/rebalance.
-            # Only an active lifecycle drain needs continuation evidence.
-            pass
+            # Ray may surface a remote KeyError as RayTaskError(cause=KeyError).
+            cause = getattr(exc, "cause", None)
+            if not isinstance(exc, KeyError) and not isinstance(cause, KeyError):
+                raise
         return output
 
 
