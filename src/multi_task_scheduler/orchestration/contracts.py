@@ -161,6 +161,22 @@ class OperationEvidence:
         )
 
 
+def require_operation_evidence(
+    value,
+    operation_id: str,
+    expected: EvidenceType,
+    label: str = "operation",
+) -> OperationEvidence:
+    """Validate one cross-owner receipt without duplicating adapter checks."""
+    if not isinstance(value, OperationEvidence):
+        raise TypeError(f"{label} did not return OperationEvidence")
+    if value.operation_id != operation_id:
+        raise ValueError(f"{label} evidence belongs to another operation")
+    if value.type is not expected:
+        raise ValueError(f"expected {expected.value}, got {value.type.value}")
+    return value
+
+
 @dataclass(frozen=True)
 class Lease:
     """GS ledger entry: authorized claims and expiry, without a public state machine."""

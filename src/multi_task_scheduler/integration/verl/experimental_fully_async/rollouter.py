@@ -20,11 +20,11 @@ from multi_task_scheduler.orchestration.contracts import (
     OperationEvidence,
     OperationRecord,
     ReplicaKey,
+    require_operation_evidence as _require_evidence,
     ReplicaKind,
     ReplicaState,
 )
 
-from ._support import require_evidence as _require_evidence
 from .llm_server_manager import MultiTaskLLMServerManager
 
 

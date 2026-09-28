@@ -16,11 +16,11 @@ from multi_task_scheduler.orchestration.contracts import (
     OperationEvidence,
     OperationRecord,
     ReplicaKey,
+    require_operation_evidence as _require_evidence,
     ReplicaKind,
 )
 from multi_task_scheduler.orchestration.replica_sync_gate import GateKind, ReplicaSyncGate
 
-from ._support import require_evidence as _require_evidence
 
 
 @ray.remote(num_cpus=10)
