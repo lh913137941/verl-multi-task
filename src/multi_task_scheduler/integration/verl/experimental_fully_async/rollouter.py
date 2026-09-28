@@ -362,14 +362,7 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                 runtime = manager.inspect_runtime(target)
                 if runtime is None:
                     raise RuntimeError("native runtime is unavailable for RESTORE commit")
-                receipts = await runtime.wake_up()
-                if not isinstance(receipts, (tuple, list)) or not receipts:
-                    raise RuntimeError("native RESTORE returned no wake receipts")
-                for receipt in receipts:
-                    if not isinstance(receipt, dict):
-                        raise TypeError("native RESTORE wake returned a non-dict receipt")
-                    if receipt.get("fully_awake") is not True or receipt.get("sleeping") is not False:
-                        raise RuntimeError("native RESTORE did not confirm full wake")
+                await runtime.wake_up()
 
                 server_id = getattr(runtime, "_server_address", None)
                 server_handle = getattr(runtime, "_server_handle", None)
