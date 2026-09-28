@@ -345,7 +345,7 @@ def test_real_standalone_level2_sleep_releases_device_memory_and_weights_wake_st
         )
         assert destroy_evidence.released_gpu_uuids == (gpu_uuid,)
 
-        weights_receipts = asyncio.run(manager.wake_weights(key))
+        weights_receipts = asyncio.run(replica.wake_up(tags=["weights"]))
         assert all(
             receipt["sleeping"] is True
             and receipt["fully_awake"] is False
