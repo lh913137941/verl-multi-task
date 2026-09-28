@@ -212,14 +212,11 @@ class GroupScheduler:
         # advance_lease() immediately. Recording after the RPC creates a race
         # where valid RELEASED/SERVICE_COMMITTED evidence appears "unknown".
         staged_command = previous is None
-        staged_borrower = False
-        staged_restore_reservation = False
         if staged_command:
             self.operation_commands[command.operation_id] = command
             if command.kind is OperationKind.ADD:
                 if self.borrower_targets.get(command.lease_id) is None:
                     self.borrower_targets[command.lease_id] = command.target
-                    staged_borrower = True
             elif command.kind is OperationKind.RESTORE:
                 # The phase validation above already proved every physical
                 # claim unowned. GroupScheduler is a single-writer actor, so
@@ -229,7 +226,6 @@ class GroupScheduler:
                     self.active_bundle_owner[bundle_key] = command.lease_id
                 for gpu_uuid in lease.gpu_uuids:
                     self.active_gpu_owner[gpu_uuid] = command.lease_id
-                staged_restore_reservation = True
 
         try:
             result = ray.get(
@@ -242,41 +238,11 @@ class GroupScheduler:
                 raise ValueError("TaskRunner returned a record for another operation")
             return result
         except BaseException:
-            # Submission failure can be ambiguous (for example a timeout after
-            # TaskRunner already journaled/launched the worker). Reconcile with
-            # the existing query API and roll back GS staging only when the
-            # TaskRunner authoritatively says the operation was never journaled.
-            definitely_unaccepted = False
-            if staged_command:
-                try:
-                    observed = ray.get(
-                        task_runner.query_operation.remote(command.operation_id),
-                        timeout=30,
-                    )
-                    definitely_unaccepted = (
-                        isinstance(observed, OperationRecord)
-                        and observed.operation_id == command.operation_id
-                        and observed.status is OperationStatus.UNKNOWN
-                        and observed.result is None
-                    )
-                except BaseException:
-                    # Unknown delivery/query outcome: preserve GS intent so a
-                    # possibly-running lifecycle worker can still reconcile its
-                    # evidence. A same-command retry remains idempotent.
-                    definitely_unaccepted = False
-
-            if definitely_unaccepted:
-                self.operation_commands.pop(command.operation_id, None)
-                if staged_borrower:
-                    if self.borrower_targets.get(command.lease_id) == command.target:
-                        self.borrower_targets.pop(command.lease_id, None)
-                if staged_restore_reservation:
-                    for bundle_key in lease.bundle_keys:
-                        if self.active_bundle_owner.get(bundle_key) == command.lease_id:
-                            self.active_bundle_owner.pop(bundle_key, None)
-                    for gpu_uuid in lease.gpu_uuids:
-                        if self.active_gpu_owner.get(gpu_uuid) == command.lease_id:
-                            self.active_gpu_owner.pop(gpu_uuid, None)
+            # A missing TaskRunner journal record is itself an UNKNOWN delivery
+            # observation: the submit RPC may have crossed the actor boundary
+            # before its reply was lost. Preserve GS intent/reservations and
+            # require an exact-command replay or later evidence to reconcile it.
+            # Never infer "definitely unaccepted" from UNKNOWN + empty result.
             raise
 
     @staticmethod

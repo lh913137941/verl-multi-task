@@ -535,10 +535,17 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
             )
         except BaseException as exc:
             if mutated:
-                gate.block(
-                    lease.owner,
-                    f"RESTORE outcome unknown: {type(exc).__name__}",
-                )
+                quarantine_error = None
+                try:
+                    await self.rollouter.quarantine_dormant_restore.remote(
+                        operation.operation_id
+                    )
+                except BaseException as projection_exc:
+                    quarantine_error = projection_exc
+                reason = f"RESTORE outcome unknown: {type(exc).__name__}"
+                if quarantine_error is not None:
+                    reason += "; M projection reconciliation failed"
+                gate.block(lease.owner, reason)
             raise
         finally:
             await lease.release()

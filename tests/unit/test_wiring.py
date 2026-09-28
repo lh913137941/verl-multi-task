@@ -1612,6 +1612,47 @@ def test_trainer_restore_bootstrap_release_returns_compensation_without_blocking
     assert calls == [("bootstrap_target", 11)]
 
 
+def test_trainer_restore_unverified_bootstrap_quarantines_m_projection_and_blocks_g():
+    key = ReplicaKey("task-a", "native-0")
+    runtime = type("Runtime", (), {"replica_kind": ReplicaKind.NATIVE})()
+    calls = []
+
+    class CE:
+        def __init__(self):
+            self.pending_bootstrap = {key: ((runtime,), "op-donate")}
+
+        def discard_pending(self, target):
+            self.pending_bootstrap.pop(target, None)
+
+        def register_pending(self, target, replicas, *, operation_id):
+            self.pending_bootstrap[target] = (tuple(replicas), operation_id)
+
+        async def bootstrap_target(self, target, *, operation_id, loaded_version):
+            raise RuntimeError("re-sleep proof unavailable")
+
+    class Rollouter:
+        get_pending_target = AsyncRemoteMethod(lambda operation_id: key)
+        quarantine_dormant_restore = AsyncRemoteMethod(
+            lambda operation_id: calls.append(("quarantine", operation_id)) or True
+        )
+
+    trainer = trainer_class()()
+    trainer.rollouter = Rollouter()
+    trainer.checkpoint_manager = CE()
+    trainer.current_param_version = 11
+
+    with pytest.raises(RuntimeError, match="re-sleep proof unavailable"):
+        asyncio.run(
+            trainer.restore_and_publish(
+                OperationRecord("op-restore-unknown", OperationStatus.RUNNING)
+            )
+        )
+
+    assert calls == [("quarantine", "op-restore-unknown")]
+    assert trainer.replica_sync_gate.health == "BLOCKED"
+    assert trainer.replica_sync_gate.blocked_operation_id == "op-restore-unknown"
+
+
 def test_trainer_restore_definite_no_route_removes_e_then_resleeps():
     key = ReplicaKey("task-a", "native-0")
     runtime = type("Runtime", (), {"replica_kind": ReplicaKind.NATIVE})()
@@ -1714,6 +1755,9 @@ def test_trainer_restore_service_failure_keeps_e_effective_and_blocks_g():
             lambda operation: (_ for _ in ()).throw(
                 RuntimeError("service publish failed")
             )
+        )
+        quarantine_dormant_restore = AsyncRemoteMethod(
+            lambda operation_id: False
         )
 
     trainer = trainer_class()()
@@ -3932,7 +3976,7 @@ def test_group_scheduler_stages_operation_intent_before_taskrunner_dispatch():
     assert gs.operation_commands[command.operation_id] == command
 
 
-def test_group_scheduler_rolls_back_staged_add_state_when_taskrunner_rejects():
+def test_group_scheduler_preserves_staged_add_state_when_taskrunner_rejects_unknown():
     cls = _isolated_group_scheduler_class()
     gs = cls()
     lease = _scheduler_test_lease()
@@ -3962,11 +4006,11 @@ def test_group_scheduler_rolls_back_staged_add_state_when_taskrunner_rejects():
     gs.task_runners["task-a"] = Runner()
     with pytest.raises(NotImplementedError, match="backend unavailable"):
         gs.submit_operation(command)
-    assert command.operation_id not in gs.operation_commands
-    assert lease.lease_id not in gs.borrower_targets
+    assert gs.operation_commands[command.operation_id] == command
+    assert gs.borrower_targets[lease.lease_id] == command.target
 
 
-def test_group_scheduler_rolls_back_restore_reservation_when_taskrunner_rejects():
+def test_group_scheduler_preserves_restore_reservation_when_taskrunner_rejects_unknown():
     cls = _isolated_group_scheduler_class()
     gs = cls()
     lease = _scheduler_test_lease()
@@ -3997,9 +4041,9 @@ def test_group_scheduler_rolls_back_restore_reservation_when_taskrunner_rejects(
     gs.task_runners["task-a"] = Runner()
     with pytest.raises(NotImplementedError, match="restore unavailable"):
         gs.submit_operation(command)
-    assert command.operation_id not in gs.operation_commands
-    assert lease.lease_id not in gs.active_gpu_owner.values()
-    assert lease.lease_id not in gs.active_bundle_owner.values()
+    assert gs.operation_commands[command.operation_id] == command
+    assert gs.active_gpu_owner["u0"] == lease.lease_id
+    assert gs.active_bundle_owner[("pg", 0)] == lease.lease_id
 
 
 def test_group_scheduler_preserves_staging_when_submission_outcome_is_ambiguous():
@@ -4438,15 +4482,21 @@ def test_rollouter_submit_idle_report_forwards_paused_surplus_metadata():
     )
 
 
-def test_rollouter_natural_drain_timeout_quarantines_instead_of_polling_forever():
+def test_rollouter_natural_drain_timeout_stays_draining_and_same_op_resumes():
     cls = rollouter_class()
     rollouter = cls(object(), object())
     key = ReplicaKey("task-a", "native-0")
     rollouter._natural_drain_timeout_s = 0.01
+    state = {"unsettled": True, "begin_calls": 0}
 
     class LB:
-        begin_drain = AsyncRemoteMethod(lambda target, operation_id: "s0")
-        has_unsettled_requests = AsyncRemoteMethod(lambda server_id: True)
+        begin_drain = AsyncRemoteMethod(
+            lambda target, operation_id:
+            state.__setitem__("begin_calls", state["begin_calls"] + 1) or "s0"
+        )
+        has_unsettled_requests = AsyncRemoteMethod(
+            lambda server_id: state["unsettled"]
+        )
 
     class Manager:
         global_load_balancer = LB()
@@ -4458,8 +4508,8 @@ def test_rollouter_natural_drain_timeout_quarantines_instead_of_polling_forever(
         def replica_meta(self, target):
             return self.replica_kind[target], self.replica_state[target]
 
-        def transition_replica(self, target, state):
-            self.replica_state[target] = state
+        def transition_replica(self, target, new_state):
+            self.replica_state[target] = new_state
 
     manager = Manager()
     rollouter.llm_server_manager = manager
@@ -4473,7 +4523,20 @@ def test_rollouter_natural_drain_timeout_quarantines_instead_of_polling_forever(
             )
         )
 
-    assert manager.replica_state[key] is ReplicaState.QUARANTINED
+    assert manager.replica_state[key] is ReplicaState.DRAINING
+    assert rollouter.get_pending_target("op-timeout") == key
+
+    state["unsettled"] = False
+    evidence = asyncio.run(
+        rollouter.prepare_exit(
+            key,
+            operation_id="op-timeout",
+            force=False,
+        )
+    )
+    assert evidence.type is EvidenceType.EXIT_READY
+    assert manager.replica_state[key] is ReplicaState.DRAINING
+    assert state["begin_calls"] >= 2
 
 
 def test_rollouter_add_commit_publishes_hidden_borrower_after_e_is_ready():
@@ -4794,6 +4857,30 @@ def test_rollouter_restore_commit_publishes_r_c_then_marks_native_active():
         ("state", ReplicaState.ACTIVE),
         ("commit_ready", key, "s0", "h0", "op-restore"),
     ]
+
+
+def test_rollouter_quarantines_dormant_restore_projection_only():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "native-0")
+
+    class Manager:
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.DORMANT}
+            self.replica_kind = {key: ReplicaKind.NATIVE}
+
+        def replica_meta(self, target):
+            return self.replica_kind[target], self.replica_state[target]
+
+        def transition_replica(self, target, state):
+            self.replica_state[target] = state
+
+    manager = Manager()
+    rollouter.llm_server_manager = manager
+    rollouter._pending_operation_targets["op-restore-quarantine"] = key
+
+    assert rollouter.quarantine_dormant_restore("op-restore-quarantine") is True
+    assert manager.replica_state[key] is ReplicaState.QUARANTINED
 
 
 def test_rollouter_restore_ack_loss_reconciles_committed_route_without_sleep():
@@ -5457,6 +5544,79 @@ def test_rollouter_force_aborts_target_replica_and_waits_for_continuation_handof
         ("abort_all_requests",),
     ]
     assert handoff_calls["count"] >= 1
+
+
+def test_rollouter_force_timeout_same_op_resumes_without_repeating_abort():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "borrowed-0")
+    rollouter._force_handoff_timeout_s = 0.01
+    calls = []
+    state = {"handoff": False, "unsettled": True}
+
+    rollouter.config = type(
+        "Config",
+        (),
+        {"async_training": type("Async", (), {"partial_rollout": True})()},
+    )()
+
+    class Runtime:
+        async def abort_all_requests(self):
+            calls.append(("abort_all_requests",))
+            return {"aborted_count": 1, "request_ids": ["backend-1"]}
+
+    class LB:
+        server_for_replica = AsyncRemoteMethod(lambda target: "s0")
+        get_all_servers = AsyncRemoteMethod(lambda: ["s1"])
+        begin_drain = AsyncRemoteMethod(
+            lambda target, operation_id:
+            calls.append(("begin_drain", target, operation_id)) or "s0"
+        )
+        requests_for_server = AsyncRemoteMethod(lambda server_id: ("request-1",))
+        query_attempt = AsyncRemoteMethod(lambda request_id: AttemptState.ADMITTED)
+        has_unsettled_requests = AsyncRemoteMethod(
+            lambda server_id: state["unsettled"]
+        )
+        continuation_handoff_requests = AsyncRemoteMethod(
+            lambda operation_id: ("request-1",) if state["handoff"] else ()
+        )
+
+    class Manager:
+        global_load_balancer = LB()
+
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.ACTIVE}
+            self.replica_kind = {key: ReplicaKind.BORROWED}
+
+        def replica_meta(self, target):
+            return self.replica_kind[target], self.replica_state[target]
+
+        def inspect_runtime(self, target):
+            return Runtime()
+
+        def transition_replica(self, target, new_state):
+            self.replica_state[target] = new_state
+
+    manager = Manager()
+    rollouter.llm_server_manager = manager
+
+    with pytest.raises(TimeoutError, match="continuation handoff"):
+        asyncio.run(
+            rollouter.prepare_exit(key, operation_id="op-force-resume", force=True)
+        )
+
+    assert manager.replica_state[key] is ReplicaState.DRAINING
+    assert calls.count(("abort_all_requests",)) == 1
+
+    state["handoff"] = True
+    state["unsettled"] = False
+    evidence = asyncio.run(
+        rollouter.prepare_exit(key, operation_id="op-force-resume", force=True)
+    )
+
+    assert evidence.type is EvidenceType.EXIT_READY
+    assert manager.replica_state[key] is ReplicaState.DRAINING
+    assert calls.count(("abort_all_requests",)) == 1
 
 
 def test_rollouter_force_rejects_native_before_backend_capability_gate():

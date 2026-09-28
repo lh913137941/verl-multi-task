@@ -129,6 +129,13 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         self.group_scheduler = group_scheduler
         self.task_session = task_session
         self._pending_operation_targets: dict[str, ReplicaKey] = {}
+        # FORCE keeps only operation-local recovery facts: the LB requests that
+        # were ADMITTED before abort and the backend-confirmed abort count.
+        # None means the abort RPC outcome itself was not proven.
+        self._force_exit_recovery: dict[
+            str, tuple[tuple[str, ...], int | None]
+        ] = {}
+        self._force_handoff_timeout_s = 30.0
         multitask_config = getattr(config, "multitask", None)
         if multitask_config is None and isinstance(config, dict):
             multitask_config = config.get("multitask")
@@ -357,6 +364,22 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                     )
             raise
 
+    def quarantine_dormant_restore(self, operation_id: str) -> bool:
+        """Project an uncertain partially-awake RESTORE into M=QUARANTINED."""
+        target = self.get_pending_target(operation_id)
+        manager = self.llm_server_manager
+        kind, state = manager.replica_meta(target)
+        if kind is not ReplicaKind.NATIVE:
+            raise ValueError("RESTORE quarantine is valid only for NATIVE replicas")
+        if state is ReplicaState.QUARANTINED:
+            return True
+        if state is ReplicaState.DORMANT:
+            manager.transition_replica(target, ReplicaState.QUARANTINED)
+            return True
+        # ACTIVE/DRAINING carry stronger publication/rollback facts and must be
+        # reconciled by the existing service path rather than overwritten here.
+        return False
+
     async def prepare_exit(
         self,
         replica_key: ReplicaKey,
@@ -385,9 +408,14 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         if force:
             if kind is not ReplicaKind.BORROWED:
                 raise ValueError("FORCE REMOVE is borrowed-only")
-            if state is not ReplicaState.ACTIVE:
+            same_operation_resume = (
+                state is ReplicaState.DRAINING
+                and previous_target == replica_key
+            )
+            if state is not ReplicaState.ACTIVE and not same_operation_resume:
                 raise ValueError(
-                    f"FORCE prepare_exit requires ACTIVE replica, got {state.value}"
+                    "FORCE prepare_exit requires ACTIVE replica or same-operation "
+                    f"DRAINING reconciliation, got {state.value}"
                 )
             async_training = getattr(self.config, "async_training", None)
             if not bool(getattr(async_training, "partial_rollout", False)):
@@ -404,8 +432,10 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
             if runtime is None:
                 raise RuntimeError("FORCE target runtime is unavailable")
 
-            manager.transition_replica(replica_key, ReplicaState.DRAINING)
-            self._pending_operation_targets[operation_id] = replica_key
+            if state is ReplicaState.ACTIVE:
+                manager.transition_replica(replica_key, ReplicaState.DRAINING)
+                self._pending_operation_targets[operation_id] = replica_key
+
             try:
                 try:
                     drained_server = await lb.begin_drain.remote(
@@ -418,33 +448,54 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                 if drained_server != server_id:
                     raise RuntimeError("FORCE drain bound a different server")
 
-                admitted_list = []
-                for request_id in await lb.requests_for_server.remote(server_id):
-                    if (
-                        await lb.query_attempt.remote(request_id)
-                        is AttemptState.ADMITTED
-                    ):
-                        admitted_list.append(request_id)
-                admitted = tuple(admitted_list)
-                abort_result = await runtime.abort_all_requests()
-                if not isinstance(abort_result, dict):
-                    raise TypeError("FORCE abort returned a non-dict result")
-                aborted_count = abort_result.get("aborted_count")
-                if type(aborted_count) is not int or aborted_count < 0:
-                    raise RuntimeError("FORCE abort did not report aborted_count")
-                if aborted_count > len(admitted):
-                    raise RuntimeError(
-                        "FORCE abort count exceeds LB requests owned by target"
+                recovery = self._force_exit_recovery.get(operation_id)
+                if recovery is None:
+                    admitted_list = []
+                    for request_id in await lb.requests_for_server.remote(server_id):
+                        if (
+                            await lb.query_attempt.remote(request_id)
+                            is AttemptState.ADMITTED
+                        ):
+                            admitted_list.append(request_id)
+                    admitted = tuple(admitted_list)
+                    # Persist the pre-abort request set before invoking the
+                    # backend. If its result is lost, same-op replay can remain
+                    # fail-closed without re-aborting already handed-off work.
+                    self._force_exit_recovery[operation_id] = (admitted, None)
+
+                    abort_result = await runtime.abort_all_requests()
+                    if not isinstance(abort_result, dict):
+                        raise TypeError("FORCE abort returned a non-dict result")
+                    aborted_count = abort_result.get("aborted_count")
+                    if type(aborted_count) is not int or aborted_count < 0:
+                        raise RuntimeError("FORCE abort did not report aborted_count")
+                    if aborted_count > len(admitted):
+                        raise RuntimeError(
+                            "FORCE abort count exceeds LB requests owned by target"
+                        )
+                    self._force_exit_recovery[operation_id] = (
+                        admitted,
+                        aborted_count,
                     )
+                else:
+                    admitted, aborted_count = recovery
 
                 loop = asyncio.get_running_loop()
-                deadline = loop.time() + 30.0
+                deadline = loop.time() + self._force_handoff_timeout_s
                 while True:
                     handoffs = set(
                         await lb.continuation_handoff_requests.remote(operation_id)
                     )
                     unsettled = await lb.has_unsettled_requests.remote(server_id)
-                    if not unsettled and len(handoffs.intersection(admitted)) >= aborted_count:
+                    confirmed = len(handoffs.intersection(admitted))
+                    if aborted_count is None:
+                        # The abort ACK itself was lost. Do not repeat abort.
+                        # Only a continuation proof for every request that was
+                        # ADMITTED at the boundary can recover this conservatively.
+                        handoff_complete = confirmed == len(admitted)
+                    else:
+                        handoff_complete = confirmed >= aborted_count
+                    if not unsettled and handoff_complete:
                         break
                     if loop.time() >= deadline:
                         raise TimeoutError(
@@ -454,8 +505,10 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
 
                 return OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
             except BaseException:
-                if manager.replica_state.get(replica_key) is ReplicaState.DRAINING:
-                    manager.transition_replica(replica_key, ReplicaState.QUARANTINED)
+                # Once FORCE closes admission or abort may have happened, keep
+                # DRAINING and preserve the same operation's request facts.
+                # Replays resume this operation; they never reset M to ACTIVE
+                # and never blindly repeat an already-issued abort.
                 raise
 
         if state not in {ReplicaState.ACTIVE, ReplicaState.DRAINING}:
@@ -496,8 +549,9 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                     next_log = now + 10.0
                 await asyncio.sleep(min(0.1, max(0.0, deadline - now)))
         except BaseException:
-            if manager.replica_state.get(replica_key) is ReplicaState.DRAINING:
-                manager.transition_replica(replica_key, ReplicaState.QUARANTINED)
+            # Natural drain timeout/ACK uncertainty is resumable. Preserve M as
+            # DRAINING and the same operation binding; do not silently upgrade
+            # to FORCE or quarantine away the only safe replay path.
             raise
 
         return OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
@@ -798,6 +852,7 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
             )
             manager.transition_replica(target, target_state)
             self._pending_operation_targets.pop(operation.operation_id, None)
+            self._force_exit_recovery.pop(operation.operation_id, None)
             return evidence
         except BaseException:
             if manager.replica_state.get(target) in {
