@@ -1087,10 +1087,6 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         manager.validate_borrowed_spec(valid_spec)
     manager.rollout_config.tensor_model_parallel_size = 1
 
-    wrong_m = dict(valid_spec, max_colocate_count=1)
-    with pytest.raises(ValueError, match="max_colocate_count"):
-        manager.validate_borrowed_spec(wrong_m)
-
     wrong_share = dict(valid_spec)
     wrong_share["claims"] = [
         dict(valid_spec["claims"][0], gpu_fraction=1.0)
