@@ -48,8 +48,11 @@ The 092303 text's requirement that every target already belong to E applies to
 refreshing effective members, not initial ADD or rejoining RESTORE. Applying it
 to ADD contradicts that same section's requirement to join E only after transfer.
 RESTORE now reuses the same target bootstrap/version-confirmation machinery for
-a parked native runtime after weights-only wake; the real GPU current-Vpub test
-must pass before TaskRunner admission is enabled.
+a parked native runtime; weights-only wake is performed inside CE bootstrap while
+Trainer G is held, followed by current-Vpub transfer, KV restore and version
+confirmation. The opt-in real GPU acceptance mutates sender tensor data before
+transfer so a version tag alone cannot satisfy the check; that test must actually
+pass before TaskRunner admission is enabled.
 
 For NCCL/HCCL, enabled profiles require the explicit boolean
 `actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.<backend>.rebuild_group=true`.
