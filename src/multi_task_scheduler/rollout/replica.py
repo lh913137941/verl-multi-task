@@ -101,59 +101,50 @@ class MultiTaskvLLMReplica(vLLMReplica):
         if spec.get("max_colocate_count") != FIRST_RELEASE_MAX_COLOCATE_COUNT:
             raise ValueError("placement max_colocate_count does not match first release")
 
-        claims = tuple(spec.get("claims") or ())
-        if spec.get("world_size") != len(claims) or len(claims) != self.world_size:
-            raise ValueError("placement world_size does not match borrower model topology")
-
-        # Reuse the shared Lease contract for claim identity, donor, PG/GPU,
-        # accounting-share, CPU and uniqueness checks.
         claims = Lease(
             spec["lease_id"],
-            claims,
+            tuple(spec.get("claims") or ()),
             spec.get("expires_at", 0),
         ).claims
-
-        for rank, claim in enumerate(claims):
-            if claim.get("rank") != rank:
-                raise ValueError("borrower ranks must be ordered 0..world_size-1")
-            if claim.get("node_rank") != 0 or claim.get("local_rank") != rank:
-                raise ValueError("first release requires one-node borrower rank layout")
-        if len({claim["node_id"] for claim in claims}) != 1:
-            raise ValueError("first release borrowed placement must be single-node")
-
+        if spec.get("world_size") != 1 or self.world_size != 1 or len(claims) != 1:
+            raise ValueError("current borrowed runtime requires world_size=1")
+        claim = claims[0]
+        if (
+            claim.get("rank") != 0
+            or claim.get("node_rank") != 0
+            or claim.get("local_rank") != 0
+        ):
+            raise ValueError("current borrowed claim requires rank=node_rank=local_rank=0")
 
     def build_borrowed_worker_plan(self, spec: dict) -> tuple[dict, ...]:
         """Build deterministic CE actor placement metadata with no Ray side effects."""
         self.validate_placement(spec)
         prefix = f"borrowed_ce_{self.replica_rank}_"
-        plan = []
-        for claim in spec["claims"]:
-            plan.append(
-                {
-                    "rank": claim["rank"],
-                    "claim_id": claim["claim_id"],
-                    "actor_name": f"{prefix}r{claim['rank']}",
-                    "pg_id": claim["pg_id"],
-                    "bundle_index": claim["bundle_index"],
-                    "node_id": claim["node_id"],
-                    "gpu_uuid": claim["gpu_uuid"],
-                    "num_gpus": claim["gpu_fraction"],
-                    "num_cpus": claim["cpu_request"],
-                    "env_vars": {
-                        "WORLD_SIZE": str(spec["world_size"]),
-                        "RANK": str(claim["rank"]),
-                        "RAY_LOCAL_WORLD_SIZE": str(spec["world_size"]),
-                        "WG_PREFIX": prefix,
-                        "WG_BACKEND": "ray",
-                    },
-                }
-            )
-        self.placement_claims = tuple(dict(claim) for claim in spec["claims"])
+        claim = spec["claims"][0]
+        plan = ({
+            "rank": 0,
+            "claim_id": claim["claim_id"],
+            "actor_name": f"{prefix}r0",
+            "pg_id": claim["pg_id"],
+            "bundle_index": claim["bundle_index"],
+            "node_id": claim["node_id"],
+            "gpu_uuid": claim["gpu_uuid"],
+            "num_gpus": claim["gpu_fraction"],
+            "num_cpus": claim["cpu_request"],
+            "env_vars": {
+                "WORLD_SIZE": "1",
+                "RANK": "0",
+                "RAY_LOCAL_WORLD_SIZE": "1",
+                "WG_PREFIX": prefix,
+                "WG_BACKEND": "ray",
+            },
+        },)
+        self.placement_claims = (dict(claim),)
         self.borrowed_server_names = (
             f"{super()._get_server_name_prefix()}server_"
             f"{self.replica_rank}_0{self.name_suffix}",
         )
-        return tuple(plan)
+        return plan
 
     async def _get_master_addr_port_for_slot(self, pg, bundle_index: int):
         """Create a borrower communication root on the selected borrower bundle."""
