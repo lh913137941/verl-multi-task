@@ -152,6 +152,28 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             if command.target.task_session != self.task_session:
                 raise ValueError("operation targets another task session")
 
+            # Current profile must reject capabilities whose native/GPU boundary
+            # is intentionally still unverified.  Do this before creating a
+            # journal entry or lifecycle worker so a known-unsupported command
+            # cannot allocate a hidden runtime, drain service, or leave the task
+            # fenced as UNKNOWN merely because its backend is not implemented.
+            if command.kind is OperationKind.ADD:
+                raise NotImplementedError(
+                    "ADD requires verified target-only parameter bootstrap"
+                )
+            if command.kind is OperationKind.DONATE:
+                raise NotImplementedError(
+                    "DONATE requires verified native STANDALONE sleep backend"
+                )
+            if command.kind is OperationKind.RESTORE:
+                raise NotImplementedError(
+                    "RESTORE requires verified native wake/bootstrap backend"
+                )
+            if command.kind is OperationKind.REMOVE and command.force:
+                raise NotImplementedError(
+                    "FORCE REMOVE requires verified targeted abort/continuation backend"
+                )
+
             journal = self._ensure_journal()
             existing = journal.query(command.operation_id)
             record = journal.begin(command)
