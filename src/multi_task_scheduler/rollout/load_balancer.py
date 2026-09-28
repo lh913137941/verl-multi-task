@@ -48,15 +48,17 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         state = self.attempt_state.get(request_id)
         if state in {AttemptState.ADMITTED, AttemptState.TERMINATED}:
             raise RuntimeError("request already has an unsettled generation")
-        if state is AttemptState.SETTLED:
-            # Re-admission starts a new attempt for this logical id.  An ACK-loss
-            # proof from the previous settled attempt must not authorize a later
-            # continuation; explicit GC and intentional reuse have the same effect.
-            self.continuation_proofs.pop(request_id, None)
+
         server_id, handle = super().acquire_server(request_id, **extra)
         if self._is_draining_server(server_id):
             super().release_server(server_id, request_id=request_id)
             raise RuntimeError("draining server cannot accept new requests")
+
+        if state is AttemptState.SETTLED:
+            # Only a successfully admitted replacement attempt invalidates the
+            # previous ACK-loss continuation proof. A failed acquire must leave
+            # the settled attempt queryable exactly as it was.
+            self.continuation_proofs.pop(request_id, None)
         self.active_request_server[request_id] = server_id
         self.attempt_state[request_id] = AttemptState.ADMITTED
         return server_id, handle
