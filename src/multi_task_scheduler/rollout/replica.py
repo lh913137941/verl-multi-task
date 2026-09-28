@@ -307,9 +307,9 @@ class MultiTaskvLLMReplica(vLLMReplica):
     ) -> RayWorkerGroup:
         """Create borrower-owned CE actors on the exact claimed PG bundles.
 
-        This low-level primitive is intentionally not wired into Manager yet.
-        Manager continues to stop before Ray side effects until bootstrap and
-        actor-exit verification are available as one complete transaction.
+        Manager uses this only for the hidden borrowed runtime transaction;
+        service publication remains separate and fail-closed until bootstrap is
+        verified end to end.
         """
         plan = self.build_borrowed_worker_plan(spec)
         expected_pg_ids = {item["pg_id"] for item in plan}
@@ -476,9 +476,8 @@ class MultiTaskvLLMReplica(vLLMReplica):
     ) -> dict:
         """Build and validate a hidden borrower runtime on existing donor PGs.
 
-        This method is a low-level transaction primitive. Manager does not call
-        it yet; target-only weight bootstrap and service publication remain a
-        separate unimplemented gate.
+        Manager calls this low-level transaction for hidden creation only;
+        target-only bootstrap and service publication remain separate gates.
         """
         self.validate_placement(spec)
         self.rollout_mode = RolloutMode.STANDALONE
