@@ -175,7 +175,6 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         for key, (replicas, _old_version) in tuple(self._members().items()):
             self._members()[key] = (replicas, loaded_version)
 
-
     async def bootstrap_target(
         self,
         key: ReplicaKey,
