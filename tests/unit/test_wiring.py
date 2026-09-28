@@ -3514,6 +3514,7 @@ def rollouter_class():
         ReplicaKey=ReplicaKey,
         ReplicaKind=ReplicaKind,
         ReplicaState=ReplicaState,
+        AttemptState=AttemptState,
         OperationRecord=OperationRecord,
         OperationEvidence=OperationEvidence,
         EvidenceType=EvidenceType,
@@ -4260,6 +4261,49 @@ def test_rollouter_verified_borrowed_destroy_commits_released():
     assert manager.destroy_calls == [(key, "op")]
     assert manager.replica_state[key] is ReplicaState.RELEASED
     assert "op" not in rollouter._pending_operation_targets
+
+
+def test_rollouter_force_requires_partial_rollout_before_mutating_m_or_r():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "borrowed-0")
+    calls = []
+
+    rollouter.config = type(
+        "Config",
+        (),
+        {"async_training": type("Async", (), {"partial_rollout": False})()},
+    )()
+
+    class LB:
+        def __getattr__(self, name):
+            raise AssertionError(f"FORCE precondition must not touch LB: {name}")
+
+    class Manager:
+        global_load_balancer = LB()
+
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.ACTIVE}
+            self.replica_kind = {key: ReplicaKind.BORROWED}
+
+        def replica_meta(self, target):
+            return self.replica_kind[target], self.replica_state[target]
+
+        def transition_replica(self, target, state):
+            calls.append((target, state))
+            self.replica_state[target] = state
+
+    manager = Manager()
+    rollouter.llm_server_manager = manager
+
+    with pytest.raises(ValueError, match="partial_rollout=true"):
+        asyncio.run(
+            rollouter.prepare_exit(key, operation_id="op-force", force=True)
+        )
+
+    assert manager.replica_state[key] is ReplicaState.ACTIVE
+    assert calls == []
+    assert "op-force" not in rollouter._pending_operation_targets
 
 
 def test_rollouter_force_aborts_target_replica_and_waits_for_continuation_handoff():
