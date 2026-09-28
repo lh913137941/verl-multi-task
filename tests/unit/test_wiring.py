@@ -851,6 +851,64 @@ def test_trainer_add_bootstraps_current_vpub_commits_e_then_publishes_service():
     ]
 
 
+def test_trainer_add_definite_route_rejection_removes_effective_e_and_returns_release():
+    key = ReplicaKey("task-a", "borrowed-0")
+    runtime = type("Runtime", (), {"replica_kind": ReplicaKind.BORROWED})()
+    calls = []
+
+    class CE:
+        def __init__(self):
+            self.pending_bootstrap = {}
+            self.effective_replicas = {}
+
+        def register_pending(self, target, replicas, *, operation_id):
+            self.pending_bootstrap[target] = (tuple(replicas), operation_id)
+
+        async def bootstrap_target(self, target, *, operation_id, loaded_version):
+            return OperationEvidence(operation_id, EvidenceType.WEIGHT_READY, 1)
+
+        def commit_pending(self, target, evidence, *, loaded_version):
+            replicas, _ = self.pending_bootstrap.pop(target)
+            self.effective_replicas[target] = (replicas, loaded_version)
+            calls.append(("commit_pending", target, loaded_version))
+
+        def remove_effective(self, target):
+            calls.append(("remove_effective", target))
+            self.effective_replicas.pop(target)
+
+    class Rollouter:
+        get_pending_target = AsyncRemoteMethod(lambda operation_id: key)
+        get_pending_replicas = AsyncRemoteMethod(lambda operation_id: (runtime,))
+        commit_service_change = AsyncRemoteMethod(
+            lambda operation: OperationEvidence(
+                operation.operation_id,
+                EvidenceType.RELEASED,
+                2,
+                ("u0",),
+            )
+        )
+
+    trainer = trainer_class()()
+    trainer.rollouter = Rollouter()
+    trainer.checkpoint_manager = CE()
+    trainer.current_param_version = 9
+
+    evidence = asyncio.run(
+        trainer.bootstrap_and_publish(
+            OperationRecord("op-add", OperationStatus.RUNNING)
+        )
+    )
+
+    assert evidence.type is EvidenceType.RELEASED
+    assert evidence.released_gpu_uuids == ("u0",)
+    assert trainer.checkpoint_manager.effective_replicas == {}
+    assert trainer.replica_sync_gate.health == "HEALTHY"
+    assert calls == [
+        ("commit_pending", key, 9),
+        ("remove_effective", key),
+    ]
+
+
 def test_trainer_add_bootstrap_failure_discards_pending_and_destroys_hidden_runtime():
     key = ReplicaKey("task-a", "borrowed-0")
     runtime = type("Runtime", (), {"replica_kind": ReplicaKind.BORROWED})()
@@ -3681,6 +3739,83 @@ def test_rollouter_add_commit_publishes_hidden_borrower_after_e_is_ready():
         ("capacity",),
         ("state", ReplicaState.ACTIVE),
         ("commit_ready", key, "s-new", "h-new", "op-add"),
+    ]
+
+
+def test_rollouter_add_definite_route_rejection_returns_verified_release():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "borrowed-0")
+    calls = []
+
+    class Runtime:
+        _server_address = "s-new"
+        _server_handle = "h-new"
+
+    class LB:
+        commit_ready = AsyncRemoteMethod(
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("route rejected")
+            )
+        )
+        query_ready_operation = AsyncRemoteMethod(lambda operation_id: None)
+
+    class Manager:
+        global_load_balancer = LB()
+
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.CREATING}
+            self.replica_kind = {key: ReplicaKind.BORROWED}
+
+        def replica_meta(self, target):
+            return self.replica_kind[target], self.replica_state[target]
+
+        def inspect_runtime(self, target):
+            return Runtime()
+
+        def activate_service(self, target):
+            calls.append(("activate_service", target))
+
+        def deactivate_service(self, target):
+            calls.append(("deactivate_service", target))
+
+        def transition_replica(self, target, state):
+            calls.append(("state", state))
+            self.replica_state[target] = state
+
+        async def destroy(self, target, *, operation_id):
+            calls.append(("destroy", target, operation_id))
+            return OperationEvidence(
+                operation_id,
+                EvidenceType.RELEASED,
+                3,
+                ("u0",),
+            )
+
+    manager = Manager()
+    rollouter.llm_server_manager = manager
+    rollouter._pending_operation_targets["op-add"] = key
+    rollouter._update_max_concurrent_samples = lambda: calls.append(("capacity",))
+
+    evidence = asyncio.run(
+        rollouter.commit_service_change(
+            OperationRecord("op-add", OperationStatus.RUNNING)
+        )
+    )
+
+    assert evidence.type is EvidenceType.RELEASED
+    assert evidence.released_gpu_uuids == ("u0",)
+    assert manager.replica_state[key] is ReplicaState.RELEASED
+    assert "op-add" not in rollouter._pending_operation_targets
+    assert calls == [
+        ("activate_service", key),
+        ("capacity",),
+        ("state", ReplicaState.ACTIVE),
+        ("state", ReplicaState.DRAINING),
+        ("deactivate_service", key),
+        ("capacity",),
+        ("destroy", key, "op-add"),
+        ("state", ReplicaState.RELEASED),
     ]
 
 
