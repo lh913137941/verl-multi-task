@@ -163,8 +163,21 @@ def test_level2_sleep_profile_allows_mtp_loaded_but_not_used_for_rollout():
 def test_level2_sleep_profile_rejects_lora_rollout(model):
     current = config()
     current["actor_rollout_ref"]["model"] = model
-    with pytest.raises(ProfileConfigurationError, match="LoRA rollout"):
+    with pytest.raises(ProfileConfigurationError, match="unmerged LoRA rollout"):
         validate_runtime_profile(current)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        {"lora_rank": 8, "lora": {"merge": True}},
+        {"lora": {"rank": 8, "merge": True}},
+    ],
+)
+def test_level2_sleep_profile_allows_merged_lora(model):
+    current = config()
+    current["actor_rollout_ref"]["model"] = model
+    assert validate_runtime_profile(current)
 
 
 def test_non_naive_checkpoint_engine_is_required():
