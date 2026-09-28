@@ -5,12 +5,8 @@ from __future__ import annotations
 import asyncio
 
 import ray
-from verl.checkpoint_engine.base import CheckpointEngineManager
+from verl.checkpoint_engine.base import CheckpointEngineManager, CheckpointEngineWorker
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
-
-from multi_task_scheduler.checkpoint.checkpoint_engine_worker import (
-    MultiTaskCheckpointEngineWorker,
-)
 
 from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
@@ -204,7 +200,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         rollout = RayWorkerGroup.from_detached(
             worker_handles=workers,
             ray_cls_with_init=RayClassWithInitArgs(
-                cls=ray.remote(MultiTaskCheckpointEngineWorker)
+                cls=ray.remote(CheckpointEngineWorker)
             ),
             name_prefix=f"bootstrap_{operation_id}_",
             use_gpu=True,
