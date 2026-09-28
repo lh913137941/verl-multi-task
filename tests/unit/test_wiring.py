@@ -2277,6 +2277,7 @@ def replica_class():
         get_resource_name=lambda: "GPU",
         get_visible_devices_keyword=lambda: "CUDA_VISIBLE_DEVICES",
         MultiTaskvLLMHttpServer=object,
+        MultiTaskCheckpointEngineWorker=object,
         os=__import__("os"),
         subprocess=__import__("subprocess"),
         ray=fake_ray,
@@ -2430,6 +2431,7 @@ def test_worker_gpu_uuid_probe_uses_native_worker_ray_call_context():
         Lease=Lease,
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
         MultiTaskvLLMHttpServer=object,
+        MultiTaskCheckpointEngineWorker=object,
         os=__import__("os"),
         subprocess=fake_subprocess,
         ray=fake_ray,
@@ -2556,6 +2558,7 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
         get_master_addr_port=object,
         get_device_name=lambda: "cuda",
         MultiTaskvLLMHttpServer=object,
+        MultiTaskCheckpointEngineWorker=object,
         asyncio=asyncio,
         list_actors=lambda **kwargs: [],
         ray=fake_ray,
@@ -2708,6 +2711,7 @@ def test_init_from_lease_reaches_runtime_ready_only_after_server_health():
         get_master_addr_port=object,
         get_device_name=lambda: "cuda",
         MultiTaskvLLMHttpServer=object,
+        MultiTaskCheckpointEngineWorker=object,
         asyncio=asyncio,
         list_actors=lambda **kwargs: [],
         ray=fake_ray,
@@ -3336,6 +3340,7 @@ def runtime_replica_class():
         ReplicaKind=ReplicaKind,
         Lease=Lease,
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
+        MultiTaskCheckpointEngineWorker=object,
     )
 
 
