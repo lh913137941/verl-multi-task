@@ -654,11 +654,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             raise ValueError("destroy requires operation_id")
         if self.replica_kind.get(key) is not ReplicaKind.BORROWED:
             raise ValueError("destroy is valid only for BORROWED replicas")
-        if self.replica_state.get(key) not in {
-            ReplicaState.CREATING,
-            ReplicaState.DRAINING,
-        }:
-            raise ValueError("destroy requires CREATING or DRAINING borrowed replica")
 
         record = self._borrowed_record_for_key(key)
         previous = record.get("destroy_evidence")
@@ -666,6 +661,12 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             if previous.operation_id != operation_id:
                 raise ValueError("borrowed runtime was destroyed by another operation")
             return previous
+
+        if self.replica_state.get(key) not in {
+            ReplicaState.CREATING,
+            ReplicaState.DRAINING,
+        }:
+            raise ValueError("destroy requires CREATING or DRAINING borrowed replica")
 
         runtime = self._runtime_inventory.get(key)
         if runtime is None:
