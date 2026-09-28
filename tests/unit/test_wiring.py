@@ -2122,9 +2122,98 @@ def test_restore_partial_wake_makes_release_kv_cache_idempotent():
         {"enable_sleep_mode": True, "free_cache_engine": True},
     )()
     server.engine = Engine()
+    server._multitask_sleep_stage_value = "weights"
 
     receipt = asyncio.run(server.release_kv_cache())
     assert receipt == {"kv_cache_released": True, "already_sleeping": True}
+
+
+def test_standalone_sleep_and_weights_wake_are_idempotent_by_stage():
+    calls = []
+
+    class Event:
+        def clear(self):
+            calls.append(("clear",))
+
+        def set(self):
+            calls.append(("set",))
+
+    class Engine:
+        def __init__(self):
+            self.sleeping = False
+
+        async def wait_for_requests_to_drain(self):
+            calls.append(("drain",))
+
+        async def sleep(self, *, level, mode):
+            calls.append(("sleep", level, mode))
+            self.sleeping = True
+
+        async def is_sleeping(self):
+            return self.sleeping
+
+        async def wake_up(self, *, tags=None):
+            calls.append(("wake", tuple(tags or ())))
+            self.sleeping = tags == ["weights"]
+
+    server = http_server_class()()
+    server.nnodes = 1
+    server.node_rank = 0
+    server.replica_rank = 0
+    server.global_steps = 4
+    server.config = type(
+        "Config",
+        (),
+        {"enable_sleep_mode": True, "free_cache_engine": True},
+    )()
+    server.engine = Engine()
+    server._resolve_sleep_level = lambda: 2
+    server._submission_paused = False
+    server._resume_event = Event()
+
+    first_sleep = asyncio.run(server.sleep())
+    second_sleep = asyncio.run(server.sleep())
+    assert second_sleep == first_sleep
+    assert [call for call in calls if call[:1] == ("sleep",)] == [
+        ("sleep", 2, "abort")
+    ]
+
+    first_weights = asyncio.run(server.wake_weights())
+    second_weights = asyncio.run(server.wake_weights())
+    assert second_weights == first_weights
+    assert [call for call in calls if call[:1] == ("wake",)] == [
+        ("wake", ("weights",))
+    ]
+
+
+def test_full_wake_rejects_direct_level2_to_awake_skip():
+    class Event:
+        def clear(self):
+            return None
+
+    class Engine:
+        async def is_sleeping(self):
+            return True
+
+        async def wake_up(self, *, tags=None):
+            raise AssertionError("full wake must fail before touching vLLM")
+
+    server = http_server_class()()
+    server.nnodes = 1
+    server.node_rank = 0
+    server.replica_rank = 0
+    server.config = type(
+        "Config",
+        (),
+        {"enable_sleep_mode": True, "free_cache_engine": True},
+    )()
+    server.engine = Engine()
+    server._multitask_sleep_stage_value = "level2"
+    server._submission_paused = True
+    server._resume_event = Event()
+
+    with pytest.raises(RuntimeError, match="weights-only RESTORE preparation"):
+        asyncio.run(server.wake_up())
 
 
 def test_final_wake_can_commit_admission_after_ce_already_restored_kv():
@@ -2263,6 +2352,36 @@ def test_manager_native_sleep_binds_released_evidence_to_runtime_gpu_uuids():
     assert evidence.released_gpu_uuids == ("u0", "u1")
 
 
+def test_manager_native_release_replay_returns_identical_evidence():
+    key = ReplicaKey("task-a", "native-0")
+    sleep_calls = []
+
+    class Worker:
+        runtime_placement = AsyncRemoteMethod(
+            lambda: {"node_id": "n0", "gpu_uuid": "u0"}
+        )
+
+    class Runtime:
+        workers = [Worker()]
+
+        async def sleep(self):
+            sleep_calls.append("sleep")
+            return ({"sleep_level": 2, "sleeping": True},)
+
+    cls = native_manager_class()
+    manager = cls.__new__(cls)
+    manager.replica_kind = {key: ReplicaKind.NATIVE}
+    manager.replica_state = {key: ReplicaState.DRAINING}
+    manager._runtime_inventory = {key: Runtime()}
+
+    first = asyncio.run(manager.sleep(key, operation_id="op-donate"))
+    manager.replica_state[key] = ReplicaState.DORMANT
+    second = asyncio.run(manager.sleep(key, operation_id="op-donate"))
+
+    assert second == first
+    assert sleep_calls == ["sleep"]
+
+
 def test_manager_native_wake_weights_keeps_dormant_runtime_fenced():
     key = ReplicaKey("task-a", "native-0")
 
@@ -2272,7 +2391,8 @@ def test_manager_native_wake_weights_keeps_dormant_runtime_fenced():
         )
 
     runtime = type("Runtime", (), {"servers": [Server()]})()
-    manager = native_manager_class().__new__(native_manager_class())
+    cls = native_manager_class()
+    manager = cls.__new__(cls)
     manager.replica_kind = {key: ReplicaKind.NATIVE}
     manager.replica_state = {key: ReplicaState.DORMANT}
     manager._runtime_inventory = {key: runtime}
