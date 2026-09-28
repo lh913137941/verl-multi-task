@@ -159,7 +159,6 @@ def _exercise_same_gpu_borrower(
                 "cpu_request": 1.0,
             }
         ],
-        "max_colocate_count": FIRST_RELEASE_MAX_COLOCATE_COUNT,
         "expires_at": 0,
         "placement_epoch": 0,
     }
