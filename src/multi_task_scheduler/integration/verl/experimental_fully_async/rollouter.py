@@ -363,7 +363,7 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
 
         try:
             if kind is ReplicaKind.NATIVE:
-                evidence = manager.sleep(
+                evidence = await manager.sleep(
                     target,
                     operation_id=operation.operation_id,
                 )
