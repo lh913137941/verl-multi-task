@@ -2817,6 +2817,135 @@ def test_manager_native_wake_weights_keeps_dormant_runtime_fenced():
     assert receipts == ({"sleeping": True, "fully_awake": False},)
 
 
+def _isolated_group_scheduler_class():
+    path = SOURCE / "scheduler/group_scheduler.py"
+    tree = ast.parse(path.read_text())
+    scheduler = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "GroupScheduler"
+    )
+    scheduler.decorator_list = []
+    module = ast.Module(body=[scheduler], type_ignores=[])
+    env = {
+        "ReplicaKey": ReplicaKey,
+        "ReplicaKind": ReplicaKind,
+        "ActorHandle": object,
+        "Lease": Lease,
+        "OperationCommand": OperationCommand,
+        "OperationEvidence": OperationEvidence,
+        "OperationKind": OperationKind,
+        "OperationRecord": OperationRecord,
+        "RUNTIME_KIND": "test",
+        "EvidenceType": EvidenceType,
+        "_RELEASE_KINDS": {OperationKind.DONATE, OperationKind.REMOVE},
+        "time": time,
+        "ray": FakeRay,
+    }
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), env)
+    return env["GroupScheduler"]
+
+
+def _scheduler_test_lease(lease_id="l1"):
+    return Lease(
+        lease_id,
+        ({
+            "claim_id": f"claim-{lease_id}",
+            "source_lease_id": f"source-{lease_id}",
+            "donor_task_id": "task-a",
+            "donor_replica_rank": 0,
+            "pg_id": "pg",
+            "bundle_index": 0,
+            "node_id": "n0",
+            "gpu_uuid": "u0",
+            "gpu_fraction": 0.5,
+            "cpu_request": 1.0,
+        },),
+    )
+
+
+def test_group_scheduler_stages_operation_intent_before_taskrunner_dispatch():
+    cls = _isolated_group_scheduler_class()
+    gs = cls()
+    lease = _scheduler_test_lease()
+    gs.open_lease(lease)
+    command = OperationCommand(
+        "op-donate-race",
+        OperationKind.DONATE,
+        ReplicaKey("task-a", "native-0"),
+        lease.lease_id,
+    )
+
+    class Runner:
+        submit_operation = RemoteMethod(
+            lambda received, lease=None: (
+                (_ for _ in ()).throw(AssertionError("GS intent was not staged"))
+                if gs.operation_commands.get(received.operation_id) != received
+                else OperationRecord(received.operation_id)
+            )
+        )
+
+    gs.task_runners["task-a"] = Runner()
+    record = gs.submit_operation(command)
+    assert record.operation_id == command.operation_id
+    assert gs.operation_commands[command.operation_id] == command
+
+
+def test_group_scheduler_rolls_back_staged_add_state_when_taskrunner_rejects():
+    cls = _isolated_group_scheduler_class()
+    gs = cls()
+    lease = _scheduler_test_lease()
+    gs.open_lease(lease)
+    gs.handoff_ready_leases.add(lease.lease_id)
+    command = OperationCommand(
+        "op-add-rejected",
+        OperationKind.ADD,
+        ReplicaKey("task-a", "borrowed-0"),
+        lease.lease_id,
+    )
+
+    class Runner:
+        submit_operation = RemoteMethod(
+            lambda received, lease=None: (_ for _ in ()).throw(
+                NotImplementedError("backend unavailable")
+            )
+        )
+
+    gs.task_runners["task-a"] = Runner()
+    with pytest.raises(NotImplementedError, match="backend unavailable"):
+        gs.submit_operation(command)
+    assert command.operation_id not in gs.operation_commands
+    assert lease.lease_id not in gs.borrower_targets
+
+
+def test_group_scheduler_rolls_back_restore_reservation_when_taskrunner_rejects():
+    cls = _isolated_group_scheduler_class()
+    gs = cls()
+    lease = _scheduler_test_lease()
+    gs.open_lease(lease)
+    gs.active_gpu_owner.clear()
+    gs.active_bundle_owner.clear()
+    command = OperationCommand(
+        "op-restore-rejected",
+        OperationKind.RESTORE,
+        ReplicaKey("task-a", "native-0"),
+        lease.lease_id,
+    )
+
+    class Runner:
+        submit_operation = RemoteMethod(
+            lambda received, lease=None: (_ for _ in ()).throw(
+                NotImplementedError("restore unavailable")
+            )
+        )
+
+    gs.task_runners["task-a"] = Runner()
+    with pytest.raises(NotImplementedError, match="restore unavailable"):
+        gs.submit_operation(command)
+    assert command.operation_id not in gs.operation_commands
+    assert lease.lease_id not in gs.active_gpu_owner.values()
+    assert lease.lease_id not in gs.active_bundle_owner.values()
+
+
 def test_group_scheduler_binds_donate_to_lease_donor_rank():
     path = SOURCE / "scheduler/group_scheduler.py"
     tree = ast.parse(path.read_text())
