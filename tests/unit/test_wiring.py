@@ -1370,7 +1370,6 @@ def replica_class():
         get_resource_name=lambda: "GPU",
         get_visible_devices_keyword=lambda: "CUDA_VISIBLE_DEVICES",
         MultiTaskvLLMHttpServer=object,
-        hashlib=__import__("hashlib"),
         os=__import__("os"),
         subprocess=__import__("subprocess"),
         ray=fake_ray,
@@ -1517,7 +1516,6 @@ def test_worker_gpu_uuid_probe_uses_native_worker_ray_call_context():
         ReplicaKind=ReplicaKind,
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
         MultiTaskvLLMHttpServer=object,
-        hashlib=__import__("hashlib"),
         os=__import__("os"),
         subprocess=fake_subprocess,
         ray=fake_ray,
@@ -1632,7 +1630,6 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
         get_master_addr_port=object,
         get_device_name=lambda: "cuda",
                 MultiTaskvLLMHttpServer=object,
-        hashlib=__import__("hashlib"),
         asyncio=asyncio,
         list_actors=lambda **kwargs: [],
         ray=fake_ray,
@@ -1781,7 +1778,6 @@ def test_init_from_lease_reaches_runtime_ready_only_after_server_health():
         get_master_addr_port=object,
         get_device_name=lambda: "cuda",
                 MultiTaskvLLMHttpServer=object,
-        hashlib=__import__("hashlib"),
         asyncio=asyncio,
         list_actors=lambda **kwargs: [],
         ray=fake_ray,
@@ -4072,7 +4068,6 @@ def test_rollouter_force_is_fail_closed_before_mutating_m_or_r():
         (),
         {"async_training": type("Async", (), {"partial_rollout": True})()},
     )()
-    rollouter._continuation_client_ready = True
 
     class LB:
         def __getattr__(self, name):
