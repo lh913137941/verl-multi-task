@@ -574,11 +574,83 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 current["result"] = self._borrowed_receipt(current)
             raise
 
-    def sleep(self, *args, **kwargs):
-        raise NotImplementedError("RuntimeBackend.sleep requires verified native backend")
+    async def sleep(
+        self,
+        key: ReplicaKey,
+        *,
+        operation_id: str,
+    ) -> OperationEvidence:
+        """Deep-sleep one retained native runtime and bind release to real GPUs."""
+        if not isinstance(key, ReplicaKey):
+            raise TypeError("sleep requires ReplicaKey")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("sleep requires operation_id")
+        if self.replica_kind.get(key) is not ReplicaKind.NATIVE:
+            raise ValueError("sleep is valid only for NATIVE replicas")
+        if self.replica_state.get(key) is not ReplicaState.DRAINING:
+            raise ValueError("sleep requires a DRAINING native replica")
 
-    def wake_weights(self, *args, **kwargs):
-        raise NotImplementedError("RuntimeBackend.wake_weights requires verified native backend")
+        runtime = self._runtime_inventory.get(key)
+        if runtime is None:
+            raise RuntimeError("native runtime handle is unavailable for verified sleep")
+        workers = tuple(getattr(runtime, "workers", ()) or ())
+        if not workers:
+            raise RuntimeError("native runtime has no CE workers for placement proof")
+
+        placements = await asyncio.gather(
+            *[worker.runtime_placement.remote() for worker in workers]
+        )
+        gpu_uuids = []
+        for placement in placements:
+            if not isinstance(placement, dict):
+                raise TypeError("native runtime placement probe returned a non-dict result")
+            gpu_uuid = placement.get("gpu_uuid")
+            if not isinstance(gpu_uuid, str) or not gpu_uuid:
+                raise RuntimeError("native runtime placement is missing physical GPU UUID")
+            gpu_uuids.append(gpu_uuid)
+        if len(set(gpu_uuids)) != len(gpu_uuids):
+            raise RuntimeError("native runtime placement contains duplicate GPU UUIDs")
+
+        receipts = await runtime.sleep()
+        if not isinstance(receipts, (tuple, list)) or not receipts:
+            raise RuntimeError("native runtime returned no sleep receipts")
+        for receipt in receipts:
+            if not isinstance(receipt, dict):
+                raise TypeError("native runtime sleep returned a non-dict receipt")
+            if receipt.get("sleep_level") != 2 or receipt.get("sleeping") is not True:
+                raise RuntimeError("native runtime did not confirm level-2 sleep")
+
+        return OperationEvidence.now(
+            operation_id,
+            EvidenceType.RELEASED,
+            released_gpu_uuids=tuple(gpu_uuids),
+        )
+
+    async def wake_weights(self, key: ReplicaKey) -> tuple[dict, ...]:
+        """Wake only native weight allocations; service admission stays closed."""
+        if not isinstance(key, ReplicaKey):
+            raise TypeError("wake_weights requires ReplicaKey")
+        if self.replica_kind.get(key) is not ReplicaKind.NATIVE:
+            raise ValueError("wake_weights is valid only for NATIVE replicas")
+        if self.replica_state.get(key) is not ReplicaState.DORMANT:
+            raise ValueError("wake_weights requires a DORMANT native replica")
+
+        runtime = self._runtime_inventory.get(key)
+        if runtime is None:
+            raise RuntimeError("native runtime handle is unavailable for wake")
+        servers = tuple(getattr(runtime, "servers", ()) or ())
+        if not servers:
+            raise RuntimeError("native runtime has no rollout servers to wake")
+
+        receipts = await asyncio.gather(
+            *[server.wake_weights.remote() for server in servers]
+        )
+        for receipt in receipts:
+            if not isinstance(receipt, dict):
+                raise TypeError("native weight wake returned a non-dict receipt")
+            if receipt.get("sleeping") is not True or receipt.get("fully_awake") is not False:
+                raise RuntimeError("native weight wake did not keep the runtime fenced")
+        return tuple(receipts)
 
     async def destroy(
         self,
