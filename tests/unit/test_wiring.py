@@ -1713,7 +1713,7 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
     assert replica.borrowed_worker_names == (
         record["options"]["name"],
     )
-    assert replica.borrowed_worker_placement[0]["gpu_uuid"] == "GPU-x"
+    assert asyncio.run(replica.worker_placements())[0]["gpu_uuid"] == "GPU-x"
     assert killed == []
 
     FakeCIA.next_gpu_uuid = "GPU-wrong"
@@ -1874,7 +1874,6 @@ def test_init_from_lease_reaches_runtime_ready_only_after_server_health():
     assert receipt["state"] == "RUNTIME_READY"
     assert receipt["server_address"] == "127.0.0.1:8000"
     assert receipt["health"]["engine_ready"] is True
-    assert replica.borrowed_runtime_state == "RUNTIME_READY"
 
 
 def checkpoint_manager_class(**extra_scope):
