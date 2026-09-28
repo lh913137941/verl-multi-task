@@ -207,3 +207,260 @@ def test_real_standalone_level2_sleep_releases_device_memory_and_weights_wake_st
         )
     finally:
         ray.shutdown()
+
+
+
+def _training_sender_class():
+    import torch
+
+    from verl.checkpoint_engine import CheckpointEngineRegistry
+    from verl.single_controller.base.decorator import Dispatch, register
+    from verl.workers.engine_workers import TrainingWorker
+
+    class RestoreTrainingWorker(TrainingWorker):
+        def __init__(self, config, checkpoint_engine_config):
+            super().__init__(config)
+            backend = checkpoint_engine_config.backend
+            bucket_size = (
+                checkpoint_engine_config.update_weights_bucket_megabytes << 20
+            )
+            engine_kwargs = dict(
+                checkpoint_engine_config.engine_kwargs.get(backend, {})
+            )
+            if torch.distributed.get_rank() == 0:
+                engine_kwargs["is_master"] = True
+            self.checkpoint_engine = CheckpointEngineRegistry.new(
+                backend,
+                bucket_size=bucket_size,
+                **engine_kwargs,
+            )
+
+        @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+        async def update_weights(self, global_steps: int = None, mode: str = "auto"):
+            weights, _ = self.engine.get_per_tensor_param()
+            await self.checkpoint_engine.send_weights(
+                weights,
+                global_steps=global_steps,
+            )
+
+        @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
+        def execute_checkpoint_engine(self, method: str, *args, **kwargs):
+            return getattr(self.checkpoint_engine, method)(*args, **kwargs)
+
+    return RestoreTrainingWorker
+
+
+def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
+    """Two-GPU acceptance for the current-Vpub RESTORE data path.
+
+    GPU 0 hosts a real FSDP TrainingWorker/NCCL sender. GPU 1 hosts the retained
+    STANDALONE vLLM replica. The receiver is level-2 slept first, so its weights
+    must be reconstructed by the checkpoint-engine transfer before final wake.
+    """
+
+    model_path = _require_model_path()
+
+    pytest.importorskip("ray")
+    pytest.importorskip("vllm")
+    pytest.importorskip("torch")
+
+    import ray
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("current-Vpub RESTORE acceptance requires at least 2 CUDA GPUs")
+
+    from multi_task_scheduler.checkpoint.checkpoint_engine_manager import (
+        MultiTaskCheckpointEngineManager,
+    )
+    from multi_task_scheduler.integration.verl.experimental_fully_async.llm_server_manager import (
+        MultiTaskLLMServerManager,
+    )
+    from multi_task_scheduler.orchestration.contracts import (
+        EvidenceType,
+        ReplicaKey,
+        ReplicaKind,
+        ReplicaState,
+    )
+    from multi_task_scheduler.rollout.replica import MultiTaskvLLMReplica
+    from verl.single_controller.ray import (
+        RayClassWithInitArgs,
+        RayResourcePool,
+        RayWorkerGroup,
+    )
+    from verl.utils.device import get_device_name
+    from verl.utils.tokenizer import normalize_token_ids
+    from verl.workers.config import (
+        CheckpointEngineConfig,
+        FSDPEngineConfig,
+        HFModelConfig,
+        RolloutConfig,
+        TrainingWorkerConfig,
+    )
+
+    checkpoint_config = CheckpointEngineConfig(
+        backend="nccl",
+        update_weights_bucket_megabytes=64,
+        engine_kwargs={"nccl": {"rebuild_group": True}},
+    )
+    model_config = HFModelConfig(
+        path=model_path,
+        trust_remote_code=True,
+        use_remove_padding=True,
+    )
+    rollout_config = RolloutConfig(
+        name="vllm",
+        mode="async",
+        nnodes=1,
+        n_gpus_per_node=1,
+        tensor_model_parallel_size=1,
+        data_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        gpu_memory_utilization=0.5,
+        max_num_seqs=16,
+        response_length=32,
+        load_format="auto",
+        skip_tokenizer_init=False,
+        enable_sleep_mode=True,
+        free_cache_engine=True,
+        checkpoint_engine=checkpoint_config,
+    )
+
+    ray.shutdown()
+    ray.init(
+        num_cpus=8,
+        num_gpus=2,
+        runtime_env={
+            "env_vars": {
+                "TOKENIZERS_PARALLELISM": "true",
+                "NCCL_DEBUG": "WARN",
+                "VLLM_LOGGING_LEVEL": "INFO",
+                "VLLM_USE_V1": "1",
+            }
+        },
+        ignore_reinit_error=True,
+    )
+
+    try:
+        trainer_pool = RayResourcePool(
+            process_on_nodes=[1],
+            use_gpu=True,
+            name_prefix="multitask_restore_sender_",
+            max_colocate_count=1,
+        )
+        engine_config = FSDPEngineConfig(
+            forward_only=True,
+            fsdp_size=1,
+            strategy="fsdp",
+            use_torch_compile=False,
+        )
+        trainer_config = TrainingWorkerConfig(
+            model_type="language_model",
+            model_config=model_config,
+            engine_config=engine_config,
+        )
+        sender_cls = _training_sender_class()
+        sender_init = RayClassWithInitArgs(
+            cls=ray.remote(sender_cls),
+            config=trainer_config,
+            checkpoint_engine_config=checkpoint_config,
+        )
+        actor_wg = RayWorkerGroup(
+            resource_pool=trainer_pool,
+            ray_cls_with_init=sender_init,
+            device_name=get_device_name(),
+        )
+        actor_wg.reset()
+
+        replica = MultiTaskvLLMReplica(
+            replica_rank=0,
+            config=rollout_config,
+            model_config=model_config,
+            gpus_per_node=1,
+            replica_kind=ReplicaKind.NATIVE,
+        )
+        asyncio.run(replica.init_standalone())
+
+        prompt_ids = normalize_token_ids(
+            model_config.tokenizer.apply_chat_template(
+                [{"role": "user", "content": "Reply with exactly: hello"}],
+                add_generation_prompt=True,
+                tokenize=True,
+            )
+        )
+
+        def generate_once(label: str):
+            return ray.get(
+                replica._server_handle.generate.remote(
+                    request_id=f"{label}-{uuid4().hex}",
+                    prompt_ids=prompt_ids,
+                    sampling_params={
+                        "temperature": 0.0,
+                        "max_tokens": 16,
+                    },
+                    image_data=None,
+                ),
+                timeout=120,
+            )
+
+        baseline = generate_once("before-restore")
+        assert getattr(baseline, "token_ids", None)
+
+        key = ReplicaKey("gpu-acceptance", "native-0")
+        manager = MultiTaskLLMServerManager.__new__(MultiTaskLLMServerManager)
+        manager.replica_kind = {key: ReplicaKind.NATIVE}
+        manager.replica_state = {key: ReplicaState.DRAINING}
+        manager._runtime_inventory = {key: replica}
+
+        release = asyncio.run(
+            manager.sleep(key, operation_id="gpu-restore-donate")
+        )
+        assert release.type is EvidenceType.RELEASED
+        manager.replica_state[key] = ReplicaState.DORMANT
+
+        weights_receipts = asyncio.run(manager.wake_weights(key))
+        assert all(
+            receipt["sleeping"] is True
+            and receipt["fully_awake"] is False
+            for receipt in weights_receipts
+        )
+
+        checkpoint_manager = MultiTaskCheckpointEngineManager(
+            config=checkpoint_config,
+            actor_wg=actor_wg,
+            replicas=[],
+        )
+        checkpoint_manager.register_pending(
+            key,
+            [replica],
+            operation_id="gpu-restore",
+        )
+        weight_ready = asyncio.run(
+            checkpoint_manager.bootstrap_target(
+                key,
+                operation_id="gpu-restore",
+                loaded_version=17,
+            )
+        )
+        assert weight_ready.type is EvidenceType.WEIGHT_READY
+        checkpoint_manager.commit_pending(
+            key,
+            weight_ready,
+            loaded_version=17,
+        )
+        assert checkpoint_manager.effective_replicas[key][1] == 17
+
+        wake_receipts = asyncio.run(replica.wake_up())
+        assert all(
+            receipt["fully_awake"] is True
+            and receipt["sleeping"] is False
+            for receipt in wake_receipts
+        )
+        health = asyncio.run(replica.validate_server_runtime())
+        assert health["global_steps"] == 17
+
+        restored = generate_once("after-restore")
+        assert getattr(restored, "token_ids", None)
+        assert restored.token_ids == baseline.token_ids
+    finally:
+        ray.shutdown()
