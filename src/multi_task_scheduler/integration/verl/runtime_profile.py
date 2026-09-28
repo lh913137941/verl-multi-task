@@ -67,6 +67,7 @@ def validate_runtime_profile(config) -> bool:
         ("actor_rollout_ref.rollout.calculate_log_probs", True),
         ("actor_rollout_ref.rollout.enable_sleep_mode", True),
         ("actor_rollout_ref.rollout.free_cache_engine", True),
+        ("trainer.device", "cuda"),
         ("data.train_batch_size", 0),
         ("data.gen_batch_size", 1),
     ):
@@ -119,16 +120,15 @@ def validate_runtime_profile(config) -> bool:
             )
 
     backend = _select(config, f"{prefix}.checkpoint_engine.backend")
-    if not isinstance(backend, str) or not backend.strip() or backend == "naive":
+    if backend != "nccl":
         raise ProfileConfigurationError(
-            "pure STANDALONE requires a non-naive checkpoint engine"
+            "first release CUDA whole-GPU lending requires checkpoint_engine.backend='nccl'"
         )
-    if backend in ("nccl", "hccl"):
-        rebuild_path = f"{prefix}.checkpoint_engine.engine_kwargs.{backend}.rebuild_group"
-        if _select(config, rebuild_path, False) is not True:
-            raise ProfileConfigurationError(
-                f"{rebuild_path} must be True for dynamic checkpoint membership"
-            )
+    rebuild_path = f"{prefix}.checkpoint_engine.engine_kwargs.nccl.rebuild_group"
+    if _select(config, rebuild_path, False) is not True:
+        raise ProfileConfigurationError(
+            f"{rebuild_path} must be True for dynamic checkpoint membership"
+        )
 
     sizes = {}
     for field in (
