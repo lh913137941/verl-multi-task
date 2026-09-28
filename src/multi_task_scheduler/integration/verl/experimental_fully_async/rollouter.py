@@ -359,7 +359,6 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                 raise ValueError("only NATIVE replicas may restore from DORMANT")
             runtime = None
             activated = False
-            rollback_complete = False
             try:
                 runtime = manager.inspect_runtime(target)
                 if runtime is None:
@@ -378,17 +377,15 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                 if not isinstance(server_id, str) or not server_id or server_handle is None:
                     raise RuntimeError("native RESTORE runtime lacks routable server identity")
 
-                # Prepare all owner-local state before opening R.  Native
-                # weight synchronization is still excluded by Trainer G, so
-                # making M/C ready here does not expose the replica externally.
+                # Trainer has already committed current-Vpub membership into E.
+                # Prepare owner-local service state before the externally visible
+                # R commit, but never re-sleep from this point without also
+                # rolling E back under G.
                 manager.activate_service(target)
                 activated = True
                 self._update_max_concurrent_samples()
                 manager.transition_replica(target, ReplicaState.ACTIVE)
 
-                # R is the final externally visible commit.  If the RPC loses
-                # its reply, query the LB's existing operation ledger before
-                # deciding whether rollback is safe.
                 try:
                     evidence = await lb.commit_ready.remote(
                         target,
@@ -408,9 +405,8 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                             operation.operation_id
                         )
                     except BaseException as reconcile_exc:
-                        # R may already be open.  Keep the runtime awake and M/C
-                        # ACTIVE rather than risking a routed-to-sleeping replica;
-                        # Trainer will fence G because the operation is unknown.
+                        # R may already be open. Keep the current-Vpub runtime
+                        # awake and M/C ACTIVE; Trainer fences G on this error.
                         raise RuntimeError(
                             "RESTORE routing commit outcome is unknown"
                         ) from reconcile_exc
@@ -429,63 +425,31 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                             ) from commit_exc
                         evidence = reconciled
                     else:
-                        # The LB authoritatively reports no publish.  Only now is
-                        # it safe to retract M/C and re-enter level-2 sleep.
-                        try:
-                            manager.transition_replica(
-                                target,
-                                ReplicaState.DRAINING,
-                            )
+                        # E is already effective, so a definite R failure cannot
+                        # safely re-sleep here. Retract local service/capacity and
+                        # quarantine M; Trainer will block G for reconciliation.
+                        manager.transition_replica(target, ReplicaState.DRAINING)
+                        if activated:
                             manager.deactivate_service(target)
                             activated = False
                             self._update_max_concurrent_samples()
-                            sleep_receipts = await runtime.sleep()
-                            self._require_level2_sleep_receipts(
-                                sleep_receipts,
-                                context="RESTORE rollback",
-                            )
-                            manager.transition_replica(
-                                target,
-                                ReplicaState.DORMANT,
-                            )
-                            rollback_complete = True
-                        except BaseException as rollback_exc:
-                            if manager.replica_state.get(target) is ReplicaState.DRAINING:
-                                manager.transition_replica(
-                                    target,
-                                    ReplicaState.QUARANTINED,
-                                )
-                            raise RuntimeError(
-                                "RESTORE publish failed and rollback is unverified"
-                            ) from rollback_exc
+                        manager.transition_replica(target, ReplicaState.QUARANTINED)
                         raise commit_exc
 
                 self._pending_operation_targets.pop(operation.operation_id, None)
                 return evidence
             except BaseException:
-                # Failures before M becomes ACTIVE are still provably pre-route.
-                # Return to DORMANT when possible; once M is ACTIVE, only the
-                # commit/query branch above may decide whether rollback is safe.
-                if (
-                    manager.replica_state.get(target) is ReplicaState.DORMANT
-                    and not rollback_complete
-                ):
-                    compensated = False
-                    try:
-                        if activated:
+                # Failures before ACTIVE/R publication still happen after E was
+                # committed. Do not manufacture DORMANT by sleeping behind E's
+                # back; quarantine the local runtime projection instead.
+                if manager.replica_state.get(target) is ReplicaState.DORMANT:
+                    if activated:
+                        try:
                             manager.deactivate_service(target)
                             self._update_max_concurrent_samples()
-                        if runtime is not None:
-                            sleep_receipts = await runtime.sleep()
-                            self._require_level2_sleep_receipts(
-                                sleep_receipts,
-                                context="RESTORE rollback",
-                            )
-                            compensated = True
-                    except BaseException:
-                        compensated = False
-                    if not compensated:
-                        manager.transition_replica(target, ReplicaState.QUARANTINED)
+                        except BaseException:
+                            pass
+                    manager.transition_replica(target, ReplicaState.QUARANTINED)
                 raise
 
         if state is not ReplicaState.DRAINING:
