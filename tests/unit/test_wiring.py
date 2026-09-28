@@ -1865,7 +1865,8 @@ def test_native_replica_requires_verified_server_receipts_for_sleep_and_wake():
             }
         )
 
-    replica = replica_class().__new__(replica_class())
+    cls = replica_class()
+    replica = cls.__new__(cls)
     replica.replica_kind = ReplicaKind.NATIVE
     replica.servers = [Server()]
 
@@ -1890,7 +1891,8 @@ def test_manager_native_sleep_binds_released_evidence_to_runtime_gpu_uuids():
                 {"sleep_level": 2, "sleeping": True},
             )
 
-    manager = native_manager_class().__new__(native_manager_class())
+    cls = native_manager_class()
+    manager = cls.__new__(cls)
     manager.replica_kind = {key: ReplicaKind.NATIVE}
     manager.replica_state = {key: ReplicaState.DRAINING}
     manager._runtime_inventory = {key: Runtime()}
