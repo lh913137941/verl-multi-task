@@ -47,8 +47,9 @@ Removing a member also invalidates its cached bootstrap result.
 The 092303 text's requirement that every target already belong to E applies to
 refreshing effective members, not initial ADD or rejoining RESTORE. Applying it
 to ADD contradicts that same section's requirement to join E only after transfer.
-RESTORE still needs its verified native wake and version-confirmation path;
-the current borrowed-only server validation is not a RESTORE implementation.
+RESTORE now reuses the same target bootstrap/version-confirmation machinery for
+a parked native runtime after weights-only wake; the real GPU current-Vpub test
+must pass before TaskRunner admission is enabled.
 
 For NCCL/HCCL, enabled profiles require the explicit boolean
 `actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.<backend>.rebuild_group=true`.
@@ -58,9 +59,9 @@ or device combination, and disabled profiles preserve native configuration.
 
 `Vpub` denotes a version, not a cached weight snapshot. Wiring ADD/RESTORE must
 also prove that the sender's actual weights match that version: the membership
-gate alone does not serialize optimizer updates. Trainer's
-`bootstrap_and_publish` and `restore_and_publish` remain explicit
-`NotImplementedError` boundaries until this orchestration is verified.
+gate alone does not serialize optimizer updates. ADD `bootstrap_and_publish`
+remains fail-closed; RESTORE has internal staged wiring but TaskRunner admission
+remains fail-closed until the real GPU current-Vpub path is verified.
 
 See [092303 repair and validation notes](2026-09-23-092303-ce-repair.md) for the
 source baseline, tests and remaining runtime work.
