@@ -178,7 +178,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             existing = journal.query(command.operation_id)
             record = journal.begin(command)
 
-            if lease is not None:
+            if command.kind is OperationKind.ADD:
                 previous_lease = self._operation_leases.get(command.operation_id)
                 if previous_lease is not None and previous_lease != lease:
                     raise ValueError("conflicting lease snapshot replay")
