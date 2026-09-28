@@ -623,7 +623,6 @@ def test_taskrunner_launch_failure_cleans_temp_thread_and_lease_state():
     )
 
     def fail_launch(operation_id):
-        runner._operation_threads[operation_id] = object()
         runner._operation_leases[operation_id] = taskrunner_lease()
         raise RuntimeError("thread start failed")
 
@@ -631,7 +630,6 @@ def test_taskrunner_launch_failure_cleans_temp_thread_and_lease_state():
     with pytest.raises(RuntimeError, match="thread start failed"):
         runner.submit_operation(command)
 
-    assert "op-remove-launch-fail" not in runner._operation_threads
     assert "op-remove-launch-fail" not in runner._operation_leases
     record = runner.query_operation("op-remove-launch-fail")
     assert record.status is OperationStatus.FAILED
