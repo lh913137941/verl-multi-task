@@ -1,7 +1,6 @@
 """Native vLLM replica extension for the supported STANDALONE profile."""
 
 import asyncio
-import hashlib
 import os
 import subprocess
 
@@ -47,12 +46,6 @@ class MultiTaskvLLMReplica(vLLMReplica):
         self.max_colocate_count = max_colocate_count
         super().__init__(*args, **kwargs)
         self.server_class = ray.remote(MultiTaskvLLMHttpServer)
-
-    @staticmethod
-    def _short_identity(value: str) -> str:
-        if not isinstance(value, str) or not value:
-            raise ValueError("identity value must be a nonempty string")
-        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
     @staticmethod
     def _runtime_placement_probe(_worker) -> dict:
@@ -165,27 +158,17 @@ class MultiTaskvLLMReplica(vLLMReplica):
         if len(node_ids) != 1:
             raise ValueError("first release borrowed placement must be single-node")
 
-    def _worker_prefix(self, spec: dict) -> str:
-        token = self._short_identity(
-            f"{spec['lease_id']}:{spec['operation_id']}:{self.runtime_epoch}"
-        )
-        return f"borrowed_ce_{self.replica_rank}_{token}_"
-
-    def _worker_name(self, spec: dict, claim: dict) -> str:
-        claim_token = self._short_identity(claim["claim_id"])
-        return f"{self._worker_prefix(spec)}r{claim['rank']}_{claim_token}"
-
     def build_borrowed_worker_plan(self, spec: dict) -> tuple[dict, ...]:
         """Build deterministic CE actor placement metadata with no Ray side effects."""
         self.validate_placement(spec)
-        prefix = self._worker_prefix(spec)
+        prefix = f"borrowed_ce_{self.replica_rank}_"
         plan = []
         for claim in spec["claims"]:
             plan.append(
                 {
                     "rank": claim["rank"],
                     "claim_id": claim["claim_id"],
-                    "actor_name": self._worker_name(spec, claim),
+                    "actor_name": f"{prefix}r{claim['rank']}",
                     "pg_id": claim["pg_id"],
                     "bundle_index": claim["bundle_index"],
                     "node_id": claim["node_id"],
@@ -202,24 +185,11 @@ class MultiTaskvLLMReplica(vLLMReplica):
                 }
             )
         self.placement_claims = tuple(dict(claim) for claim in spec["claims"])
-        token = self._short_identity(
-            f"{spec['lease_id']}:{spec['operation_id']}:{self.runtime_epoch}"
-        )
-        self.borrowed_server_name_prefix = f"vllm_borrowed_{token}_"
         self.borrowed_server_names = (
-            f"{self.borrowed_server_name_prefix}server_{self.replica_rank}_0",
+            f"{super()._get_server_name_prefix()}server_"
+            f"{self.replica_rank}_0{self.name_suffix}",
         )
         return tuple(plan)
-
-    def _get_server_name_prefix(self) -> str:
-        if self.replica_kind is ReplicaKind.BORROWED:
-            prefix = getattr(self, "borrowed_server_name_prefix", None)
-            if not prefix:
-                raise RuntimeError(
-                    "borrowed server name prefix is unavailable before placement planning"
-                )
-            return prefix
-        return super()._get_server_name_prefix()
 
     async def _get_master_addr_port_for_slot(self, pg, bundle_index: int):
         """Create a borrower communication root on the selected borrower bundle."""
@@ -381,7 +351,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
             worker_group = RayWorkerGroup.from_detached(
                 worker_handles=workers,
                 ray_cls_with_init=bind_args,
-                name_prefix=self._worker_prefix(spec),
+                name_prefix=f"borrowed_ce_{self.replica_rank}_",
                 use_gpu=True,
                 device_name=get_device_name(),
             )
