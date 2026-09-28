@@ -406,30 +406,30 @@ def test_taskrunner_minimal_journal_surface_and_replay_does_not_relaunch():
     assert runner.query_operation("missing").status is OperationStatus.UNKNOWN
 
 
-def test_taskrunner_admission_policy_only_allows_natural_remove():
+def test_taskrunner_admission_policy_allows_add_and_force_remove():
     runner = taskrunner_class()()
     key = ReplicaKey("task-a", "r0")
 
     assert runner._unverified_reason(
         OperationCommand("op-remove", OperationKind.REMOVE, key, "l1")
     ) is None
-    assert "target-only parameter bootstrap" in runner._unverified_reason(
+    assert runner._unverified_reason(
         OperationCommand("op-add", OperationKind.ADD, key, "l1")
-    )
+    ) is None
+    assert runner._unverified_reason(
+        OperationCommand(
+            "op-force", OperationKind.REMOVE, key, "l1", force=True
+        )
+    ) is None
     assert "STANDALONE sleep backend" in runner._unverified_reason(
         OperationCommand("op-donate", OperationKind.DONATE, key, "l1")
     )
     assert "wake/bootstrap backend" in runner._unverified_reason(
         OperationCommand("op-restore", OperationKind.RESTORE, key, "l1")
     )
-    assert "targeted abort/continuation backend" in runner._unverified_reason(
-        OperationCommand(
-            "op-force", OperationKind.REMOVE, key, "l1", force=True
-        )
-    )
 
 
-def test_taskrunner_add_fails_before_hidden_runtime_creation():
+def test_taskrunner_add_is_admitted_with_matching_lease_snapshot():
     runner = taskrunner_class()()
     runner.task_session = "task-a"
     runner._control_ready = True
@@ -442,14 +442,11 @@ def test_taskrunner_add_fails_before_hidden_runtime_creation():
         "l1",
     )
 
-    with pytest.raises(
-        NotImplementedError,
-        match="verified target-only parameter bootstrap",
-    ):
-        runner.submit_operation(command, lease=taskrunner_lease())
+    record = runner.submit_operation(command, lease=taskrunner_lease())
 
-    assert launched == []
-    assert runner._operation_journal.query("op-add") is None
+    assert record.status is OperationStatus.ACCEPTED
+    assert launched == ["op-add"]
+    assert runner._operation_leases["op-add"] == taskrunner_lease()
 
 
 def test_taskrunner_executes_natural_borrowed_remove_and_advances_lease():
@@ -682,7 +679,7 @@ def test_taskrunner_unverified_native_donate_fails_before_drain_or_journal():
     assert runner._operation_journal.query("op-donate") is None
 
 
-def test_taskrunner_force_remove_fails_before_drain_or_journal():
+def test_taskrunner_force_remove_is_admitted_and_dispatched():
     runner = taskrunner_class()()
     runner.task_session = "task-a"
     runner._control_ready = True
@@ -690,22 +687,139 @@ def test_taskrunner_force_remove_fails_before_drain_or_journal():
     runner._launch_operation = launched.append
     key = ReplicaKey("task-a", "borrowed-0")
 
-    with pytest.raises(
-        NotImplementedError,
-        match="verified targeted abort/continuation backend",
-    ):
-        runner.submit_operation(
-            OperationCommand(
-                "op-force",
-                OperationKind.REMOVE,
-                key,
-                "l1",
-                force=True,
+    record = runner.submit_operation(
+        OperationCommand(
+            "op-force",
+            OperationKind.REMOVE,
+            key,
+            "l1",
+            force=True,
+        )
+    )
+
+    assert record.status is OperationStatus.ACCEPTED
+    assert launched == ["op-force"]
+
+
+def test_trainer_add_bootstraps_current_vpub_commits_e_then_publishes_service():
+    key = ReplicaKey("task-a", "borrowed-0")
+    runtime = type("Runtime", (), {"replica_kind": ReplicaKind.BORROWED})()
+    calls = []
+
+    class CE:
+        def __init__(self):
+            self.pending_bootstrap = {}
+            self.effective_replicas = {}
+
+        def register_pending(self, target, replicas, *, operation_id):
+            calls.append(("register_pending", target, operation_id))
+            self.pending_bootstrap[target] = (tuple(replicas), operation_id)
+
+        async def bootstrap_target(self, target, *, operation_id, loaded_version):
+            calls.append(("bootstrap_target", target, operation_id, loaded_version))
+            return OperationEvidence(operation_id, EvidenceType.WEIGHT_READY, 1)
+
+        def commit_pending(self, target, evidence, *, loaded_version):
+            calls.append(("commit_pending", target, loaded_version))
+            replicas, _ = self.pending_bootstrap.pop(target)
+            self.effective_replicas[target] = (replicas, loaded_version)
+
+        def discard_pending(self, target):
+            calls.append(("discard_pending", target))
+            self.pending_bootstrap.pop(target, None)
+
+    class Rollouter:
+        get_pending_target = AsyncRemoteMethod(lambda operation_id: key)
+        get_pending_replicas = AsyncRemoteMethod(lambda operation_id: (runtime,))
+        commit_service_change = AsyncRemoteMethod(
+            lambda operation: calls.append(("commit_service", operation.operation_id))
+            or OperationEvidence(
+                operation.operation_id,
+                EvidenceType.SERVICE_COMMITTED,
+                2,
+            )
+        )
+        finalize_release = AsyncRemoteMethod(
+            lambda operation: (_ for _ in ()).throw(
+                AssertionError("successful ADD must not rollback runtime")
             )
         )
 
-    assert launched == []
-    assert runner._operation_journal.query("op-force") is None
+    trainer = trainer_class()()
+    trainer.rollouter = Rollouter()
+    trainer.checkpoint_manager = CE()
+    trainer.current_param_version = 9
+
+    evidence = asyncio.run(
+        trainer.bootstrap_and_publish(
+            OperationRecord("op-add", OperationStatus.RUNNING)
+        )
+    )
+
+    assert evidence.type is EvidenceType.SERVICE_COMMITTED
+    assert trainer.checkpoint_manager.effective_replicas[key][1] == 9
+    assert calls == [
+        ("register_pending", key, "op-add"),
+        ("bootstrap_target", key, "op-add", 9),
+        ("commit_pending", key, 9),
+        ("commit_service", "op-add"),
+    ]
+
+
+def test_trainer_add_bootstrap_failure_discards_pending_and_destroys_hidden_runtime():
+    key = ReplicaKey("task-a", "borrowed-0")
+    runtime = type("Runtime", (), {"replica_kind": ReplicaKind.BORROWED})()
+    calls = []
+
+    class CE:
+        def __init__(self):
+            self.pending_bootstrap = {}
+
+        def register_pending(self, target, replicas, *, operation_id):
+            calls.append(("register_pending", target, operation_id))
+            self.pending_bootstrap[target] = (tuple(replicas), operation_id)
+
+        async def bootstrap_target(self, target, *, operation_id, loaded_version):
+            calls.append(("bootstrap_target", target, loaded_version))
+            raise RuntimeError("weight transfer failed")
+
+        def discard_pending(self, target):
+            calls.append(("discard_pending", target))
+            self.pending_bootstrap.pop(target, None)
+
+    class Rollouter:
+        get_pending_target = AsyncRemoteMethod(lambda operation_id: key)
+        get_pending_replicas = AsyncRemoteMethod(lambda operation_id: (runtime,))
+        finalize_release = AsyncRemoteMethod(
+            lambda operation: calls.append(("finalize_release", operation.operation_id))
+            or OperationEvidence(
+                operation.operation_id,
+                EvidenceType.RELEASED,
+                2,
+                ("u0",),
+            )
+        )
+
+    trainer = trainer_class()()
+    trainer.rollouter = Rollouter()
+    trainer.checkpoint_manager = CE()
+    trainer.current_param_version = 9
+
+    with pytest.raises(RuntimeError, match="weight transfer failed"):
+        asyncio.run(
+            trainer.bootstrap_and_publish(
+                OperationRecord("op-add", OperationStatus.RUNNING)
+            )
+        )
+
+    assert trainer.replica_sync_gate.health == "HEALTHY"
+    assert trainer.checkpoint_manager.pending_bootstrap == {}
+    assert calls == [
+        ("register_pending", key, "op-add"),
+        ("bootstrap_target", key, 9),
+        ("discard_pending", key),
+        ("finalize_release", "op-add"),
+    ]
 
 
 def test_trainer_donate_parks_native_ce_member_in_existing_pending_set():
