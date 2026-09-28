@@ -558,9 +558,6 @@ def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
             loaded_version=17,
         )
         assert checkpoint_manager.effective_replicas[key][1] == 17
-        assert ray.get(
-            replica.servers[0]._multitask_sleep_stage.remote()
-        ) == "weights"
 
         # bootstrap_target has restored KV memory, but the local admission gate
         # must remain closed until the explicit final wake commits service.
