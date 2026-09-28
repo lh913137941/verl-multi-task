@@ -42,10 +42,18 @@ abort reply 丢失等故障需要命中非常精确的 owner-commit 边界；在
 bash scripts/e2e/verify_cluster.sh --launcher /path/to/multitask_test_launcher.sh --lease /tmp/lease.json
 ```
 
-如果测试 job 已经在 Ray 集群里运行：
+如果 donor / borrower 两个测试 job 已经在同一 Ray 集群里运行，先列出已注册 TaskRunner：
 
 ```bash
-bash scripts/e2e/verify_cluster.sh --attach --lease /tmp/lease.json
+python scripts/e2e/list_tasks.py
+```
+
+然后指定两个不同的 task_session：
+
+```bash
+bash scripts/e2e/verify_cluster.sh --attach --lease /tmp/lease.json \
+  --donor-session <donor-task-session> \
+  --borrower-session <borrower-task-session>
 ```
 
 只想先验证不依赖真实生命周期拓扑的控制面/异常恢复/Exactly-once：
