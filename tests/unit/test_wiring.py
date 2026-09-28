@@ -1355,6 +1355,9 @@ def replica_class():
             self.workers = []
             self.servers = []
 
+        def _get_server_name_prefix(self):
+            return "vllm_"
+
     fake_ray = type("ReplicaRay", (), {"remote": staticmethod(lambda cls: cls)})
     return isolated(
         "rollout/replica.py",
@@ -1559,6 +1562,9 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
             self.workers = []
             self.servers = []
 
+        def _get_server_name_prefix(self):
+            return "vllm_"
+
     created = []
     killed = []
 
@@ -1737,6 +1743,9 @@ def test_init_from_lease_reaches_runtime_ready_only_after_server_health():
             self.name_suffix = name_suffix
             self.workers = []
             self.servers = []
+
+        def _get_server_name_prefix(self):
+            return "vllm_"
             self._server_handle = None
             self._server_address = None
 
