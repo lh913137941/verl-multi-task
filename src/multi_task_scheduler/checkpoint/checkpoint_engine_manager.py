@@ -217,10 +217,13 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                     *[replica.wake_up(tags=["weights"]) for replica in replicas]
                 )
 
-            # Target is hidden, so active replicas must not be aborted or touched.
-            await asyncio.gather(
-                *[replica.release_kv_cache() for replica in replicas]
-            )
+            # Borrowed ADD targets are resident and use VERL's native
+            # KV-release path. Native RESTORE already has KV absent after the
+            # weights-only wake above.
+            if not native_restore:
+                await asyncio.gather(
+                    *[replica.release_kv_cache() for replica in replicas]
+                )
 
             topology_started = True
             self.build_process_group(rollout)
