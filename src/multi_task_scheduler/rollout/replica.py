@@ -372,11 +372,9 @@ class MultiTaskvLLMReplica(vLLMReplica):
         placements = await asyncio.gather(
             *[worker.runtime_placement.remote() for worker in workers]
         )
-        worker_nodes = {
-            placement.get("node_id")
-            for placement in placements
-            if isinstance(placement, dict)
-        }
+        if any(not isinstance(placement, dict) for placement in placements):
+            raise TypeError("native runtime placement probe returned a non-dict result")
+        worker_nodes = {placement.get("node_id") for placement in placements}
         if len(worker_nodes) != 1 or health.get("node_id") not in worker_nodes:
             raise RuntimeError("native server/worker node placement mismatch")
         return dict(health)
@@ -406,9 +404,10 @@ class MultiTaskvLLMReplica(vLLMReplica):
         self._server_address = None
 
     async def cleanup_borrowed_runtime(self) -> None:
-        """Destroy locally owned borrower server/workers without touching donor PGs."""
+        """Destroy borrower-owned actors and own the cleanup proof flag."""
         if self.replica_kind is not ReplicaKind.BORROWED:
             raise ValueError("borrowed cleanup is BORROWED-only")
+        self.borrowed_cleanup_verified = False
         errors = []
         try:
             await self._shutdown_servers_verified()
@@ -424,6 +423,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
         self.workers = []
         if errors:
             raise RuntimeError("borrowed runtime cleanup is unverified") from errors[0]
+        self.borrowed_cleanup_verified = True
 
     async def init_from_lease(
         self,
@@ -458,9 +458,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
         except BaseException as exc:
             try:
                 await self.cleanup_borrowed_runtime()
-                self.borrowed_cleanup_verified = True
             except BaseException as cleanup_exc:
-                self.borrowed_cleanup_verified = False
                 self.borrowed_runtime_state = "FAILED"
                 raise RuntimeError(
                     "borrowed runtime creation failed and cleanup is unverified"
