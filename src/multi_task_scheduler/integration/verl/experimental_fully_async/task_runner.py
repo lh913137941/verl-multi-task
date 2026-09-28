@@ -189,6 +189,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                 self._launch_operation(command.operation_id)
             except BaseException as exc:
                 with self._journal_lock:
+                    self._operation_threads.pop(command.operation_id, None)
                     self._operation_leases.pop(command.operation_id, None)
                     self._operation_journal.finish(
                         command.operation_id,
