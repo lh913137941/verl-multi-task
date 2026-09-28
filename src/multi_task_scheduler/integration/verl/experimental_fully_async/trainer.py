@@ -315,6 +315,53 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
         finally:
             await lease.release()
 
+    async def _reconcile_blocked_exit(
+        self,
+        operation: OperationRecord,
+    ) -> OperationEvidence | None:
+        """Resolve a BLOCKED DONATE/REMOVE service commit from owner facts under G."""
+        gate = self.replica_sync_gate
+        if (
+            gate.health != "BLOCKED"
+            or gate.blocked_operation_id != operation.operation_id
+        ):
+            return None
+
+        target = await self.rollouter.get_pending_target.remote(operation.operation_id)
+        if target in self.checkpoint_manager.effective_replicas:
+            # E still owns the replica, so this is not a post-remove uncertainty.
+            return None
+
+        result = {}
+
+        async def reconcile():
+            service_evidence = await self.rollouter.commit_service_change.remote(
+                operation
+            )
+            result["evidence"] = _require_evidence(
+                service_evidence,
+                operation.operation_id,
+                EvidenceType.SERVICE_COMMITTED,
+                "exit service reconciliation",
+            )
+
+        await gate.reconcile(operation.operation_id, reconcile)
+        evidence = result.get("evidence")
+        if evidence is None:
+            raise RuntimeError("exit reconciliation returned no evidence")
+        return evidence
+
+    async def reconcile_exit(
+        self,
+        operation: OperationRecord,
+    ) -> OperationEvidence | None:
+        """Exact-op recovery hook used only after TaskRunner recorded UNKNOWN."""
+        if not isinstance(operation, OperationRecord):
+            raise TypeError("reconcile_exit requires OperationRecord")
+        if self.rollouter is None or self.checkpoint_manager is None:
+            raise RuntimeError("Trainer owner dependencies are not initialized")
+        return await self._reconcile_blocked_exit(operation)
+
     async def remove_and_commit(self, operation: OperationRecord) -> OperationEvidence:
         """Remove E and commit R/C while holding the same gate as native sync."""
         if not isinstance(operation, OperationRecord):

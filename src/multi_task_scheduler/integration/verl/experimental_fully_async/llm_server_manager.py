@@ -147,6 +147,39 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
     def inspect_runtime(self, key: ReplicaKey):
         return self._runtime_inventory.get(key)
 
+    def query_release_evidence(
+        self,
+        key: ReplicaKey,
+        operation_id: str,
+    ) -> OperationEvidence | None:
+        """Return already-verified physical release evidence for exact-op replay."""
+        if not isinstance(key, ReplicaKey):
+            raise TypeError("query_release_evidence requires ReplicaKey")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("operation_id must be a nonempty string")
+
+        kind = self.replica_kind.get(key)
+        if kind is ReplicaKind.NATIVE:
+            entry = self._native_release_evidence.get(operation_id)
+            if entry is None:
+                return None
+            previous_key, evidence = entry
+            if previous_key != key:
+                raise ValueError("native release operation belongs to another replica")
+            return evidence
+        if kind is ReplicaKind.BORROWED:
+            try:
+                record = self._borrowed_record_for_key(key)
+            except KeyError:
+                return None
+            evidence = record.get("destroy_evidence")
+            if evidence is None:
+                return None
+            if evidence.operation_id != operation_id:
+                return None
+            return evidence
+        return None
+
     def deactivate_service(self, key: ReplicaKey):
         """Remove one runtime from native active-service lists without destroying it."""
         runtime = self._runtime_inventory.get(key)

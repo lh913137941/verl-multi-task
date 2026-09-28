@@ -176,7 +176,6 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             reconciliation_launch = (
                 existing is not None
                 and existing.status is OperationStatus.UNKNOWN
-                and command.kind in {OperationKind.ADD, OperationKind.RESTORE}
                 and command.operation_id not in self._operation_threads
             )
             launch = existing is None or reconciliation_launch
@@ -190,7 +189,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                     if reconciliation_launch:
                         # The prior UNKNOWN owner outcome still exists. A local
                         # thread-launch failure creates no new owner fact and must
-                        # not erase the preserved ADD lease snapshot or rewrite
+                        # not erase preserved reconciliation inputs or rewrite
                         # the old UNKNOWN into a resolved FAILED result.
                         pass
                     else:
@@ -222,7 +221,11 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                 journal = self._operation_journal
                 command = journal.command(operation_id)
                 current = journal.query(operation_id)
-                if current is not None and current.status is OperationStatus.UNKNOWN:
+                reconciling = (
+                    current is not None
+                    and current.status is OperationStatus.UNKNOWN
+                )
+                if reconciling:
                     record = journal.reopen_unknown(operation_id)
                 else:
                     record = journal.mark_running(operation_id)
@@ -294,20 +297,57 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                 )
 
             elif command.kind in {OperationKind.DONATE, OperationKind.REMOVE}:
-                exit_evidence = ray.get(
-                    rollouter.prepare_exit.remote(
-                        command.target,
-                        operation_id=operation_id,
-                        force=bool(command.force),
+                service_evidence = None
+                if reconciling:
+                    # The remote release may have committed before TaskRunner lost
+                    # its ACK. Manager's release ledger is authoritative and makes
+                    # this replay side-effect free.
+                    prior_release = ray.get(
+                        rollouter.query_release_operation.remote(
+                            command.target,
+                            operation_id,
+                        )
                     )
-                )
-                self._require_evidence(
-                    exit_evidence,
-                    operation_id=operation_id,
-                    expected=EvidenceType.EXIT_READY,
-                )
+                    if prior_release is not None:
+                        final_evidence = self._require_evidence(
+                            prior_release,
+                            operation_id=operation_id,
+                            expected=EvidenceType.RELEASED,
+                        )
+                        self._advance_lease(command, final_evidence)
+                        with self._journal_lock:
+                            self._operation_journal.finish(
+                                operation_id,
+                                OperationStatus.SUCCEEDED,
+                                final_evidence.type.value,
+                            )
+                        return
 
-                service_evidence = ray.get(trainer.remove_and_commit.remote(operation))
+                    # If E removal happened and G was fenced around an uncertain
+                    # R/C commit, reconcile that owner state before repeating
+                    # prepare_exit. A healthy gate returns None and we continue
+                    # through the ordinary idempotent exit path.
+                    service_evidence = ray.get(
+                        trainer.reconcile_exit.remote(operation)
+                    )
+
+                if service_evidence is None:
+                    exit_evidence = ray.get(
+                        rollouter.prepare_exit.remote(
+                            command.target,
+                            operation_id=operation_id,
+                            force=bool(command.force),
+                        )
+                    )
+                    self._require_evidence(
+                        exit_evidence,
+                        operation_id=operation_id,
+                        expected=EvidenceType.EXIT_READY,
+                    )
+                    service_evidence = ray.get(
+                        trainer.remove_and_commit.remote(operation)
+                    )
+
                 self._require_evidence(
                     service_evidence,
                     operation_id=operation_id,

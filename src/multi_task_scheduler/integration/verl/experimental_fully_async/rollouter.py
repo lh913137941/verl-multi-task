@@ -506,6 +506,16 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
             raise RuntimeError("pending lifecycle target has no runtime")
         return (runtime,)
 
+    def query_release_operation(
+        self,
+        target: ReplicaKey,
+        operation_id: str,
+    ) -> OperationEvidence | None:
+        """Read Manager-owned RELEASED evidence for exact lifecycle replay."""
+        if not isinstance(target, ReplicaKey):
+            raise TypeError("query_release_operation requires ReplicaKey")
+        return self.llm_server_manager.query_release_evidence(target, operation_id)
+
     async def commit_service_change(
         self, operation: OperationRecord
     ) -> OperationEvidence | None:
@@ -724,8 +734,10 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
             manager.deactivate_service(target)
             self._update_max_concurrent_samples()
         except BaseException:
-            if manager.replica_state.get(target) is ReplicaState.DRAINING:
-                manager.transition_replica(target, ReplicaState.QUARANTINED)
+            # E was already removed by Trainer under G. Keep the conservative
+            # DRAINING projection so the same operation can reconcile R/C under
+            # the BLOCKED gate. Physical release still quarantines separately
+            # when it cannot be proved.
             raise
 
         return OperationEvidence.now(

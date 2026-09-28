@@ -443,6 +443,32 @@ def test_taskrunner_minimal_journal_surface_and_replay_does_not_relaunch():
     assert missing.result is None
 
 
+def test_taskrunner_exact_unknown_remove_replay_relaunches_same_operation():
+    runner = taskrunner_class()()
+    runner.task_session = "task-a"
+    runner._control_ready = True
+    command = OperationCommand(
+        "op-remove-reconcile",
+        OperationKind.REMOVE,
+        ReplicaKey("task-a", "borrowed-0"),
+        "l1",
+    )
+    runner._operation_journal.begin(command)
+    runner._operation_journal.mark_running(command.operation_id)
+    runner._operation_journal.finish(
+        command.operation_id,
+        OperationStatus.UNKNOWN,
+        "release ACK unknown",
+    )
+    launched = []
+    runner._launch_operation = launched.append
+
+    replay = runner.submit_operation(command)
+
+    assert replay.status is OperationStatus.UNKNOWN
+    assert launched == [command.operation_id]
+
+
 def test_taskrunner_exact_unknown_add_replay_relaunches_same_operation():
     runner = taskrunner_class()()
     runner.task_session = "task-a"
@@ -656,6 +682,67 @@ def test_taskrunner_replays_identical_lease_evidence_after_ack_loss():
     runner._advance_lease(command, evidence)
 
     assert calls == [("l1", evidence), ("l1", evidence)]
+
+
+def test_taskrunner_unknown_remove_replay_uses_verified_release_without_repeating_exit():
+    runner = taskrunner_class()()
+    runner.task_session = "task-a"
+    runner._control_ready = True
+    runner._launch_operation = lambda operation_id: None
+    key = ReplicaKey("task-a", "borrowed-0")
+    command = OperationCommand("op-remove-release-lost", OperationKind.REMOVE, key, "l1")
+    runner._operation_journal.begin(command)
+    runner._operation_journal.mark_running(command.operation_id)
+    runner._operation_journal.finish(
+        command.operation_id,
+        OperationStatus.UNKNOWN,
+        "final release reply lost",
+    )
+    calls = []
+    release = OperationEvidence(
+        command.operation_id,
+        EvidenceType.RELEASED,
+        11,
+        ("u0",),
+    )
+
+    class Rollouter:
+        query_release_operation = RemoteMethod(
+            lambda target, operation_id: calls.append(
+                ("query_release", target, operation_id)
+            ) or release
+        )
+        prepare_exit = RemoteMethod(
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("verified release replay must not drain again")
+            )
+        )
+
+    class Trainer:
+        reconcile_exit = RemoteMethod(
+            lambda operation: (_ for _ in ()).throw(
+                AssertionError("verified release replay must not enter Trainer")
+            )
+        )
+
+    class GroupScheduler:
+        advance_lease = RemoteMethod(
+            lambda lease_id, evidence: calls.append(
+                ("advance_lease", lease_id, evidence)
+            ) or {"released": True}
+        )
+
+    runner.components = {"rollouter": Rollouter(), "trainer": Trainer()}
+    runner.group_scheduler = GroupScheduler()
+    runner._execute_operation(command.operation_id)
+
+    record = runner.query_operation(command.operation_id)
+    assert record.status is OperationStatus.SUCCEEDED
+    assert record.result == EvidenceType.RELEASED.value
+    assert calls == [
+        ("query_release", key, command.operation_id),
+        ("advance_lease", "l1", release),
+    ]
 
 
 def test_taskrunner_executes_natural_borrowed_remove_and_advances_lease():
@@ -1206,6 +1293,42 @@ def test_trainer_blocked_add_replay_reconciles_committed_route_and_clears_g():
         await lease.release()
         return await trainer.bootstrap_and_publish(
             OperationRecord("op-add", OperationStatus.RUNNING)
+        )
+
+    evidence = asyncio.run(scenario())
+
+    assert evidence == committed
+    assert trainer.replica_sync_gate.health == "HEALTHY"
+
+
+def test_trainer_blocked_exit_replay_reconciles_service_commit_and_clears_g():
+    key = ReplicaKey("task-a", "native-0")
+    committed = OperationEvidence(
+        "op-donate",
+        EvidenceType.SERVICE_COMMITTED,
+        12,
+    )
+
+    class CE:
+        effective_replicas = {}
+
+    class Rollouter:
+        get_pending_target = AsyncRemoteMethod(lambda operation_id: key)
+        commit_service_change = AsyncRemoteMethod(lambda operation: committed)
+
+    trainer = trainer_class()()
+    trainer.rollouter = Rollouter()
+    trainer.checkpoint_manager = CE()
+
+    async def scenario():
+        lease = await trainer.replica_sync_gate.acquire(
+            "op-donate",
+            GateKind.REMOVE,
+        )
+        trainer.replica_sync_gate.block(lease.owner, "R/C outcome unknown")
+        await lease.release()
+        return await trainer.reconcile_exit(
+            OperationRecord("op-donate", OperationStatus.RUNNING)
         )
 
     evidence = asyncio.run(scenario())
@@ -3581,6 +3704,23 @@ def test_manager_native_sleep_binds_released_evidence_to_runtime_gpu_uuids():
     assert evidence.released_gpu_uuids == ("u0",)
 
 
+def test_manager_release_evidence_query_reads_native_owner_ledger():
+    key = ReplicaKey("task-a", "native-0")
+    evidence = OperationEvidence(
+        "op-donate",
+        EvidenceType.RELEASED,
+        3,
+        ("u0",),
+    )
+    cls = native_manager_class()
+    manager = cls.__new__(cls)
+    manager.replica_kind = {key: ReplicaKind.NATIVE}
+    manager._native_release_evidence = {"op-donate": (key, evidence)}
+
+    assert manager.query_release_evidence(key, "op-donate") == evidence
+    assert manager.query_release_evidence(key, "other") is None
+
+
 def test_manager_native_release_replay_returns_identical_evidence():
     key = ReplicaKey("task-a", "native-0")
     sleep_calls = []
@@ -4899,6 +5039,50 @@ def test_rollouter_natural_exit_quarantines_when_drain_start_remains_unknown():
         ("state", ReplicaState.DRAINING),
         ("state", ReplicaState.QUARANTINED),
     ]
+
+
+def test_rollouter_exit_service_commit_failure_stays_draining_for_same_op_reconciliation():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "r0")
+
+    class LB:
+        server_for_replica = AsyncRemoteMethod(lambda target: "s0")
+        has_unsettled_requests = AsyncRemoteMethod(lambda server_id: False)
+        finish_remove = AsyncRemoteMethod(
+            lambda target: (_ for _ in ()).throw(
+                RuntimeError("route commit reply lost")
+            )
+        )
+
+    class Manager:
+        global_load_balancer = LB()
+
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.DRAINING}
+            self.replica_kind = {key: ReplicaKind.NATIVE}
+
+        def replica_meta(self, target):
+            return self.replica_kind[target], self.replica_state[target]
+
+        def transition_replica(self, target, state):
+            self.replica_state[target] = state
+
+        def deactivate_service(self, target):
+            raise AssertionError("failed finish_remove must not deactivate service")
+
+    manager = Manager()
+    rollouter.llm_server_manager = manager
+    rollouter._pending_operation_targets["op"] = key
+
+    with pytest.raises(RuntimeError, match="route commit reply lost"):
+        asyncio.run(
+            rollouter.commit_service_change(
+                OperationRecord("op", OperationStatus.RUNNING)
+            )
+        )
+
+    assert manager.replica_state[key] is ReplicaState.DRAINING
 
 
 def test_rollouter_release_failure_quarantines_drained_replica():
