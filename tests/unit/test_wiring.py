@@ -470,6 +470,56 @@ def test_taskrunner_add_is_admitted_with_matching_lease_snapshot():
     assert runner._operation_leases["op-add"] == taskrunner_lease()
 
 
+def test_taskrunner_verified_add_rollback_finishes_failed_and_advances_lease():
+    runner = taskrunner_class()()
+    runner.task_session = "task-a"
+    runner._control_ready = True
+    runner._launch_operation = lambda operation_id: None
+    key = ReplicaKey("task-a", "borrowed-0")
+    calls = []
+
+    class Rollouter:
+        prepare_replica = RemoteMethod(
+            lambda target, **kwargs: calls.append(
+                ("prepare_replica", target, kwargs["operation_id"])
+            )
+        )
+
+    class Trainer:
+        bootstrap_and_publish = RemoteMethod(
+            lambda operation: OperationEvidence(
+                operation.operation_id,
+                EvidenceType.RELEASED,
+                2,
+                ("u0",),
+            )
+        )
+
+    class GroupScheduler:
+        advance_lease = RemoteMethod(
+            lambda lease_id, evidence: calls.append(
+                ("advance_lease", lease_id, evidence.type, evidence.released_gpu_uuids)
+            )
+            or {"add_rolled_back": True}
+        )
+
+    runner.components = {"rollouter": Rollouter(), "trainer": Trainer()}
+    runner.group_scheduler = GroupScheduler()
+    runner.submit_operation(
+        OperationCommand("op-add-rollback", OperationKind.ADD, key, "l1"),
+        lease=taskrunner_lease(),
+    )
+    runner._execute_operation("op-add-rollback")
+
+    record = runner.query_operation("op-add-rollback")
+    assert record.status is OperationStatus.FAILED
+    assert "verified RELEASED" in record.result
+    assert calls == [
+        ("prepare_replica", key, "op-add-rollback"),
+        ("advance_lease", "l1", EvidenceType.RELEASED, ("u0",)),
+    ]
+
+
 def test_taskrunner_executes_natural_borrowed_remove_and_advances_lease():
     runner = taskrunner_class()()
     runner.task_session = "task-a"
@@ -826,13 +876,14 @@ def test_trainer_add_bootstrap_failure_discards_pending_and_destroys_hidden_runt
     trainer.checkpoint_manager = CE()
     trainer.current_param_version = 9
 
-    with pytest.raises(RuntimeError, match="weight transfer failed"):
-        asyncio.run(
-            trainer.bootstrap_and_publish(
-                OperationRecord("op-add", OperationStatus.RUNNING)
-            )
+    evidence = asyncio.run(
+        trainer.bootstrap_and_publish(
+            OperationRecord("op-add", OperationStatus.RUNNING)
         )
+    )
 
+    assert evidence.type is EvidenceType.RELEASED
+    assert evidence.released_gpu_uuids == ("u0",)
     assert trainer.replica_sync_gate.health == "HEALTHY"
     assert trainer.checkpoint_manager.pending_bootstrap == {}
     assert calls == [
