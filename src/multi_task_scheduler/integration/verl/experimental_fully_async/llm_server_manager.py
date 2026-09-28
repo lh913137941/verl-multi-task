@@ -138,6 +138,11 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             self._runtime_inventory.pop(key, None)
         return new_state
 
+    def _native_release_receipts(self) -> dict[str, tuple[ReplicaKey, OperationEvidence]]:
+        if not hasattr(self, "_native_release_evidence"):
+            self._native_release_evidence = {}
+        return self._native_release_evidence
+
     def replica_meta(self, key: ReplicaKey) -> tuple[ReplicaKind, ReplicaState]:
         return self.replica_kind[key], self.replica_state[key]
 
@@ -587,6 +592,14 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             raise ValueError("sleep requires operation_id")
         if self.replica_kind.get(key) is not ReplicaKind.NATIVE:
             raise ValueError("sleep is valid only for NATIVE replicas")
+
+        previous = self._native_release_receipts().get(operation_id)
+        if previous is not None:
+            previous_key, evidence = previous
+            if previous_key != key:
+                raise ValueError("native release operation is bound to another replica")
+            return evidence
+
         if self.replica_state.get(key) is not ReplicaState.DRAINING:
             raise ValueError("sleep requires a DRAINING native replica")
 
@@ -620,11 +633,13 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             if receipt.get("sleep_level") != 2 or receipt.get("sleeping") is not True:
                 raise RuntimeError("native runtime did not confirm level-2 sleep")
 
-        return OperationEvidence.now(
+        evidence = OperationEvidence.now(
             operation_id,
             EvidenceType.RELEASED,
             released_gpu_uuids=tuple(gpu_uuids),
         )
+        self._native_release_receipts()[operation_id] = (key, evidence)
+        return evidence
 
     async def wake_weights(self, key: ReplicaKey) -> tuple[dict, ...]:
         """Wake only native weight allocations; service admission stays closed."""
