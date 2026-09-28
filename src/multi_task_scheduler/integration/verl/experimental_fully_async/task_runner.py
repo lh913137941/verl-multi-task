@@ -15,7 +15,6 @@ from verl.trainer.ppo.utils import Role
 from verl.single_controller.ray.base import _unwrap_ray_remote
 from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
-    FIRST_RELEASE_MAX_COLOCATE_COUNT,
     Lease,
     OperationCommand,
     OperationEvidence,
@@ -44,6 +43,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
         self._control_ready = False
         self._attached_to_gs = False
         self._journal_lock = threading.RLock()
+        self._operation_threads: dict[str, threading.Thread] = {}
         self._operation_leases: dict[str, Lease] = {}
         self._operation_journal = OperationJournal()
 
@@ -99,6 +99,32 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             )
         return value
 
+    @staticmethod
+    def _unverified_reason(command: OperationCommand) -> str | None:
+        """Return the current profile admission fence, if any."""
+        if command.kind is OperationKind.ADD:
+            return "ADD requires verified target-only parameter bootstrap"
+        if command.kind is OperationKind.DONATE:
+            return "DONATE requires verified native STANDALONE sleep backend"
+        if command.kind is OperationKind.RESTORE:
+            return "RESTORE requires verified native wake/bootstrap backend"
+        if command.kind is OperationKind.REMOVE and command.force:
+            return "FORCE REMOVE requires verified targeted abort/continuation backend"
+        return None
+
+    def _advance_lease(
+        self,
+        command: OperationCommand,
+        evidence: OperationEvidence,
+    ) -> None:
+        ray.get(
+            self.group_scheduler.advance_lease.remote(
+                command.lease_id,
+                evidence,
+            ),
+            timeout=30,
+        )
+
     def _launch_operation(self, operation_id: str) -> None:
         worker = threading.Thread(
             target=self._execute_operation,
@@ -106,7 +132,14 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             name=f"multitask-operation-{operation_id}",
             daemon=True,
         )
-        worker.start()
+        with self._journal_lock:
+            self._operation_threads[operation_id] = worker
+        try:
+            worker.start()
+        except BaseException:
+            with self._journal_lock:
+                self._operation_threads.pop(operation_id, None)
+            raise
 
     def submit_operation(
         self,
@@ -131,22 +164,12 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             if command.target.task_session != self.task_session:
                 raise ValueError("operation targets another task session")
 
-            # Current profile must reject capabilities whose native/GPU boundary
-            # is intentionally still unverified.  Do this before creating a
-            # journal entry or lifecycle worker so a known-unsupported command
-            # cannot allocate a hidden runtime, drain service, or leave the task
-            # fenced as UNKNOWN merely because its backend is not implemented.
-            unsupported = {
-                OperationKind.ADD: "ADD requires verified target-only parameter bootstrap",
-                OperationKind.DONATE: "DONATE requires verified native STANDALONE sleep backend",
-                OperationKind.RESTORE: "RESTORE requires verified native wake/bootstrap backend",
-            }
-            if command.kind in unsupported:
-                raise NotImplementedError(unsupported[command.kind])
-            if command.kind is OperationKind.REMOVE and command.force:
-                raise NotImplementedError(
-                    "FORCE REMOVE requires verified targeted abort/continuation backend"
-                )
+            # Admission is narrower than the internal orchestration surface:
+            # isolated tests may exercise staged paths, while the production
+            # profile admits only capabilities with verified native/GPU closure.
+            reason = self._unverified_reason(command)
+            if reason is not None:
+                raise NotImplementedError(reason)
 
             journal = self._operation_journal
             existing = journal.query(command.operation_id)
@@ -189,13 +212,13 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
         )
 
     def _execute_operation(self, operation_id: str) -> None:
-        with self._journal_lock:
-            journal = self._operation_journal
-            command = journal.command(operation_id)
-            record = journal.mark_running(operation_id)
-            operation = self._snapshot_record(record)
-
         try:
+            with self._journal_lock:
+                journal = self._operation_journal
+                command = journal.command(operation_id)
+                record = journal.mark_running(operation_id)
+                operation = self._snapshot_record(record)
+
             trainer = self.components["trainer"]
             rollouter = self.components["rollouter"]
 
@@ -245,13 +268,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                     operation_id=operation_id,
                     expected=EvidenceType.RELEASED,
                 )
-                ray.get(
-                    self.group_scheduler.advance_lease.remote(
-                        command.lease_id,
-                        final_evidence,
-                    ),
-                    timeout=30,
-                )
+                self._advance_lease(command, final_evidence)
 
             elif command.kind is OperationKind.RESTORE:
                 ray.get(
@@ -267,13 +284,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                     operation_id=operation_id,
                     expected=EvidenceType.SERVICE_COMMITTED,
                 )
-                ray.get(
-                    self.group_scheduler.advance_lease.remote(
-                        command.lease_id,
-                        final_evidence,
-                    ),
-                    timeout=30,
-                )
+                self._advance_lease(command, final_evidence)
 
             else:  # pragma: no cover - OperationKind construction already fences this.
                 raise ValueError(f"unsupported operation kind: {command.kind!r}")
@@ -306,6 +317,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             )
         finally:
             with self._journal_lock:
+                self._operation_threads.pop(operation_id, None)
                 self._operation_leases.pop(operation_id, None)
 
     def run(self, config):
@@ -315,7 +327,8 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
         try:
             return super().run(config)
         finally:
-            self._control_ready = False
+            with self._journal_lock:
+                self._control_ready = False
             if self._attached_to_gs:
                 try:
                     ray.get(
@@ -374,7 +387,8 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             timeout=30,
         )
         self._attached_to_gs = True
-        self._control_ready = True
+        with self._journal_lock:
+            self._control_ready = True
 
     def _create_rollouter(self, config) -> None:
         print("[ASYNC MAIN] Starting create rollouter...")
