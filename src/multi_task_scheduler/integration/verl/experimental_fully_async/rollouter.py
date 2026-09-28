@@ -603,8 +603,16 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
     def _activate_service_target(self, target: ReplicaKey) -> None:
         manager = self.llm_server_manager
         manager.activate_service(target)
-        self._update_max_concurrent_samples()
-        manager.transition_replica(target, ReplicaState.ACTIVE)
+        try:
+            self._update_max_concurrent_samples()
+            manager.transition_replica(target, ReplicaState.ACTIVE)
+        except BaseException:
+            try:
+                manager.deactivate_service(target)
+                self._update_max_concurrent_samples()
+            except BaseException:
+                pass
+            raise
 
     def _retract_service_target(self, target: ReplicaKey) -> None:
         manager = self.llm_server_manager
