@@ -1089,6 +1089,53 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         asyncio.run(manager.create_borrowed_replica(conflicting))
     assert manager.next_replica_rank == 1
 
+    class CleanedFailureRuntime(FakeBorrowedRuntime):
+        async def init_from_lease(self, spec, pg_by_id):
+            self.borrowed_cleanup_verified = True
+            raise RuntimeError("borrowed init failed after verified cleanup")
+
+    manager.rollout_replica_class = CleanedFailureRuntime
+    cleaned_failure = dict(
+        valid_spec,
+        operation_id="op-add-cleaned-failure",
+        lease_id="borrower-lease-cleaned-failure",
+        borrower_replica_id="borrowed-cleaned-failure",
+        replica_rank=None,
+    )
+    with pytest.raises(RuntimeError, match="verified cleanup"):
+        asyncio.run(manager.create_borrowed_replica(cleaned_failure))
+    cleaned_key = ReplicaKey("task-a", "borrowed-cleaned-failure", 0)
+    cleaned_record = manager.borrowed_operations["borrower-lease-cleaned-failure"]
+    assert manager.replica_state[cleaned_key] is ReplicaState.RELEASED
+    assert cleaned_record["state"] == "FAILED"
+    assert cleaned_record["released"] is True
+    with pytest.raises(RuntimeError, match="verified cleanup"):
+        asyncio.run(manager.create_borrowed_replica(cleaned_failure))
+
+    class UnverifiedFailureRuntime(FakeBorrowedRuntime):
+        async def init_from_lease(self, spec, pg_by_id):
+            raise RuntimeError("borrowed init failed before cleanup")
+
+        async def cleanup_borrowed_runtime(self):
+            self.borrowed_cleanup_verified = False
+            raise RuntimeError("cleanup failed")
+
+    manager.rollout_replica_class = UnverifiedFailureRuntime
+    unverified_failure = dict(
+        valid_spec,
+        operation_id="op-add-unverified-failure",
+        lease_id="borrower-lease-unverified-failure",
+        borrower_replica_id="borrowed-unverified-failure",
+        replica_rank=None,
+    )
+    with pytest.raises(RuntimeError, match="before cleanup"):
+        asyncio.run(manager.create_borrowed_replica(unverified_failure))
+    quarantined_key = ReplicaKey("task-a", "borrowed-unverified-failure", 0)
+    quarantined_record = manager.borrowed_operations["borrower-lease-unverified-failure"]
+    assert manager.replica_state[quarantined_key] is ReplicaState.QUARANTINED
+    assert quarantined_record["state"] == "FAILED"
+    assert quarantined_record["released"] is False
+
 
 def test_http_server_health_and_shutdown_use_real_engine_boundaries():
     class Engine:
