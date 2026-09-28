@@ -179,6 +179,13 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         else:
             await engine.wake_up(tags=tags)
         sleeping = bool(await engine.is_sleeping())
+        if tags == ["weights"] and not sleeping:
+            # A weights-only RESTORE step must never pass through the full-wake
+            # admission path, even if a backend reports an unexpected sleeping
+            # state. Keep the local gate closed and fail for reconciliation.
+            raise RuntimeError(
+                "weights-only wake unexpectedly made the vLLM engine fully awake"
+            )
         if sleeping:
             if tags == ["weights"]:
                 self._set_multitask_sleep_stage("weights")
