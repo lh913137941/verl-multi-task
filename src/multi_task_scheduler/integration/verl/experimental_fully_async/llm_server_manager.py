@@ -431,7 +431,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             existing = self.borrowed_operations.get(lease_id)
             if existing is not None:
                 if (
-                    existing["operation_id"] != normalized["operation_id"]
+                    existing["resolved_spec"]["operation_id"] != normalized["operation_id"]
                     or not self._same_borrowed_create_request(existing, normalized)
                 ):
                     raise ValueError("conflicting borrowed create replay")
@@ -464,7 +464,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 state=ReplicaState.CREATING,
             )
             record = {
-                "operation_id": normalized["operation_id"],
                 "replica_key": replica_key,
                 "result": None,
                 "error": None,
@@ -500,7 +499,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 replica_key = current["replica_key"]
                 current["error"] = None
                 current["result"] = {
-                    "operation_id": current["operation_id"],
+                    "operation_id": current["resolved_spec"]["operation_id"],
                     "lease_id": lease_id,
                     "replica_rank": current["resolved_spec"]["replica_rank"],
                     "state": "RUNTIME_READY",
