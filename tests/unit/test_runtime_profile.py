@@ -134,6 +134,39 @@ def test_router_plugin_is_rejected_in_first_release():
         validate_runtime_profile(current)
 
 
+def test_level2_sleep_profile_rejects_mtp_rollout():
+    current = config()
+    current["actor_rollout_ref"]["rollout"]["mtp"] = {
+        "enable": True,
+        "enable_rollout": True,
+    }
+    with pytest.raises(ProfileConfigurationError, match="MTP rollout"):
+        validate_runtime_profile(current)
+
+
+def test_level2_sleep_profile_allows_mtp_loaded_but_not_used_for_rollout():
+    current = config()
+    current["actor_rollout_ref"]["rollout"]["mtp"] = {
+        "enable": True,
+        "enable_rollout": False,
+    }
+    assert validate_runtime_profile(current)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        {"lora_rank": 8},
+        {"lora": {"rank": 8}},
+    ],
+)
+def test_level2_sleep_profile_rejects_lora_rollout(model):
+    current = config()
+    current["actor_rollout_ref"]["model"] = model
+    with pytest.raises(ProfileConfigurationError, match="LoRA rollout"):
+        validate_runtime_profile(current)
+
+
 def test_non_naive_checkpoint_engine_is_required():
     current = config()
     current["actor_rollout_ref"]["rollout"]["checkpoint_engine"]["backend"] = "naive"
