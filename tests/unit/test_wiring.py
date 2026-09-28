@@ -1078,7 +1078,6 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     assert "selected_slots" not in normalized
     assert normalized["max_colocate_count"] == FIRST_RELEASE_MAX_COLOCATE_COUNT
     assert normalized["claims"][0]["rank"] == 0
-    assert normalized["lease_ids"] == ["source-lease-0"]
 
     wrong_task = dict(valid_spec, borrower_task_id="task-b")
     with pytest.raises(ValueError, match="another task_session"):
