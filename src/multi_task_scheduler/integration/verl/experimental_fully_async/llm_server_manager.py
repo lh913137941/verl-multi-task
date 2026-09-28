@@ -283,17 +283,9 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         if len({claim["node_id"] for claim in claims}) != 1:
             raise ValueError("first release borrowed placement must be single-node")
 
-        requested_source_leases = spec.get("lease_ids")
-        if requested_source_leases is not None:
-            if not isinstance(requested_source_leases, (list, tuple)):
-                raise TypeError("lease_ids must be a list/tuple when provided")
-            if set(requested_source_leases) != set(lease.source_lease_ids):
-                raise ValueError("lease_ids do not match claim source leases")
-
         normalized = dict(spec)
         normalized.pop("selected_slots", None)
         normalized["claims"] = claims
-        normalized["lease_ids"] = list(lease.source_lease_ids)
         normalized["world_size"] = world_size
         normalized["max_colocate_count"] = max_colocate_count
         normalized["placement_epoch"] = placement_epoch
@@ -460,7 +452,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             rank = self._allocate_replica_rank_locked(normalized.get("replica_rank"))
             resolved_spec = dict(normalized)
             resolved_spec["claims"] = [dict(claim) for claim in normalized["claims"]]
-            resolved_spec["lease_ids"] = list(normalized["lease_ids"])
             resolved_spec["replica_rank"] = rank
             self.register_replica(
                 replica_key,
