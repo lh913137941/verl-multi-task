@@ -42,6 +42,14 @@ def validate_runtime_profile(config) -> bool:
         raise ProfileConfigurationError("multitask.enabled must be a boolean")
     if not enabled:
         return False
+    drain_timeout_s = multitask.get("drain_timeout_s", 300.0)
+    if (
+        type(drain_timeout_s) not in (int, float)
+        or drain_timeout_s <= 0
+    ):
+        raise ProfileConfigurationError(
+            "multitask.drain_timeout_s must be a positive number"
+        )
     profile = _select(config, "multitask.runtime.profile", None)
     if profile is None:
         profile = PROFILE_ID

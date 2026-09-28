@@ -80,7 +80,10 @@ class _ContinuationAwareServer:
         except Exception as exc:
             # Native Fully Async also aborts for ordinary weight-sync/rebalance.
             # Ray may surface a remote KeyError as RayTaskError(cause=KeyError).
-            cause = getattr(exc, "cause", None)
+            try:
+                cause = exc.cause
+            except Exception:
+                cause = None
             if not isinstance(exc, KeyError) and not isinstance(cause, KeyError):
                 raise
         return output
@@ -126,6 +129,16 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         self.group_scheduler = group_scheduler
         self.task_session = task_session
         self._pending_operation_targets: dict[str, ReplicaKey] = {}
+        multitask_config = getattr(config, "multitask", None)
+        if multitask_config is None and isinstance(config, dict):
+            multitask_config = config.get("multitask")
+        timeout_value = (
+            multitask_config.get("drain_timeout_s", 300.0)
+            if multitask_config is not None
+            else 300.0
+        )
+        self._natural_drain_timeout_s = float(timeout_value)
+        self._idle_report_signature = None
         super().__init__(
             config,
             tokenizer,
@@ -191,7 +204,7 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         surplus_count = max(0, len(active) - required_active)
         return tuple(active[:surplus_count])
 
-    def submit_idle_report(self):
+    async def submit_idle_report(self):
         if self.group_scheduler is None:
             raise RuntimeError("GroupScheduler handle is required for idle reporting")
         candidates = self.collect_idle_candidates()
@@ -209,10 +222,46 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                 for key, kind in candidates
             ),
         }
-        return ray.get(
-            self.group_scheduler.submit_idle_report.remote(report),
-            timeout=30,
-        )
+        return await self.group_scheduler.submit_idle_report.remote(report)
+
+    async def _idle_report_loop(self):
+        """Emit one metadata report per distinct paused surplus set."""
+        while True:
+            await asyncio.sleep(1.0)
+            if not getattr(self, "running", False):
+                return
+            if not getattr(self, "paused", False) or self.group_scheduler is None:
+                self._idle_report_signature = None
+                continue
+
+            candidates = self.collect_idle_candidates()
+            signature = tuple(
+                (key.task_session, key.replica_id, key.runtime_epoch, kind.value)
+                for key, kind in candidates
+            )
+            if not signature or signature == self._idle_report_signature:
+                continue
+            try:
+                await self.submit_idle_report()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Idle reports are advisory metadata. Failure must not stop
+                # rollout production; retry on the next monitor tick.
+                print(
+                    "[MultiTaskRollouter] idle report failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            else:
+                self._idle_report_signature = signature
+
+    async def fit(self):
+        reporter = asyncio.create_task(self._idle_report_loop())
+        try:
+            return await super().fit()
+        finally:
+            reporter.cancel()
+            await asyncio.gather(reporter, return_exceptions=True)
 
     async def prepare_replica(
         self,
@@ -373,8 +422,26 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                 # lost; a second failure leaves the drain outcome unverified.
                 server_id = await lb.begin_drain.remote(replica_key, operation_id)
 
+            loop = asyncio.get_running_loop()
+            if self._natural_drain_timeout_s <= 0:
+                raise ValueError("multitask.drain_timeout_s must be positive")
+            deadline = loop.time() + self._natural_drain_timeout_s
+            next_log = loop.time() + 10.0
             while await lb.has_unsettled_requests.remote(server_id):
-                await asyncio.sleep(0.1)
+                now = loop.time()
+                if now >= deadline:
+                    raise TimeoutError(
+                        "natural drain did not settle before "
+                        f"{self._natural_drain_timeout_s:.1f}s deadline"
+                    )
+                if now >= next_log:
+                    print(
+                        "[MultiTaskRollouter] waiting for natural drain: "
+                        f"operation={operation_id}, server={server_id}, "
+                        f"remaining_budget={deadline - now:.1f}s"
+                    )
+                    next_log = now + 10.0
+                await asyncio.sleep(min(0.1, max(0.0, deadline - now)))
         except BaseException:
             if manager.replica_state.get(replica_key) is ReplicaState.DRAINING:
                 manager.transition_replica(replica_key, ReplicaState.QUARANTINED)

@@ -276,6 +276,20 @@ def test_continuation_handoff_survives_readmission_until_remove_commit():
     assert lb.continuation_handoff_requests("op-force") == ()
 
 
+def test_load_balancer_bounds_settled_request_history():
+    lb = load_balancer_class()({"s0": object()})
+    lb._settled_retention = 2
+
+    for index in range(5):
+        request_id = f"request-{index}"
+        server_id, _ = lb.acquire_server(request_id)
+        lb.release_server(server_id, request_id=request_id)
+
+    assert len(lb.attempt_state) <= 2
+    assert set(lb.attempt_state) == {"request-3", "request-4"}
+    assert all(state is AttemptState.SETTLED for state in lb.attempt_state.values())
+
+
 def test_lb_commit_ready_is_atomic_and_idempotent():
     key = ReplicaKey("task-a", "borrowed-0")
     handle = object()
@@ -2528,6 +2542,9 @@ def test_ce_native_restore_wakes_weights_under_bootstrap_and_restores_kv_before_
             calls.append(("health",))
             return {"global_steps": 13}
 
+        async def worker_placements(self):
+            return ({"node_id": "n0", "gpu_uuid": "u0"},)
+
         async def sleep(self):
             raise AssertionError("successful RESTORE bootstrap must not rollback")
 
@@ -3867,6 +3884,74 @@ def test_rollouter_idle_detection_preserves_committed_capacity_without_reading_l
 
     rollouter.paused = False
     assert rollouter.collect_idle_candidates() == ()
+
+
+def test_rollouter_submit_idle_report_forwards_paused_surplus_metadata():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    keys = [ReplicaKey("task-a", f"r{i}") for i in range(3)]
+    rollouter.llm_server_manager = type(
+        "M",
+        (),
+        {
+            "replica_state": {key: ReplicaState.ACTIVE for key in keys},
+            "replica_kind": {key: ReplicaKind.NATIVE for key in keys},
+        },
+    )()
+    seen = []
+
+    class GS:
+        submit_idle_report = AsyncRemoteMethod(
+            lambda report: seen.append(report)
+            or {"accepted": True, "candidate_count": len(report["candidates"])}
+        )
+
+    rollouter.group_scheduler = GS()
+    result = asyncio.run(rollouter.submit_idle_report())
+
+    assert result == {"accepted": True, "candidate_count": 1}
+    assert seen[0]["task_session"] == "task-a"
+    assert seen[0]["candidates"] == (
+        {"replica_key": keys[0], "kind": ReplicaKind.NATIVE.value},
+    )
+
+
+def test_rollouter_natural_drain_timeout_quarantines_instead_of_polling_forever():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "native-0")
+    rollouter._natural_drain_timeout_s = 0.01
+
+    class LB:
+        begin_drain = AsyncRemoteMethod(lambda target, operation_id: "s0")
+        has_unsettled_requests = AsyncRemoteMethod(lambda server_id: True)
+
+    class Manager:
+        global_load_balancer = LB()
+
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.ACTIVE}
+            self.replica_kind = {key: ReplicaKind.NATIVE}
+
+        def replica_meta(self, target):
+            return self.replica_kind[target], self.replica_state[target]
+
+        def transition_replica(self, target, state):
+            self.replica_state[target] = state
+
+    manager = Manager()
+    rollouter.llm_server_manager = manager
+
+    with pytest.raises(TimeoutError, match="natural drain"):
+        asyncio.run(
+            rollouter.prepare_exit(
+                key,
+                operation_id="op-timeout",
+                force=False,
+            )
+        )
+
+    assert manager.replica_state[key] is ReplicaState.QUARANTINED
 
 
 def test_rollouter_add_commit_publishes_hidden_borrower_after_e_is_ready():

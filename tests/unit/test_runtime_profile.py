@@ -239,3 +239,11 @@ def test_unknown_profile_and_extra_runtime_selector_are_rejected():
 def test_malformed_parent_sections_fail_explicitly(malformed):
     with pytest.raises(ProfileConfigurationError):
         resolve_runtime_profile(malformed)
+
+
+@pytest.mark.parametrize("value", [0, -1, "300", None, True])
+def test_drain_timeout_must_be_positive_number(value):
+    current = config()
+    current["multitask"]["drain_timeout_s"] = value
+    with pytest.raises(ProfileConfigurationError, match="drain_timeout_s"):
+        validate_runtime_profile(current)

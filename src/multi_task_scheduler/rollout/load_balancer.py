@@ -35,6 +35,9 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         # this survives immediate re-admission on another server until removal
         # commits, so FORCE can verify handoff even after the retry has started.
         self.continuation_handoffs: dict[str, set[str]] = {}
+        # Keep enough SETTLED history for ACK-loss queries without allowing
+        # request facts to grow for the entire task lifetime.
+        self._settled_retention = 10_000
         for key, server_id in dict(initial_routes or {}).items():
             if not isinstance(key, ReplicaKey):
                 raise TypeError("initial route key must be ReplicaKey")
@@ -44,6 +47,21 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
 
     def require_release_fields(self) -> list[str]:
         return ["request_id"]
+
+    def _gc_settled_requests(self) -> None:
+        overflow = len(self.attempt_state) - self._settled_retention
+        if overflow <= 0:
+            return
+        for request_id, state in tuple(self.attempt_state.items()):
+            if overflow <= 0:
+                break
+            if (
+                state is AttemptState.SETTLED
+                and request_id not in self.active_request_server
+            ):
+                self.attempt_state.pop(request_id, None)
+                self.continuation_proofs.pop(request_id, None)
+                overflow -= 1
 
     def acquire_server(self, request_id: str, **extra):
         state = self.attempt_state.get(request_id)
@@ -72,6 +90,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         if request_id and state in {AttemptState.ADMITTED, AttemptState.TERMINATED}:
             self.attempt_state[request_id] = AttemptState.SETTLED
             self.active_request_server.pop(request_id, None)
+            self._gc_settled_requests()
 
     def query_attempt(self, request_id: str):
         return self.attempt_state.get(request_id)
@@ -217,6 +236,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         operation_id = self.draining_operations.pop(server_id, None)
         if operation_id is not None:
             self.continuation_handoffs.pop(operation_id, None)
+        self._gc_settled_requests()
         self.routes.pop(key, None)
         for operation_id, (ready_key, _server_id, _evidence) in tuple(
             self.ready_operations.items()

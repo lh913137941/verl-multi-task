@@ -1,4 +1,4 @@
-From 8fd550572bf4580282e5e80cf74f3408c9acc2ad Mon Sep 17 00:00:00 2001
+From 9f5b131195f848c9d78347179ed02f6fe48c42fc Mon Sep 17 00:00:00 2001
 Subject: [fully_async] feat: add optional multitask task-runner bridge
 
 Baseline: verl v0.10.0.dev, commit f92febf50fe3db102273eaf59b1854f392ae761d
@@ -6,7 +6,7 @@ Baseline: verl v0.10.0.dev, commit f92febf50fe3db102273eaf59b1854f392ae761d
 diff --git a/verl/experimental/fully_async_policy/config/fully_async_ppo_trainer.yaml b/verl/experimental/fully_async_policy/config/fully_async_ppo_trainer.yaml
 --- a/verl/experimental/fully_async_policy/config/fully_async_ppo_trainer.yaml
 +++ b/verl/experimental/fully_async_policy/config/fully_async_ppo_trainer.yaml
-@@ -6,6 +6,13 @@ defaults:
+@@ -6,6 +6,15 @@ defaults:
    - ppo_trainer
    - _self_
  
@@ -14,6 +14,8 @@ diff --git a/verl/experimental/fully_async_policy/config/fully_async_ppo_trainer
 +# enabled=true; runtime.profile alone never activates it.
 +multitask:
 +  enabled: false
++  # Bound natural DONATE/REMOVE drain waits; FORCE has its own shorter handoff deadline.
++  drain_timeout_s: 300.0
 +  runtime:
 +    profile: null
 +

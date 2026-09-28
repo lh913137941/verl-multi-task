@@ -30,7 +30,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main
 `verl.plugins` 自动加载、不 monkey patch 原生类，也不提供另一份训练入口。当前
 v0.10.0.dev 基线固定到 VERL commit `f92febf50fe3db102273eaf59b1854f392ae761d`；
 对应入口接线已提交到 `lh913137941/verl:chatgpt/092203-multitask-entry`
-(commit `8fd550572bf4580282e5e80cf74f3408c9acc2ad`)，并随本仓
+(commit `9f5b131195f848c9d78347179ed02f6fe48c42fc`)，并随本仓
 `patches/verl-v0.10-fully-async-multitask-entry.patch` 一并交付。
 
 ## 首版 profile
@@ -84,7 +84,7 @@ VERL main → resolve_runtime_profile → run_ppo
 
 - **M / Manager**：`replica_state[ReplicaKey]`、`replica_kind[ReplicaKey]`；
 - **E / CE Manager**：`effective_replicas` 和参数侧事实；
-- **R / LB**：原生 route/inflight + `active_request_server` + `attempt_state`；
+- **R / LB**：原生 route/inflight + `active_request_server` + `attempt_state`；SETTLED request 只保留有界 ACK-loss 查询窗口，超出窗口时连同旧 continuation proof 一并回收；
 - **C / Rollouter**：复用原生 `max_concurrent_samples`，生产窗口复用 `paused`。
 
 Trainer 持有唯一同步门 G。不存在公共 `ReplicaRecord` 或 `AttemptRecord`。
@@ -125,12 +125,14 @@ Lease(lease_id, claims, expires_at)
 以下主流程代码已经接通并由 TaskRunner 受理，但仍必须在真实 VERL/vLLM/CUDA/NCCL 组合完成验收；运行时无法证明 placement、权重、请求交接或资源释放时会显式失败/隔离，不用假 handle 或合成证据伪造成功：
 
 - ADD：hidden borrowed create → current-Vpub target bootstrap → E → R/C/M 已端到端接线；真实 GPU/NCCL 验收仍需实际执行；
-- DONATE：自然 drain → E/R/C 退出 → native level-2 sleep → GPU UUID `RELEASED` → GS handoff-ready 已端到端接线；真实同卡让渡闭环仍需实际执行；
+- DONATE：自然 drain → E/R/C 退出 → native level-2 sleep → GPU UUID `RELEASED` → GS handoff-ready 已端到端接线；自然 drain 由 `multitask.drain_timeout_s`（默认 300s）设上限并周期输出等待日志，超时进入隔离而不是无限轮询；真实同卡让渡闭环仍需实际执行；
 - RESTORE 已在内部复用现有 `pending_bootstrap / bootstrap_target / commit_ready` 串起流程；weights-only wake 已移入 Trainer G 内的 CE bootstrap，随后完成当前 Vpub 全量装参、KV 恢复/版本确认并先提交 E，再 full wake、本地 C/M 就绪，最后由 R 对外发布；LB 回包丢失先按 `query_ready_operation()` 对账；E 提交前的 CE/bootstrap 失败可在 G 内 verified re-sleep 回 DORMANT，但 E 一旦 effective，后续 R 明确发布失败会撤销本地 C 并将 M 收口到 QUARANTINED，R 结果未知则保持 runtime awake/ACTIVE 并由 Trainer BLOCK G，禁止在 E 背后单方面 re-sleep。opt-in GPU 验收还会先真实修改 sender output weights，避免只靠 `global_steps` 标签过关；当前环境尚未跑通该 GPU 闭环，但 TaskRunner 已受理 RESTORE，运行时按证据失败/隔离；
 - FORCE_VERIFIED：borrowed-only targeted abort + continuation proof + partial-rollout retry 已接线，并有 opt-in 两 GPU 验收入口；当前会话未实际运行该 GPU 用例；
 - native sleep 后还需用真实 GPU 实验确认显存让渡足以让 borrower 在同一物理 GPU 启动；控制面 receipt/mock 不作为验收。
 
 首版 whole-GPU 借还还要求 VERL `_resolve_sleep_level()==2`；因此 MTP rollout / unmerged LoRA rollout 等会退化为 level-1 sleep 的配置在 runtime profile 阶段直接拒绝，不能生成 `RELEASED`。
+
+paused production window 现在由 Rollouter 内部 reporter 自动向 GS 发送去重后的 idle metadata；报告失败只重试元数据，不中断生成。
 
 因此 `multitask.enabled=true` 目前表示“启用 092203 控制面与 native subclass
 绑定”，不表示 GPU 借还闭环已经通过验收。
