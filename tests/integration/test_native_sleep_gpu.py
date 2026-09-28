@@ -381,6 +381,24 @@ def _training_sender_class():
                 **engine_kwargs,
             )
 
+        @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+        def zero_output_weights_for_restore_acceptance(self):
+            """Test-only mutation proving RESTORE loads a changed Vpub payload."""
+            module = getattr(self.engine.module, "_fsdp_wrapped_module", self.engine.module)
+            get_output_embeddings = getattr(module, "get_output_embeddings", None)
+            if get_output_embeddings is None:
+                raise RuntimeError("acceptance model does not expose output embeddings")
+            output = get_output_embeddings()
+            weight = getattr(output, "weight", None)
+            if weight is None:
+                raise RuntimeError("acceptance model output embedding has no weight")
+            with torch.no_grad():
+                weight.zero_()
+            return {
+                "shape": tuple(weight.shape),
+                "abs_sum": float(weight.detach().float().abs().sum().item()),
+            }
+
         @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
         async def update_weights(self, global_steps: int = None, mode: str = "auto"):
             weights, _ = self.engine.get_per_tensor_param()
@@ -552,6 +570,21 @@ def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
         baseline = generate_once("before-restore")
         assert getattr(baseline, "token_ids", None)
 
+        # Create a genuinely different sender Vpub before the native runtime
+        # sleeps.  This prevents global_steps=17 from acting as a mere label:
+        # successful RESTORE must carry changed tensor data from the sender.
+        mutation = ray.get(
+            actor_wg.execute_checkpoint_engine(
+                ["prepare"] * actor_wg.world_size
+            )
+        )
+        # prepare() above is only a topology-compatible no-op preflight here;
+        # mutate through the test worker's registered business method.
+        mutation_receipts = ray.get(
+            actor_wg.zero_output_weights_for_restore_acceptance()
+        )
+        assert all(receipt["abs_sum"] == 0.0 for receipt in mutation_receipts)
+
         key = ReplicaKey("gpu-acceptance", "native-0")
         manager = MultiTaskLLMServerManager.__new__(MultiTaskLLMServerManager)
         manager.replica_kind = {key: ReplicaKind.NATIVE}
@@ -630,6 +663,9 @@ def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
 
         restored = ray.get(parked_ref, timeout=120)
         assert getattr(restored, "token_ids", None)
-        assert restored.token_ids == baseline.token_ids
+        assert restored.token_ids != baseline.token_ids, (
+            "RESTORE output did not change after the sender Vpub tensor mutation; "
+            "global_steps alone is not sufficient acceptance evidence"
+        )
     finally:
         ray.shutdown()
