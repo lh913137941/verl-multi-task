@@ -465,16 +465,20 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             request_spec = dict(normalized)
             request_spec["claims"] = [dict(claim) for claim in normalized["claims"]]
             request_spec["lease_ids"] = list(normalized["lease_ids"])
-            rank = self._allocate_replica_rank_locked(normalized.get("replica_rank"))
-            resolved_spec = dict(normalized)
-            resolved_spec["claims"] = [dict(claim) for claim in normalized["claims"]]
-            resolved_spec["lease_ids"] = list(normalized["lease_ids"])
-            resolved_spec["replica_rank"] = rank
             replica_key = ReplicaKey(
                 normalized["borrower_task_id"],
                 normalized["borrower_replica_id"],
                 normalized["placement_epoch"],
             )
+            if replica_key in self.replica_state:
+                raise ValueError(
+                    "borrowed ReplicaKey is already registered; use a new runtime_epoch"
+                )
+            rank = self._allocate_replica_rank_locked(normalized.get("replica_rank"))
+            resolved_spec = dict(normalized)
+            resolved_spec["claims"] = [dict(claim) for claim in normalized["claims"]]
+            resolved_spec["lease_ids"] = list(normalized["lease_ids"])
+            resolved_spec["replica_rank"] = rank
             self.register_replica(
                 replica_key,
                 ReplicaKind.BORROWED,
