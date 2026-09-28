@@ -2448,6 +2448,105 @@ def test_group_scheduler_binds_donate_to_lease_donor_rank():
     assert cls._target_matches_donor(ReplicaKey("task-a", "r1"), lease)
     assert not cls._target_matches_donor(ReplicaKey("task-a", "native-0"), lease)
 
+def test_group_scheduler_restore_requires_original_donor_and_returned_claims():
+    path = SOURCE / "scheduler/group_scheduler.py"
+    tree = ast.parse(path.read_text())
+    scheduler = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "GroupScheduler"
+    )
+    scheduler.decorator_list = []
+    module = ast.Module(body=[scheduler], type_ignores=[])
+    env = {
+        "ReplicaKey": ReplicaKey,
+        "ReplicaKind": ReplicaKind,
+        "ActorHandle": object,
+        "Lease": Lease,
+        "OperationCommand": OperationCommand,
+        "OperationEvidence": OperationEvidence,
+        "OperationKind": OperationKind,
+        "OperationRecord": OperationRecord,
+        "RUNTIME_KIND": "test",
+        "EvidenceType": EvidenceType,
+        "_RELEASE_KINDS": {OperationKind.DONATE, OperationKind.REMOVE},
+        "time": time,
+        "ray": FakeRay,
+    }
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), env)
+    cls = env["GroupScheduler"]
+    gs = cls()
+    lease = Lease(
+        "l1",
+        ({
+            "claim_id": "claim-1",
+            "source_lease_id": "source-1",
+            "donor_task_id": "task-a",
+            "donor_replica_rank": 0,
+            "pg_id": "pg",
+            "bundle_index": 0,
+            "node_id": "n0",
+            "gpu_uuid": "u0",
+            "gpu_fraction": 0.5,
+            "cpu_request": 1.0,
+        },),
+    )
+    gs.open_lease(lease)
+
+    class Runner:
+        submit_operation = RemoteMethod(
+            lambda command, lease=None: OperationRecord(command.operation_id)
+        )
+
+    gs.task_runners["task-a"] = Runner()
+
+    with pytest.raises(ValueError, match="does not match the lease donor replica"):
+        gs.submit_operation(
+            OperationCommand(
+                "op-wrong-replica",
+                OperationKind.RESTORE,
+                ReplicaKey("task-a", "native-1"),
+                "l1",
+            )
+        )
+
+    with pytest.raises(ValueError, match="does not own the lease claims"):
+        gs.submit_operation(
+            OperationCommand(
+                "op-wrong-task",
+                OperationKind.RESTORE,
+                ReplicaKey("task-b", "native-0"),
+                "l1",
+            )
+        )
+
+    with pytest.raises(ValueError, match="claims to be fully returned"):
+        gs.submit_operation(
+            OperationCommand(
+                "op-not-returned",
+                OperationKind.RESTORE,
+                ReplicaKey("task-a", "native-0"),
+                "l1",
+            )
+        )
+
+    # Simulate the already-verified borrowed REMOVE release boundary.  The
+    # RESTORE command may proceed only after no lease-owned GPU/bundle remains.
+    gs.active_gpu_owner.pop("u0")
+    gs.active_bundle_owner.pop(("pg", 0))
+    record = gs.submit_operation(
+        OperationCommand(
+            "op-restore",
+            OperationKind.RESTORE,
+            ReplicaKey("task-a", "native-0"),
+            "l1",
+        )
+    )
+    assert record.operation_id == "op-restore"
+    assert gs.operation_commands["op-restore"].target == ReplicaKey(
+        "task-a", "native-0"
+    )
+
+
 def rollouter_class():
     class Parent:
         def __init__(self, *args, **kwargs):
