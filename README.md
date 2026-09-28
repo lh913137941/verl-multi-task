@@ -128,7 +128,7 @@ Lease(lease_id, claims, expires_at)
 - FORCE_VERIFIED 的 targeted abort + continuation 真实闭环；当前只保留 continuation-aware Client/LB 控制面 wiring，TaskRunner/Rollouter 都在任何 drain/abort 副作用前 fail-closed；
 - native sleep 后还需用真实 GPU 实验确认显存让渡足以让 borrower 在同一物理 GPU 启动；控制面 receipt/mock 不作为验收。
 
-首版 whole-GPU 借还还要求 VERL `_resolve_sleep_level()==2`；因此 MTP rollout / LoRA rollout 等会退化为 level-1 sleep 的配置在 runtime profile 阶段直接拒绝，不能生成 `RELEASED`。
+首版 whole-GPU 借还还要求 VERL `_resolve_sleep_level()==2`；因此 MTP rollout / unmerged LoRA rollout 等会退化为 level-1 sleep 的配置在 runtime profile 阶段直接拒绝，不能生成 `RELEASED`。
 
 因此 `multitask.enabled=true` 目前表示“启用 092203 控制面与 native subclass
 绑定”，不表示 GPU 借还闭环已经通过验收。
