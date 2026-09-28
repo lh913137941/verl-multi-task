@@ -1136,7 +1136,11 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     assert receipt["server_address"] == "s-borrowed"
     assert record["resolved_spec"]["replica_rank"] == 0
     borrowed_key = ReplicaKey("task-a", "borrowed-0", 0)
-    assert record["replica_key"] == borrowed_key
+    assert ReplicaKey(
+        record["resolved_spec"]["borrower_task_id"],
+        record["resolved_spec"]["borrower_replica_id"],
+        record["resolved_spec"]["placement_epoch"],
+    ) == borrowed_key
     assert manager.replica_kind[borrowed_key] is ReplicaKind.BORROWED
     assert manager.replica_state[borrowed_key] is ReplicaState.CREATING
     borrowed_runtime = manager.inspect_runtime(borrowed_key)
