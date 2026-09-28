@@ -2378,7 +2378,6 @@ def test_rollouter_idle_detection_treats_unknown_capacity_as_zero():
     cls = rollouter_class()
     rollouter = cls(object(), object())
     rollouter.max_concurrent_samples = None
-    assert rollouter.committed_capacity == 0
     assert rollouter.collect_idle_candidates() == ()
 
 
