@@ -268,11 +268,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
 
         claims = [dict(claim) for claim in lease.claims]
         for rank, claim in enumerate(claims):
-            if claim["gpu_fraction"] != FIRST_RELEASE_RAY_GPU_FRACTION:
-                raise ValueError(
-                    "borrowed claim Ray GPU share does not match "
-                    "max_colocate_count"
-                )
             supplied_rank = claim.get("rank", rank)
             if type(supplied_rank) is not int or supplied_rank != rank:
                 raise ValueError(
