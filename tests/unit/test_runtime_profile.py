@@ -23,7 +23,7 @@ def config():
                 "free_cache_engine": True,
                 "nnodes": 1,
                 "n_gpus_per_node": 8,
-                "tensor_model_parallel_size": 4,
+                "tensor_model_parallel_size": 1,
                 "data_parallel_size": 1,
                 "pipeline_model_parallel_size": 1,
                 "disaggregation": {"enabled": False},
@@ -122,10 +122,11 @@ def test_first_release_scope_rejects_cross_node_dp_pp(field, value):
         validate_runtime_profile(current)
 
 
-def test_tp_must_fit_single_node():
+@pytest.mark.parametrize("tp", [2, 4, 8])
+def test_unverified_tensor_parallelism_is_rejected(tp):
     current = config()
-    current["actor_rollout_ref"]["rollout"]["tensor_model_parallel_size"] = 9
-    with pytest.raises(ProfileConfigurationError, match="TP replica"):
+    current["actor_rollout_ref"]["rollout"]["tensor_model_parallel_size"] = tp
+    with pytest.raises(ProfileConfigurationError, match="tensor_model_parallel_size=1"):
         validate_runtime_profile(current)
 
 
