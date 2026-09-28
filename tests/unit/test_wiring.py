@@ -2313,9 +2313,14 @@ def test_standalone_server_level2_sleep_and_two_phase_wake_keep_admission_fenced
     assert server._submission_paused is True
     assert server._resume_event.is_set is False
 
-    weights_receipt = asyncio.run(server.wake_weights())
+    weights_receipt = asyncio.run(server.wake_up(tags=["weights"]))
     assert weights_receipt["fully_awake"] is False
     assert weights_receipt["sleeping"] is True
+    assert server._submission_paused is True
+    assert server._resume_event.is_set is False
+
+    kv_receipt = asyncio.run(server.resume_kv_cache())
+    assert kv_receipt["kv_cache_resumed"] is True
     assert server._submission_paused is True
     assert server._resume_event.is_set is False
 
@@ -2546,8 +2551,8 @@ def test_standalone_sleep_and_weights_wake_are_idempotent_by_stage():
         ("sleep", 2, "abort")
     ]
 
-    first_weights = asyncio.run(server.wake_weights())
-    second_weights = asyncio.run(server.wake_weights())
+    first_weights = asyncio.run(server.wake_up(tags=["weights"]))
+    second_weights = asyncio.run(server.wake_up(tags=["weights"]))
     assert second_weights == first_weights
     assert [call for call in calls if call[:1] == ("wake",)] == [
         ("wake", ("weights",))
@@ -2599,11 +2604,41 @@ def test_weights_only_wake_never_opens_admission_on_backend_anomaly():
     server._resume_event = Event()
 
     with pytest.raises(RuntimeError, match="weights-only wake unexpectedly"):
-        asyncio.run(server.wake_weights())
+        asyncio.run(server.wake_up(tags=["weights"]))
 
     assert server._submission_paused is True
     assert server._resume_event.set_calls == 0
     assert server._multitask_sleep_stage() == "level2"
+
+
+def test_full_wake_rejects_weights_stage_before_ce_kv_restore():
+    class Event:
+        def clear(self):
+            return None
+
+    class Engine:
+        async def is_sleeping(self):
+            return True
+
+        async def wake_up(self, *, tags=None):
+            raise AssertionError("full wake must fail before touching vLLM")
+
+    server = http_server_class()()
+    server.nnodes = 1
+    server.node_rank = 0
+    server.replica_rank = 0
+    server.config = type(
+        "Config",
+        (),
+        {"enable_sleep_mode": True, "free_cache_engine": True},
+    )()
+    server.engine = Engine()
+    server._multitask_sleep_stage_value = "weights"
+    server._submission_paused = True
+    server._resume_event = Event()
+
+    with pytest.raises(RuntimeError, match="requires CE KV restore"):
+        asyncio.run(server.wake_up())
 
 
 def test_full_wake_rejects_direct_level2_to_awake_skip():
@@ -3244,9 +3279,6 @@ def test_rollouter_prepare_replica_reuses_existing_entry_for_native_restore():
         def replica_meta(self, target):
             calls.append(("replica_meta", target))
             return self.replica_kind[target], self.replica_state[target]
-
-        async def wake_weights(self, target):
-            raise AssertionError("RESTORE pre-bind must not mutate GPU before Trainer G")
 
     rollouter.llm_server_manager = Manager()
     result = asyncio.run(
