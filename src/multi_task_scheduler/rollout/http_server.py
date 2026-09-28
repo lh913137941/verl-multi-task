@@ -163,6 +163,10 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         self._submission_paused = True
         self._resume_event.clear()
         sleeping_before = bool(await engine.is_sleeping())
+        if tags is None and stage == "level2":
+            raise RuntimeError(
+                "full native wake requires weights-only RESTORE preparation"
+            )
         if not sleeping_before:
             # CE target bootstrap wakes KV cache itself.  The final no-tag wake
             # is therefore allowed to act as an admission/health commit after
@@ -170,6 +174,8 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
             # engine remain an error so stale sequencing cannot be hidden.
             if tags is not None:
                 raise RuntimeError("tagged native wake requires a sleeping vLLM engine")
+            if stage not in {"weights", "awake"}:
+                raise RuntimeError("native wake ledger disagrees with vLLM engine")
         else:
             await engine.wake_up(tags=tags)
         sleeping = bool(await engine.is_sleeping())
