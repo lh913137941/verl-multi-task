@@ -59,8 +59,7 @@ data.train_batch_size=0
 data.gen_batch_size=1
 ```
 
-`multitask.enabled=false` 时继续走原生 TaskRunner。显式启用后，缺包、缺依赖、
-profile 不匹配或首版拓扑不满足都会报错，不静默回退到原生 MultiTask 路径。
+`multitask.enabled=false` 或省略 `multitask.enabled` 时继续走原生 TaskRunner；单独设置 `multitask.runtime.profile` 不会隐式启用 MultiTask。显式启用后，缺包、缺依赖、profile 不匹配或首版拓扑不满足都会报错，不静默回退到原生 MultiTask 路径。
 
 ## 创建链与状态所有者
 

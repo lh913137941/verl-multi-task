@@ -35,16 +35,15 @@ def validate_runtime_profile(config) -> bool:
         return False
     if not isinstance(multitask, Mapping):
         raise ProfileConfigurationError("multitask must be a mapping")
-    enabled = multitask.get("enabled", False)
-    if "enabled" in multitask:
-        if type(enabled) is not bool:
-            raise ProfileConfigurationError("multitask.enabled must be a boolean")
-        if not enabled:
-            return False
+    if "enabled" not in multitask:
+        return False
+    enabled = multitask["enabled"]
+    if type(enabled) is not bool:
+        raise ProfileConfigurationError("multitask.enabled must be a boolean")
+    if not enabled:
+        return False
     profile = _select(config, "multitask.runtime.profile", None)
     if profile is None:
-        if not enabled:
-            return False
         profile = PROFILE_ID
     if not isinstance(profile, str) or profile != PROFILE_ID:
         raise ProfileConfigurationError(

@@ -12,7 +12,7 @@ from multi_task_scheduler.integration.verl.runtime_profile import (
 
 def config():
     return {
-        "multitask": {"runtime": {"profile": PROFILE_ID}},
+        "multitask": {"enabled": True, "runtime": {"profile": PROFILE_ID}},
         "actor_rollout_ref": {
             "hybrid_engine": False,
             "rollout": {
@@ -57,6 +57,7 @@ def test_valid_profile_is_not_mutated():
         {"multitask": None},
         {"multitask": {"runtime": None}},
         {"multitask": {"runtime": {"profile": None}}},
+        {"multitask": {"runtime": {"profile": PROFILE_ID}}},
         {"multitask": {"enabled": False}},
         {
             "multitask": {

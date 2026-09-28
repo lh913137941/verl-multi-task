@@ -8,7 +8,7 @@ Current first release: experimental Fully Async, pure STANDALONE, non-PD vLLM, s
 - E / CE Manager: `effective_replicas` and parameter facts.
 - R / LB: native routes/counters + internal `active_request_server` + `attempt_state`.
 - C / Rollouter: committed capacity via native `max_concurrent_samples`; production window reuses native `paused`.
-- Trainer owns the single synchronization gate G. G does not cover long client/runtime waits.
+- Trainer owns the single synchronization gate G. G does not cover long client/runtime waits. A BLOCKED G has no raw reset: only the operation that latched it may run owner-fact reconciliation under the gate and clear it after that reconciliation returns successfully; failed/unknown reconciliation keeps G blocked.
 
 There is no public `ReplicaRecord` or `AttemptRecord`.
 

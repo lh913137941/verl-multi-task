@@ -226,6 +226,12 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             topology_started = True
             self.build_process_group(rollout)
 
+            # Keep native VERL synchronization semantics here. Its
+            # CheckpointEngineManager.update_weights() is async but deliberately
+            # uses blocking ray.get() for the transfer/finalize boundary. Moving
+            # only this target path to a background thread/future would let the
+            # Trainer event loop progress while G still protects an in-flight
+            # collective, diverging from the native ordering contract.
             ray.get(
                 actor_wg.update_weights(
                     global_steps=loaded_version,
