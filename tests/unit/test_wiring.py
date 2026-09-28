@@ -949,6 +949,14 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     key = ReplicaKey("task-a", "r0")
     runtime = type("Runtime", (), {"_server_address": "s0", "_server_handle": "h0"})()
     manager.register_replica(key, ReplicaKind.NATIVE, state=ReplicaState.ACTIVE, runtime=runtime)
+    manager.register_replica(key, ReplicaKind.NATIVE, state=ReplicaState.ACTIVE, runtime=runtime)
+    with pytest.raises(ValueError, match="another runtime"):
+        manager.register_replica(
+            key,
+            ReplicaKind.NATIVE,
+            state=ReplicaState.ACTIVE,
+            runtime=object(),
+        )
     manager.rollout_replicas.append(runtime)
     manager.server_addresses.append("s0")
     manager.server_handles.append("h0")
