@@ -3846,6 +3846,98 @@ def test_rollouter_natural_exit_separates_drain_from_service_commit():
     ]
 
 
+def test_rollouter_natural_exit_retries_idempotent_begin_drain_after_lost_reply():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "r0")
+    calls = []
+    attempts = {"count": 0}
+
+    class LB:
+        async def _begin(self, target, operation_id):
+            attempts["count"] += 1
+            calls.append(("begin", attempts["count"]))
+            if attempts["count"] == 1:
+                raise RuntimeError("reply lost")
+            return "s0"
+
+        begin_drain = type(
+            "Remote",
+            (),
+            {"remote": lambda self, target, operation_id: LB()._begin(target, operation_id)},
+        )()
+        has_unsettled_requests = AsyncRemoteMethod(lambda server_id: False)
+
+    class Manager:
+        global_load_balancer = LB()
+
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.ACTIVE}
+            self.replica_kind = {key: ReplicaKind.BORROWED}
+
+        def replica_meta(self, target):
+            return self.replica_kind[target], self.replica_state[target]
+
+        def transition_replica(self, target, state):
+            calls.append(("state", state))
+            self.replica_state[target] = state
+
+    manager = Manager()
+    rollouter.llm_server_manager = manager
+
+    evidence = asyncio.run(
+        rollouter.prepare_exit(key, operation_id="op-retry")
+    )
+    assert evidence.type is EvidenceType.EXIT_READY
+    assert manager.replica_state[key] is ReplicaState.DRAINING
+    assert calls == [
+        ("state", ReplicaState.DRAINING),
+        ("begin", 1),
+        ("begin", 2),
+    ]
+
+
+def test_rollouter_natural_exit_quarantines_when_drain_start_remains_unknown():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "r0")
+    calls = []
+
+    class LB:
+        begin_drain = AsyncRemoteMethod(
+            lambda target, operation_id: (_ for _ in ()).throw(
+                RuntimeError("drain unavailable")
+            )
+        )
+
+    class Manager:
+        global_load_balancer = LB()
+
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.ACTIVE}
+            self.replica_kind = {key: ReplicaKind.BORROWED}
+
+        def replica_meta(self, target):
+            return self.replica_kind[target], self.replica_state[target]
+
+        def transition_replica(self, target, state):
+            calls.append(("state", state))
+            self.replica_state[target] = state
+
+    manager = Manager()
+    rollouter.llm_server_manager = manager
+
+    with pytest.raises(RuntimeError, match="drain unavailable"):
+        asyncio.run(
+            rollouter.prepare_exit(key, operation_id="op-fail")
+        )
+    assert manager.replica_state[key] is ReplicaState.QUARANTINED
+    assert calls == [
+        ("state", ReplicaState.DRAINING),
+        ("state", ReplicaState.QUARANTINED),
+    ]
+
+
 def test_rollouter_release_failure_quarantines_drained_replica():
     cls = rollouter_class()
     rollouter = cls(object(), object())
