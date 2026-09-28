@@ -163,8 +163,11 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             self.rollout_replicas.remove(runtime)
 
         address = getattr(runtime, "_server_address", None)
+        handle = getattr(runtime, "_server_handle", None)
         if address in self.server_addresses:
             index = self.server_addresses.index(address)
+            if index >= len(self.server_handles) or self.server_handles[index] != handle:
+                raise RuntimeError("native service address/handle inventory is inconsistent")
             self.server_addresses.pop(index)
             self.server_handles.pop(index)
         return runtime
@@ -178,7 +181,13 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             self.rollout_replicas.append(runtime)
         address = getattr(runtime, "_server_address", None)
         handle = getattr(runtime, "_server_handle", None)
-        if address and address not in self.server_addresses:
+        if not isinstance(address, str) or not address or handle is None:
+            raise RuntimeError("native runtime lacks a routable server identity")
+        if address in self.server_addresses:
+            index = self.server_addresses.index(address)
+            if index >= len(self.server_handles) or self.server_handles[index] != handle:
+                raise RuntimeError("native service address/handle inventory is inconsistent")
+        else:
             self.server_addresses.append(address)
             self.server_handles.append(handle)
         return runtime
