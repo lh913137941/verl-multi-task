@@ -34,11 +34,23 @@ DP=1、PP=1、non-PD vLLM；TP 必须能在单节点放下并经实际组合验�
    continuation 证明成立后才允许 `TERMINATED`，迟到 release 不得覆盖该终态。
 6. 启动两个隔离的训练 job，检查它们发现同一 detached GS；一个正常退出不影响另一个。
 7. GPU 借还、target-only bootstrap、DONATE sleep、RESTORE wake、FORCE targeted abort
-   和真实 RELEASED 逐卡核验必须单独做 GPU 验收。当前这些原语仍显式
-   `NotImplementedError`，不可把控制面测试当成借还闭环完成。
+   和真实 RELEASED 逐卡核验必须单独做 GPU 验收。当前 level-2 sleep/staged wake、
+   borrowed create/destroy 和 RESTORE 控制面编排已有隔离实现，但 ADD/DONATE/RESTORE/FORCE
+   的 TaskRunner 入口仍 fail-closed；不可把 unit/mock/CPU Ray 测试当成借还闭环完成。
+8. 可先运行真实 DONATE primitive 验收（单卡、真实本地模型）：
+   ```bash
+   VERL_MULTITASK_GPU_MODEL_PATH=/path/to/local/model \
+   python -m pytest -q -s -m gpu_integration \
+     tests/integration/test_native_sleep_gpu.py
+   ```
+   该测试要求真实生成成功、CE worker 报告物理 GPU UUID、level-2 sleep 后
+   `nvidia-smi` 显存显著下降，并确认 weights-only wake 仍处于 partial sleeping。
+   它只证明 sleep/wake primitive，不证明 current-Vpub RESTORE；完整 RESTORE 仍必须由
+   Trainer/CheckpointEngine sender 实际装参并验证 `global_steps == Vpub` 后再验收。
 
 记录完整命令、组合配置、两仓源码版本、环境依赖、实际导入路径、节点/GPU 数量、
-Actor 类型和日志。若没有实际触发中断/续推，只记录该配置运行结果。
+Actor 类型、GPU UUID、sleep 前后显存和日志。若没有实际触发中断/续推或 current-Vpub
+重装，只记录已实际覆盖的能力。
 
 当前分支没有可用的 GitHub Actions 运行结果；README 不声明未执行的 native/GPU
 测试通过。安装说明、状态 owner 与能力边界见 [README](../../README.md)。
