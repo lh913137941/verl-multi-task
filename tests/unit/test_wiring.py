@@ -426,7 +426,7 @@ def test_taskrunner_add_fails_before_hidden_runtime_creation():
         runner.submit_operation(command, lease=taskrunner_lease())
 
     assert launched == []
-    assert runner._ensure_journal().query("op-add") is None
+    assert runner._operation_journal.query("op-add") is None
 
 
 def test_taskrunner_executes_natural_borrowed_remove_and_advances_lease():
@@ -509,7 +509,7 @@ def test_taskrunner_restore_fails_before_journal_or_worker_launch():
         )
 
     assert launched == []
-    assert runner._ensure_journal().query("op-restore") is None
+    assert runner._operation_journal.query("op-restore") is None
 
 
 def test_taskrunner_internal_restore_closes_gs_lease_after_service_commit():
@@ -523,7 +523,7 @@ def test_taskrunner_internal_restore_closes_gs_lease_after_service_commit():
         key,
         "l1",
     )
-    runner._ensure_journal().begin(command)
+    runner._operation_journal.begin(command)
     calls = []
 
     class Rollouter:
@@ -654,7 +654,7 @@ def test_taskrunner_unverified_native_donate_fails_before_drain_or_journal():
         )
 
     assert launched == []
-    assert runner._ensure_journal().query("op-donate") is None
+    assert runner._operation_journal.query("op-donate") is None
 
 
 def test_taskrunner_force_remove_fails_before_drain_or_journal():
@@ -680,7 +680,7 @@ def test_taskrunner_force_remove_fails_before_drain_or_journal():
         )
 
     assert launched == []
-    assert runner._ensure_journal().query("op-force") is None
+    assert runner._operation_journal.query("op-force") is None
 
 
 def test_trainer_donate_parks_native_ce_member_in_existing_pending_set():
