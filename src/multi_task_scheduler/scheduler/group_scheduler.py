@@ -201,19 +201,13 @@ class GroupScheduler:
                     self.borrower_targets[command.lease_id] = command.target
                     staged_borrower = True
             elif command.kind is OperationKind.RESTORE:
-                # Reservation is temporary: it prevents another lease from
-                # claiming the donor slot while the native runtime is waking.
+                # The phase validation above already proved every physical
+                # claim unowned. GroupScheduler is a single-writer actor, so
+                # stage the reservation only after that complete precheck;
+                # avoid check-and-mutate loops that can leave partial state.
                 for bundle_key in lease.bundle_keys:
-                    if self.active_bundle_owner.get(bundle_key) is not None:
-                        raise RuntimeError(
-                            "RESTORE bundle ownership changed during submission"
-                        )
                     self.active_bundle_owner[bundle_key] = command.lease_id
                 for gpu_uuid in lease.gpu_uuids:
-                    if self.active_gpu_owner.get(gpu_uuid) is not None:
-                        raise RuntimeError(
-                            "RESTORE GPU ownership changed during submission"
-                        )
                     self.active_gpu_owner[gpu_uuid] = command.lease_id
                 staged_restore_reservation = True
 
