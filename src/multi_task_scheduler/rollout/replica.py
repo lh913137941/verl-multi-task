@@ -474,7 +474,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
             replica_rank=self.replica_rank,
         )
 
-    async def sleep(self, *args, **kwargs):
+    async def sleep(self):
         """Deep-sleep the retained native runtime through verified server receipts."""
         if self.replica_kind is not ReplicaKind.NATIVE:
             raise ValueError("sleep is valid only for retained NATIVE replicas")
@@ -491,17 +491,17 @@ class MultiTaskvLLMReplica(vLLMReplica):
                 raise RuntimeError("native server did not confirm level-2 sleep")
         return tuple(receipts)
 
-    async def wake_up(self, *args, **kwargs):
-        """Fully wake a retained native runtime after current weights are installed."""
+    async def wake_up(self, tags: list[str] | None = None):
+        """Wake native servers and verify partial/full residency receipts."""
         if self.replica_kind is not ReplicaKind.NATIVE:
             raise ValueError("wake_up is valid only for retained NATIVE replicas")
         servers = tuple(getattr(self, "servers", ()) or ())
         if not servers:
             raise RuntimeError("native replica has no rollout servers to wake")
         receipts = await asyncio.gather(
-            *[server.wake_up.remote(*args, **kwargs) for server in servers]
+            *[server.wake_up.remote(tags=tags) for server in servers]
         )
-        weights_only = kwargs.get("tags") == ["weights"]
+        weights_only = tags == ["weights"]
         for receipt in receipts:
             if not isinstance(receipt, dict):
                 raise TypeError("native server wake returned a non-dict receipt")
