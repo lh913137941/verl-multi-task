@@ -137,23 +137,6 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                 )
                 return
 
-            if service_evidence is None:
-                await lease.guard(
-                    self.checkpoint_manager.remove_effective,
-                    target,
-                )
-                release_evidence = await lease.guard(
-                    self.rollouter.finalize_release.remote,
-                    operation,
-                )
-                _require_evidence(
-                    release_evidence,
-                    operation.operation_id,
-                    EvidenceType.RELEASED,
-                    "ADD no-route rollback",
-                )
-                e_committed = False
-                return release_evidence
             if (
                 isinstance(service_evidence, OperationEvidence)
                 and service_evidence.type is EvidenceType.RELEASED
@@ -247,6 +230,24 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                 self.rollouter.commit_service_change.remote,
                 operation,
             )
+            if service_evidence is None:
+                # R is definitely absent. Remove E before physical destroy.
+                await lease.guard(
+                    self.checkpoint_manager.remove_effective,
+                    target,
+                )
+                release_evidence = await lease.guard(
+                    self.rollouter.finalize_release.remote,
+                    operation,
+                )
+                _require_evidence(
+                    release_evidence,
+                    operation.operation_id,
+                    EvidenceType.RELEASED,
+                    "ADD no-route rollback",
+                )
+                e_committed = False
+                return release_evidence
             if (
                 isinstance(service_evidence, OperationEvidence)
                 and service_evidence.type is EvidenceType.RELEASED

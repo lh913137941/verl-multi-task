@@ -506,7 +506,9 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
             raise RuntimeError("pending lifecycle target has no runtime")
         return (runtime,)
 
-    async def commit_service_change(self, operation: OperationRecord) -> OperationEvidence:
+    async def commit_service_change(
+        self, operation: OperationRecord
+    ) -> OperationEvidence | None:
         """Commit the R/C part of a drained exit while Manager keeps M=DRAINING."""
         if not isinstance(operation, OperationRecord):
             raise TypeError("commit_service_change requires OperationRecord")
