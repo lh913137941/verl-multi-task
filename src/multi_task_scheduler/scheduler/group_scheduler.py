@@ -138,6 +138,12 @@ class GroupScheduler:
                 if expected_target is None or expected_target != command.target:
                     raise ValueError("REMOVE target does not match the borrowed replica")
             elif command.kind is OperationKind.RESTORE:
+                if command.target.task_session != donor_task_id:
+                    raise ValueError("RESTORE target does not own the lease claims")
+                if not self._target_matches_donor(command.target, lease):
+                    raise ValueError(
+                        "RESTORE target does not match the lease donor replica"
+                    )
                 if any(
                     self.active_gpu_owner.get(gpu_uuid) == command.lease_id
                     for gpu_uuid in lease.gpu_uuids
