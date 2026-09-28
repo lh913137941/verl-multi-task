@@ -85,7 +85,6 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             "borrower_replica_id": command.target.replica_id,
             "replica_rank": None,
             "claims": claims,
-            "max_colocate_count": FIRST_RELEASE_MAX_COLOCATE_COUNT,
             "expires_at": lease.expires_at,
             "placement_epoch": command.target.runtime_epoch,
         }
