@@ -16,6 +16,7 @@ from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
     OperationEvidence,
     ReplicaKey,
+    ReplicaKind,
 )
 
 
@@ -237,8 +238,29 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         actor_wg = self.actor_wg
         topology_started = False
         finalized = False
+        native_restore = False
+        native_wake_started = False
+
+        replica_kinds = {
+            getattr(replica, "replica_kind", None)
+            for replica in replicas
+        }
+        if len(replica_kinds) != 1:
+            raise ValueError("pending target contains inconsistent replica kinds")
+        replica_kind = next(iter(replica_kinds))
+        if replica_kind not in {ReplicaKind.NATIVE, ReplicaKind.BORROWED}:
+            raise ValueError("pending target has unsupported replica kind")
+        native_restore = replica_kind is ReplicaKind.NATIVE
 
         try:
+            # Native RESTORE allocates only weight memory under the same G that
+            # serializes parameter publication. ADD targets are already resident.
+            if native_restore:
+                native_wake_started = True
+                await asyncio.gather(
+                    *[replica.wake_up(tags=["weights"]) for replica in replicas]
+                )
+
             # Target is hidden, so active replicas must not be aborted or touched.
             await asyncio.gather(
                 *[replica.release_kv_cache() for replica in replicas]
@@ -288,6 +310,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             )
             return evidence
         except BaseException as exc:
+            cleanup_error = None
             if topology_started and not finalized:
                 try:
                     ray.get(
@@ -299,7 +322,31 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                         )
                     )
                 except BaseException as finalize_exc:
-                    raise RuntimeError(
-                        "target bootstrap failed and checkpoint topology cleanup is unverified"
-                    ) from finalize_exc
+                    cleanup_error = finalize_exc
+
+            # A failed native RESTORE must not escape with a partially awake
+            # retained runtime.  Re-enter proven level-2 sleep while G is still
+            # held; server admission never opens on this path.
+            if native_restore and native_wake_started:
+                try:
+                    receipts = await asyncio.gather(
+                        *[replica.sleep() for replica in replicas]
+                    )
+                    for replica_receipts in receipts:
+                        if not isinstance(replica_receipts, (tuple, list)) or not replica_receipts:
+                            raise RuntimeError("native RESTORE rollback returned no sleep receipts")
+                        if any(
+                            not isinstance(receipt, dict)
+                            or receipt.get("sleep_level") != 2
+                            or receipt.get("sleeping") is not True
+                            for receipt in replica_receipts
+                        ):
+                            raise RuntimeError("native RESTORE rollback did not confirm level-2 sleep")
+                except BaseException as rollback_exc:
+                    cleanup_error = rollback_exc
+
+            if cleanup_error is not None:
+                raise RuntimeError(
+                    "target bootstrap failed and runtime cleanup is unverified"
+                ) from cleanup_error
             raise exc
