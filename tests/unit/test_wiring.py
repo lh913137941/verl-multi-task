@@ -255,6 +255,27 @@ def test_failed_settled_request_readmission_preserves_previous_continuation_proo
     ) == old_evidence
 
 
+def test_continuation_handoff_survives_readmission_until_remove_commit():
+    key0 = ReplicaKey("task-a", "r0")
+    key1 = ReplicaKey("task-a", "r1")
+    lb = load_balancer_class()(
+        {"s0": object(), "s1": object()},
+        initial_routes={key0: "s0", key1: "s1"},
+    )
+    server_id, _ = lb.acquire_server("request-1")
+    old_key = key0 if server_id == "s0" else key1
+    lb.begin_drain(old_key, "op-force")
+    lb.confirm_continuation("request-1", "client-1", "prefix-1")
+    lb.release_server(server_id, request_id="request-1")
+
+    lb.acquire_server("request-1")
+    assert "request-1" not in lb.continuation_proofs
+    assert lb.continuation_handoff_requests("op-force") == ("request-1",)
+
+    lb.finish_remove(old_key)
+    assert lb.continuation_handoff_requests("op-force") == ()
+
+
 def test_lb_commit_ready_is_atomic_and_idempotent():
     key = ReplicaKey("task-a", "borrowed-0")
     handle = object()
@@ -3526,6 +3547,120 @@ def test_rollouter_idle_detection_preserves_committed_capacity_without_reading_l
     assert rollouter.collect_idle_candidates() == ()
 
 
+def test_rollouter_add_commit_publishes_hidden_borrower_after_e_is_ready():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "borrowed-0")
+    calls = []
+
+    class Runtime:
+        _server_address = "s-new"
+        _server_handle = "h-new"
+
+    runtime = Runtime()
+
+    class LB:
+        commit_ready = AsyncRemoteMethod(
+            lambda target, server_id, handle, operation_id:
+            calls.append(("commit_ready", target, server_id, handle, operation_id))
+            or OperationEvidence(
+                operation_id,
+                EvidenceType.SERVICE_COMMITTED,
+                1,
+            )
+        )
+
+    class Manager:
+        global_load_balancer = LB()
+
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.CREATING}
+            self.replica_kind = {key: ReplicaKind.BORROWED}
+
+        def replica_meta(self, target):
+            return self.replica_kind[target], self.replica_state[target]
+
+        def inspect_runtime(self, target):
+            return runtime
+
+        def activate_service(self, target):
+            calls.append(("activate_service", target))
+
+        def deactivate_service(self, target):
+            calls.append(("deactivate_service", target))
+
+        def transition_replica(self, target, state):
+            calls.append(("state", state))
+            self.replica_state[target] = state
+
+    manager = Manager()
+    rollouter.llm_server_manager = manager
+    rollouter._pending_operation_targets["op-add"] = key
+    rollouter._update_max_concurrent_samples = lambda: calls.append(("capacity",))
+
+    evidence = asyncio.run(
+        rollouter.commit_service_change(
+            OperationRecord("op-add", OperationStatus.RUNNING)
+        )
+    )
+
+    assert evidence.type is EvidenceType.SERVICE_COMMITTED
+    assert manager.replica_state[key] is ReplicaState.ACTIVE
+    assert "op-add" not in rollouter._pending_operation_targets
+    assert calls == [
+        ("activate_service", key),
+        ("capacity",),
+        ("state", ReplicaState.ACTIVE),
+        ("commit_ready", key, "s-new", "h-new", "op-add"),
+    ]
+
+
+def test_rollouter_add_pre_publish_rollback_destroys_creating_borrower():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "borrowed-0")
+    calls = []
+
+    class Manager:
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.CREATING}
+            self.replica_kind = {key: ReplicaKind.BORROWED}
+
+        def replica_meta(self, target):
+            return self.replica_kind[target], self.replica_state[target]
+
+        async def destroy(self, target, *, operation_id):
+            calls.append(("destroy", target, operation_id))
+            return OperationEvidence(
+                operation_id,
+                EvidenceType.RELEASED,
+                1,
+                ("u0",),
+            )
+
+        def transition_replica(self, target, state):
+            calls.append(("state", state))
+            self.replica_state[target] = state
+
+    manager = Manager()
+    rollouter.llm_server_manager = manager
+    rollouter._pending_operation_targets["op-add"] = key
+
+    evidence = asyncio.run(
+        rollouter.finalize_release(
+            OperationRecord("op-add", OperationStatus.RUNNING)
+        )
+    )
+
+    assert evidence.type is EvidenceType.RELEASED
+    assert manager.replica_state[key] is ReplicaState.RELEASED
+    assert "op-add" not in rollouter._pending_operation_targets
+    assert calls == [
+        ("destroy", key, "op-add"),
+        ("state", ReplicaState.RELEASED),
+    ]
+
+
 def test_rollouter_prepare_replica_reuses_existing_entry_for_native_restore():
     cls = rollouter_class()
     rollouter = cls(object(), object())
@@ -4127,23 +4262,44 @@ def test_rollouter_verified_borrowed_destroy_commits_released():
     assert "op" not in rollouter._pending_operation_targets
 
 
-def test_rollouter_force_is_fail_closed_before_mutating_m_or_r():
+def test_rollouter_force_aborts_target_replica_and_waits_for_continuation_handoff():
     cls = rollouter_class()
     rollouter = cls(object(), object())
     key = ReplicaKey("task-a", "borrowed-0")
+    calls = []
+    handoff_calls = {"count": 0}
+
     rollouter.config = type(
         "Config",
         (),
         {"async_training": type("Async", (), {"partial_rollout": True})()},
     )()
 
-    class LB:
-        def __getattr__(self, name):
-            raise AssertionError(f"FORCE fail-closed path must not touch LB: {name}")
-
     class Runtime:
         async def abort_all_requests(self):
-            raise AssertionError("FORCE fail-closed path must not abort requests")
+            calls.append(("abort_all_requests",))
+            return {"aborted_count": 1, "request_ids": ["backend-1"]}
+
+    class LB:
+        server_for_replica = AsyncRemoteMethod(lambda target: "s0")
+        get_all_servers = AsyncRemoteMethod(lambda: ["s0", "s1"])
+        begin_drain = AsyncRemoteMethod(
+            lambda target, operation_id:
+            calls.append(("begin_drain", target, operation_id)) or "s0"
+        )
+        requests_for_server = AsyncRemoteMethod(lambda server_id: ("request-1",))
+        query_attempt = AsyncRemoteMethod(lambda request_id: AttemptState.ADMITTED)
+        has_unsettled_requests = AsyncRemoteMethod(lambda server_id: False)
+
+        async def _handoffs(self, operation_id):
+            handoff_calls["count"] += 1
+            return ("request-1",)
+
+        continuation_handoff_requests = type(
+            "Remote",
+            (),
+            {"remote": lambda self, operation_id: LB()._handoffs(operation_id)},
+        )()
 
     class Manager:
         global_load_balancer = LB()
@@ -4159,21 +4315,25 @@ def test_rollouter_force_is_fail_closed_before_mutating_m_or_r():
             return Runtime()
 
         def transition_replica(self, target, state):
-            raise AssertionError("FORCE fail-closed path must not mutate M")
+            calls.append(("state", state))
+            self.replica_state[target] = state
 
     manager = Manager()
     rollouter.llm_server_manager = manager
 
-    with pytest.raises(
-        NotImplementedError,
-        match="verified targeted abort/continuation backend",
-    ):
-        asyncio.run(
-            rollouter.prepare_exit(key, operation_id="op-force", force=True)
-        )
+    evidence = asyncio.run(
+        rollouter.prepare_exit(key, operation_id="op-force", force=True)
+    )
 
-    assert manager.replica_state[key] is ReplicaState.ACTIVE
-    assert "op-force" not in rollouter._pending_operation_targets
+    assert evidence.type is EvidenceType.EXIT_READY
+    assert manager.replica_state[key] is ReplicaState.DRAINING
+    assert rollouter.get_pending_target("op-force") == key
+    assert calls == [
+        ("state", ReplicaState.DRAINING),
+        ("begin_drain", key, "op-force"),
+        ("abort_all_requests",),
+    ]
+    assert handoff_calls["count"] >= 1
 
 
 def test_rollouter_force_rejects_native_before_backend_capability_gate():
