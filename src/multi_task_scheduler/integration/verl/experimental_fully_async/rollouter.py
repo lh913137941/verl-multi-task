@@ -226,14 +226,32 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         replica_key: ReplicaKey,
         *,
         operation_id: str,
-        spec: dict,
+        spec: dict | None,
     ):
+        """Prepare ADD placement or stage a retained native runtime for RESTORE."""
         if not isinstance(replica_key, ReplicaKey):
             raise TypeError("prepare_replica requires ReplicaKey")
         if not isinstance(operation_id, str) or not operation_id:
             raise ValueError("prepare_replica requires operation_id")
+
+        previous_target = self._pending_operation_targets.get(operation_id)
+        if previous_target is not None and previous_target != replica_key:
+            raise ValueError("operation_id is already bound to another replica")
+
+        if spec is None:
+            manager = getattr(self, "llm_server_manager", None)
+            if manager is None:
+                raise RuntimeError("LLM server manager is not initialized")
+            kind, state = manager.replica_meta(replica_key)
+            if kind is not ReplicaKind.NATIVE or state is not ReplicaState.DORMANT:
+                raise ValueError(
+                    "spec-free prepare_replica is valid only for DORMANT native RESTORE"
+                )
+            self._pending_operation_targets[operation_id] = replica_key
+            return await manager.wake_weights(replica_key)
+
         if not isinstance(spec, dict):
-            raise TypeError("prepare_replica requires placement spec")
+            raise TypeError("prepare_replica requires placement spec or None for RESTORE")
         if spec.get("operation_id") != operation_id:
             raise ValueError("placement spec belongs to another operation")
         if spec.get("borrower_task_id") != replica_key.task_session:
@@ -241,9 +259,6 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         if spec.get("borrower_replica_id") != replica_key.replica_id:
             raise ValueError("placement spec belongs to another replica")
 
-        previous_target = self._pending_operation_targets.get(operation_id)
-        if previous_target is not None and previous_target != replica_key:
-            raise ValueError("operation_id is already bound to another replica")
         self._pending_operation_targets[operation_id] = replica_key
         return await self.create_borrowed_replica(spec)
 
@@ -319,13 +334,61 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             raise TypeError("commit_service_change requires OperationRecord")
         target = self.get_pending_target(operation.operation_id)
         manager = self.llm_server_manager
-        _kind, state = manager.replica_meta(target)
+        kind, state = manager.replica_meta(target)
+        lb = manager.global_load_balancer
+
+        # RESTORE reuses the same service-commit boundary after Trainer has
+        # proved current Vpub under G.  The vLLM engine may already be fully
+        # resident because CE resumed KV cache; runtime.wake_up() then acts as
+        # the final local-admission + health commit before R/C/M are published.
+        if state is ReplicaState.DORMANT:
+            if kind is not ReplicaKind.NATIVE:
+                raise ValueError("only NATIVE replicas may restore from DORMANT")
+            try:
+                runtime = manager.inspect_runtime(target)
+                if runtime is None:
+                    raise RuntimeError("native runtime is unavailable for RESTORE commit")
+                receipts = await runtime.wake_up()
+                if not isinstance(receipts, (tuple, list)) or not receipts:
+                    raise RuntimeError("native RESTORE returned no wake receipts")
+                for receipt in receipts:
+                    if not isinstance(receipt, dict):
+                        raise TypeError("native RESTORE wake returned a non-dict receipt")
+                    if receipt.get("fully_awake") is not True or receipt.get("sleeping") is not False:
+                        raise RuntimeError("native RESTORE did not confirm full wake")
+
+                server_id = getattr(runtime, "_server_address", None)
+                server_handle = getattr(runtime, "_server_handle", None)
+                if not isinstance(server_id, str) or not server_id or server_handle is None:
+                    raise RuntimeError("native RESTORE runtime lacks routable server identity")
+                evidence = await lb.commit_ready.remote(
+                    target,
+                    server_id,
+                    server_handle,
+                    operation.operation_id,
+                )
+                if not isinstance(evidence, OperationEvidence):
+                    raise TypeError("RESTORE routing commit returned non-evidence")
+                if evidence.operation_id != operation.operation_id:
+                    raise ValueError("RESTORE service evidence belongs to another operation")
+                if evidence.type is not EvidenceType.SERVICE_COMMITTED:
+                    raise ValueError("RESTORE routing commit did not produce SERVICE_COMMITTED")
+
+                manager.activate_service(target)
+                manager.transition_replica(target, ReplicaState.ACTIVE)
+                self._update_max_concurrent_samples()
+                self._pending_operation_targets.pop(operation.operation_id, None)
+                return evidence
+            except BaseException:
+                if manager.replica_state.get(target) is ReplicaState.DORMANT:
+                    manager.transition_replica(target, ReplicaState.QUARANTINED)
+                raise
+
         if state is not ReplicaState.DRAINING:
             raise ValueError(
                 f"service exit commit requires DRAINING replica, got {state.value}"
             )
 
-        lb = manager.global_load_balancer
         try:
             server_id = await lb.server_for_replica.remote(target)
             if server_id is not None and await lb.has_unsettled_requests.remote(server_id):
