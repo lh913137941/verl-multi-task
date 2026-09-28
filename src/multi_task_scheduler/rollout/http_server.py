@@ -129,14 +129,11 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
                 "global_steps": self.global_steps,
             }
         if stage == "weights":
-            # RESTORE rollback: weights may be resident while KV is still
-            # absent (engine sleeping) or CE may already have restored KV
-            # (engine awake).  Keep admission fenced, make the engine fully
-            # resident if needed, then enter a fresh proven level-2 sleep.
+            # Keep admission fenced; VERL owns KV restore/reset semantics.
             self._submission_paused = True
             self._resume_event.clear()
             if await engine.is_sleeping():
-                await engine.wake_up(tags=["kv_cache"])
+                await super().resume_kv_cache()
                 if await engine.is_sleeping():
                     raise RuntimeError(
                         "RESTORE rollback could not restore KV before deep sleep"
