@@ -8,7 +8,7 @@
       "source_lease_id": "replace-with-source-lease-id",
       "donor_task_id": "__TASK_SESSION__",
       "donor_replica_rank": 0,
-      "pg_id": "replace-with-real-placement-group-name",
+      "pg_id": "replace-with-real-placement-group-id-hex",
       "node_id": "replace-with-real-ray-node-id",
       "gpu_uuid": "replace-with-real-gpu-uuid",
       "bundle_index": 0,
