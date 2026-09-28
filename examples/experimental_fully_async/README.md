@@ -15,7 +15,7 @@
 
 `multitask.enabled=true` 默认选择唯一的
 `experimental_fully_async_standalone` profile。当前首版只支持单节点、整卡、
-DP=1、PP=1、non-PD vLLM；TP 必须能在单节点放下并经实际组合验证。
+DP=1、PP=1、non-PD vLLM；当前真实 GPU 验收仅覆盖 TP=1，因此 TP>1 暂时 fail-closed。
 
 示例只提供接入条件，模型、数据、算法、训练步数以及 trainer/rollout 资源参数继续
 使用原生配置。GS 不分配初始规模；初始 Replica 数量仍由原生 rollout 资源字段决定。
@@ -48,9 +48,10 @@ DP=1、PP=1、non-PD vLLM；TP 必须能在单节点放下并经实际组合验�
    下降，并继续在 donor 的同一 PG bundle/同一 GPU UUID 创建 borrower runtime、完成真实
    生成和 verified destroy，最后确认 donor weights-only wake 仍处于 partial sleeping；
    若至少有 2 张 GPU，还会运行 current-Vpub
-   RESTORE 用例，用真实 FSDP TrainingWorker + NCCL sender 在 level-2 后重新装入完整参数，
-   验证 `global_steps == 17`，并证明生成请求在 final wake 前保持 parked、final wake 后
-   才继续且生成结果与 sleep 前一致。只有第二个用例成功才可作为 RESTORE 数据路径的
+   RESTORE 用例，用真实 FSDP TrainingWorker + NCCL sender；donor 睡眠并完成同卡 borrower
+   借还后，测试 sender 会实际修改 output weights，再由 CE 在 G 内完成 weights-only wake、
+   current-Vpub 全量传输与 KV 恢复，验证 `global_steps == 17`，并证明生成请求在 final wake
+   前保持 parked、final wake 后才继续。只有第二个用例成功才可作为 RESTORE 数据路径的
    GPU 证据，但它仍不等价于完整 GS→TaskRunner 借还业务闭环。
 
 记录完整命令、组合配置、两仓源码版本、环境依赖、实际导入路径、节点/GPU 数量、
