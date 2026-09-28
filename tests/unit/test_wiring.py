@@ -3083,6 +3083,29 @@ def test_group_scheduler_preserves_staging_when_submission_outcome_is_ambiguous(
     assert gs.operation_commands[command.operation_id] == command
 
 
+def test_group_scheduler_rejects_second_add_with_new_operation_id():
+    cls = _isolated_group_scheduler_class()
+    gs = cls()
+    lease = _scheduler_test_lease()
+    gs.open_lease(lease)
+    gs.handoff_ready_leases.add(lease.lease_id)
+
+    class Runner:
+        submit_operation = RemoteMethod(
+            lambda command, lease=None: OperationRecord(command.operation_id)
+        )
+
+    gs.task_runners["task-a"] = Runner()
+    target = ReplicaKey("task-a", "borrowed-0")
+    first = OperationCommand("op-add-1", OperationKind.ADD, target, lease.lease_id)
+    assert gs.submit_operation(first).operation_id == "op-add-1"
+
+    with pytest.raises(ValueError, match="original operation_id"):
+        gs.submit_operation(
+            OperationCommand("op-add-2", OperationKind.ADD, target, lease.lease_id)
+        )
+
+
 def test_group_scheduler_binds_donate_to_lease_donor_rank():
     path = SOURCE / "scheduler/group_scheduler.py"
     tree = ast.parse(path.read_text())
