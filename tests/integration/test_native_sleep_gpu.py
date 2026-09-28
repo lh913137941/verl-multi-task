@@ -576,13 +576,6 @@ def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
         )
         assert destroy_evidence.released_gpu_uuids == release.released_gpu_uuids
 
-        weights_receipts = asyncio.run(manager.wake_weights(key))
-        assert all(
-            receipt["sleeping"] is True
-            and receipt["fully_awake"] is False
-            for receipt in weights_receipts
-        )
-
         checkpoint_manager = MultiTaskCheckpointEngineManager(
             config=checkpoint_config,
             actor_wg=actor_wg,
@@ -593,6 +586,8 @@ def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
             [replica],
             operation_id="gpu-restore",
         )
+        # CE owns the weights-only wake and current-Vpub transfer as one
+        # serialized target-bootstrap boundary. No GPU mutation occurs before it.
         weight_ready = asyncio.run(
             checkpoint_manager.bootstrap_target(
                 key,
