@@ -12,7 +12,7 @@ from verl.experimental.fully_async_policy.fully_async_rollouter import (
 )
 from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
 
-from verl.single_controller.ray.base import _unwrap_ray_remote
+from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
 from multi_task_scheduler.orchestration.contracts import (
     AttemptState,
     EvidenceType,
@@ -115,7 +115,7 @@ class _MultiTaskFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
 
 
 @ray.remote(num_cpus=10, max_concurrency=100)
-class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
+class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter)):
     def __init__(
         self,
         config,

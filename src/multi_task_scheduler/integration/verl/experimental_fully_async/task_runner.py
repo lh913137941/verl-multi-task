@@ -12,7 +12,7 @@ from verl.experimental.fully_async_policy.message_queue import MessageQueueClien
 from verl.experimental.separation.utils import create_resource_pool_manager
 from verl.trainer.ppo.utils import Role
 
-from verl.single_controller.ray.base import _unwrap_ray_remote
+from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
 from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
     Lease,
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 @ray.remote(num_cpus=1, max_concurrency=8)
-class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
+class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunner)):
     """Native run thread plus a small concurrent control surface for GS commands."""
 
     def __init__(self):
