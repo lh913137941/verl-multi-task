@@ -1487,7 +1487,7 @@ def test_borrowed_worker_plan_rejects_donor_topology_or_wrong_identity():
 
     donor_layout = dict(base)
     donor_layout["claims"] = [dict(base["claims"][0], node_rank=9)]
-    with pytest.raises(ValueError, match="one-node borrower rank layout"):
+    with pytest.raises(ValueError, match="rank=node_rank=local_rank=0"):
         replica.build_borrowed_worker_plan(donor_layout)
 
 
