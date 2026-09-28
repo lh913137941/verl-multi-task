@@ -37,11 +37,8 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         return {
             "node_id": ray.get_runtime_context().get_node_id(),
             "replica_rank": self.replica_rank,
-            "node_rank": self.node_rank,
-            "nnodes": self.nnodes,
             "server_address": self._server_address,
             "server_port": self._server_port,
-            "engine_ready": True,
             "global_steps": self.global_steps,
         }
 
