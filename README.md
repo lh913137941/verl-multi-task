@@ -115,7 +115,7 @@ Lease(lease_id, claims, expires_at)
 - RELEASED 必须与已登记的 `operation_id → lease_id` 对应，并完整覆盖 lease 的 GPU UUID 集合；runtime release 无法给出真实证据时 Manager 将目标从 DRAINING 收口到 QUARANTINED。TaskRunner 的同 operation UNKNOWN 重放会先查 Manager RELEASED 账本；若只是 E 已移除后的 R/C ACK 不确定，则在同一 G 下对账并解围栏，不重复释放物理资源；
 - native 参数同步继续复用原生实现，但进入同一个 Trainer G；CE Manager 增加 owner-local pending-bootstrap 投影，borrowed runtime 在 `WEIGHT_READY` 前不会进入父类 `replicas` effective set/普通全成员同步；`bootstrap_target()` 已复用原生 CE `prepare/build_topology/init/update/finalize` 协议只同步 pending target，并要求目标 server 的 `global_steps` 精确等于当前发布版本后才生成幂等 `WEIGHT_READY` receipt，匹配 operation 的证据才能提升为 effective；
 - Queue exactly-once 仍是原生样本之上的逻辑 key + digest 薄层；
-- 空泡上报只选择“移除后仍能保持当前 committed capacity”的 ACTIVE surplus replica，不再把所有 ACTIVE replica 都当作可捐候选；
+- 空泡上报只选择“移除后仍能保持当前 committed capacity”的 ACTIVE surplus replica，不再把所有 ACTIVE replica 都当作可捐候选；GS 对已有 idle report 的 DONATE 只接受 10s 内且包含目标 NATIVE ReplicaKey 的事实；Lease donor 按 Manager/Trainer 的规范身份 `native-{replica_rank}` 精确匹配，不再接受 `r{rank}` 命名别名；
 - borrowed placement 入口已在任何 Ray Actor 副作用前校验 borrower/source lease、claim、world_size、单节点 rank/local_rank、整卡约束和过期时间；Manager 同时按 borrower lease 建立幂等 `borrowed_operations` 记录并单调分配 `replica_rank`，相同 create 重试不会二次分配 rank、冲突重放会被拒绝；随后通过 Ray placement-group table 以 `pg_id` 核验 CREATED 状态、namespace、bundle/node 落点，并借 PG name 恢复后反查 handle id；Manager 内部 runtime backend 已接通 hidden borrowed runtime 创建和 verified borrowed destroy：创建成功只登记 `RUNTIME_READY/CREATING`，不会提前进入 E/R/C；destroy 只有在 server/worker 清理验证完成后才生成带完整 GPU UUID 的 `RELEASED`；`MultiTaskvLLMReplica` 进一步生成确定性的 borrower CE actor name、PG/bundle、Ray GPU/CPU 份额和 borrower rank/world 环境计划；底层 `_create_workers_from_claims()` 已按 claim clone `RayClassWithInitArgs`、建立 borrower 自己的 MASTER 通信根并用 `RayWorkerGroup.from_detached()` 包装新 handles，物理 placement 直接复用 VERL `CheckpointEngineWorker.__ray_call__` 执行只读 node/Ray accelerator/GPU UUID 探针；worker 创建后必须逐 rank 与 claim 核对 node/GPU UUID，失败时按确定性 actor name 执行 kill，并通过 Ray State API 确认不存在非 `DEAD` actor。`MultiTaskvLLMHttpServer` 现在还提供 vLLM `check_health()` 驱动的健康事实与单节点 graceful shutdown；`MultiTaskvLLMReplica.init_from_lease()` 能在底层完成 worker → 原生 `launch_servers()` → engine/server 健康校验，并在失败时按 server/worker 名称执行 shutdown/kill + Ray State `DEAD` 核验。该 hidden-create primitive 已由 Manager 调用，ADD 现已从 TaskRunner 正常受理，并通过 Trainer G 完成 target-only current-Vpub bootstrap、E 提交与 R/C/M 发布；无法证明创建/装参/发布结果时仍按 UNKNOWN/QUARANTINED 规则收口；
 - GS 句柄只保留在 TaskRunner/Rollouter 跨任务边界，不再下沉到 Manager/LB；Manager/LB 只维护本任务 M/R 与 runtime/request 事实；
 - 对外 `OperationCommand` 仍只携带 `lease_id`；GS 在转发给 TaskRunner 时附带同一份已校验 Lease 快照，TaskRunner 只在内部生成 borrowed placement spec，再交给 Rollouter/Manager 校验。
@@ -132,7 +132,7 @@ Lease(lease_id, claims, expires_at)
 
 首版 whole-GPU 借还还要求 VERL `_resolve_sleep_level()==2`；因此 MTP rollout / unmerged LoRA rollout 等会退化为 level-1 sleep 的配置在 runtime profile 阶段直接拒绝，不能生成 `RELEASED`。
 
-paused production window 现在由 Rollouter 内部 reporter 自动向 GS 发送去重后的 idle metadata；报告失败只重试元数据，不中断生成。
+paused production window 现在由 Rollouter 内部 reporter 自动向 GS 发送 idle metadata；相同候选集每 5s 刷新一次，避免 GS 长期持有陈旧 bubble 事实；报告失败只重试元数据，不中断生成。
 
 因此 `multitask.enabled=true` 目前表示“启用 092203 控制面与 native subclass
 绑定”，不表示 GPU 借还闭环已经通过验收。
