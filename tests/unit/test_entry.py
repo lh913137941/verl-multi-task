@@ -20,7 +20,7 @@ def test_current_profile_shape_without_native_import():
                 "free_cache_engine": True,
                 "nnodes": 1,
                 "n_gpus_per_node": 8,
-                "tensor_model_parallel_size": 4,
+                "tensor_model_parallel_size": 1,
                 "data_parallel_size": 1,
                 "pipeline_model_parallel_size": 1,
                 "disaggregation": {"enabled": False},
