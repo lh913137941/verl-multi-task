@@ -71,13 +71,6 @@ def _config(model_path: str):
     return config
 
 
-async def _wake_weights_servers(replica):
-    receipts = await asyncio.gather(
-        *[server.wake_weights.remote() for server in replica.servers]
-    )
-    return tuple(receipts)
-
-
 def test_real_standalone_level2_sleep_releases_device_memory_and_weights_wake_stays_fenced():
     """Prove the DONATE sleep primitive on a real physical GPU.
 
@@ -106,7 +99,15 @@ def test_real_standalone_level2_sleep_releases_device_memory_and_weights_wake_st
 
     from transformers import AutoTokenizer
 
-    from multi_task_scheduler.orchestration.contracts import ReplicaKind
+    from multi_task_scheduler.integration.verl.experimental_fully_async.llm_server_manager import (
+        MultiTaskLLMServerManager,
+    )
+    from multi_task_scheduler.orchestration.contracts import (
+        EvidenceType,
+        ReplicaKey,
+        ReplicaKind,
+        ReplicaState,
+    )
     from multi_task_scheduler.rollout.replica import MultiTaskvLLMReplica
     from verl.utils.tokenizer import normalize_token_ids
 
@@ -116,6 +117,7 @@ def test_real_standalone_level2_sleep_releases_device_memory_and_weights_wake_st
 
     ray.shutdown()
     ray.init(
+        num_cpus=4,
         num_gpus=1,
         runtime_env={
             "env_vars": {
@@ -169,12 +171,18 @@ def test_real_standalone_level2_sleep_releases_device_memory_and_weights_wake_st
         )
         assert getattr(output, "token_ids", None)
 
+        key = ReplicaKey("gpu-acceptance", "native-0")
+        manager = MultiTaskLLMServerManager.__new__(MultiTaskLLMServerManager)
+        manager.replica_kind = {key: ReplicaKind.NATIVE}
+        manager.replica_state = {key: ReplicaState.DRAINING}
+        manager._runtime_inventory = {key: replica}
+
         before_mib = _gpu_memory_used_mib(gpu_uuid)
-        receipts = asyncio.run(replica.sleep())
-        assert all(
-            receipt["sleep_level"] == 2 and receipt["sleeping"] is True
-            for receipt in receipts
+        release = asyncio.run(
+            manager.sleep(key, operation_id="gpu-donate")
         )
+        assert release.type is EvidenceType.RELEASED
+        assert release.released_gpu_uuids == (gpu_uuid,)
         after_mib = _gpu_memory_used_mib(gpu_uuid)
 
         min_release_mib = int(os.environ.get(MIN_RELEASE_ENV, "128"))
@@ -183,7 +191,15 @@ def test_real_standalone_level2_sleep_releases_device_memory_and_weights_wake_st
             f"on {gpu_uuid}; expected at least {min_release_mib} MiB"
         )
 
-        weights_receipts = asyncio.run(_wake_weights_servers(replica))
+        # Exact replay must return byte-for-byte equivalent evidence without
+        # invoking a second vLLM sleep.
+        manager.replica_state[key] = ReplicaState.DORMANT
+        replay = asyncio.run(
+            manager.sleep(key, operation_id="gpu-donate")
+        )
+        assert replay == release
+
+        weights_receipts = asyncio.run(manager.wake_weights(key))
         assert all(
             receipt["sleeping"] is True
             and receipt["fully_awake"] is False
