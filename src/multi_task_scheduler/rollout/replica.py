@@ -379,35 +379,51 @@ class MultiTaskvLLMReplica(vLLMReplica):
             raise exc
 
     async def validate_server_runtime(self) -> dict:
-        """Verify the one-node borrower server and vLLM engine before RUNTIME_READY."""
-        if self.replica_kind is not ReplicaKind.BORROWED:
-            raise ValueError("borrowed server validation is BORROWED-only")
+        """Verify one first-release server/engine for ADD or native RESTORE."""
         if self.nnodes != 1 or len(self.servers) != 1:
-            raise RuntimeError("first release borrowed runtime requires exactly one server")
-        if not self.placement_claims:
-            raise RuntimeError("borrowed runtime has no placement claims")
+            raise RuntimeError("first release runtime validation requires exactly one server")
 
         health = await self.servers[0].runtime_health.remote()
         if not isinstance(health, dict):
             raise TypeError("server runtime health returned a non-dict result")
-        expected_node = self.placement_claims[0]["node_id"]
-        if health.get("node_id") != expected_node:
-            raise RuntimeError("borrowed server landed on unexpected node")
         if health.get("replica_rank") != self.replica_rank:
-            raise RuntimeError("borrowed server replica_rank mismatch")
+            raise RuntimeError("server replica_rank mismatch")
         if health.get("node_rank") != 0 or health.get("nnodes") != 1:
-            raise RuntimeError("borrowed server topology mismatch")
+            raise RuntimeError("server topology mismatch")
         if not health.get("engine_ready"):
-            raise RuntimeError("borrowed vLLM engine is not healthy")
+            raise RuntimeError("vLLM engine is not healthy")
         if not health.get("server_address") or not health.get("server_port"):
-            raise RuntimeError("borrowed HTTP server address is incomplete")
+            raise RuntimeError("HTTP server address is incomplete")
         if self._server_handle is not self.servers[0]:
-            raise RuntimeError("borrowed primary server handle is inconsistent")
+            raise RuntimeError("primary server handle is inconsistent")
         if not self._server_address:
-            raise RuntimeError("borrowed primary server address is missing")
+            raise RuntimeError("primary server address is missing")
 
-        self.borrowed_server_health = dict(health)
-        return self.borrowed_server_health
+        if self.replica_kind is ReplicaKind.BORROWED:
+            if not self.placement_claims:
+                raise RuntimeError("borrowed runtime has no placement claims")
+            expected_node = self.placement_claims[0]["node_id"]
+            if health.get("node_id") != expected_node:
+                raise RuntimeError("borrowed server landed on unexpected node")
+            self.borrowed_server_health = dict(health)
+            return self.borrowed_server_health
+
+        if self.replica_kind is not ReplicaKind.NATIVE:
+            raise ValueError("unsupported replica kind for runtime validation")
+        workers = tuple(getattr(self, "workers", ()) or ())
+        if not workers:
+            raise RuntimeError("native runtime has no CE workers for health validation")
+        placements = await asyncio.gather(
+            *[worker.runtime_placement.remote() for worker in workers]
+        )
+        worker_nodes = {
+            placement.get("node_id")
+            for placement in placements
+            if isinstance(placement, dict)
+        }
+        if len(worker_nodes) != 1 or health.get("node_id") not in worker_nodes:
+            raise RuntimeError("native server/worker node placement mismatch")
+        return dict(health)
 
     async def _shutdown_servers_verified(self) -> None:
         servers = list(getattr(self, "servers", []) or [])
