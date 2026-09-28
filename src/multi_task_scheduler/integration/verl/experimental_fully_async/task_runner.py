@@ -217,14 +217,40 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                 lease = self._operation_leases.get(operation_id)
                 if lease is None:
                     raise RuntimeError("ADD lost its immutable Lease snapshot")
-                placement_spec = self._build_borrowed_spec(command, lease)
-                ray.get(
+                try:
+                    placement_spec = self._build_borrowed_spec(command, lease)
+                except (TypeError, ValueError) as exc:
+                    with self._journal_lock:
+                        self._operation_journal.finish(
+                            operation_id,
+                            OperationStatus.FAILED,
+                            f"ADD placement validation failed: {type(exc).__name__}: {exc}",
+                        )
+                    return
+                prepare_result = ray.get(
                     rollouter.prepare_replica.remote(
                         command.target,
                         operation_id=operation_id,
                         spec=placement_spec,
                     )
                 )
+                if (
+                    isinstance(prepare_result, OperationEvidence)
+                    and prepare_result.type is EvidenceType.RELEASED
+                ):
+                    rollback_evidence = self._require_evidence(
+                        prepare_result,
+                        operation_id=operation_id,
+                        expected=EvidenceType.RELEASED,
+                    )
+                    self._advance_lease(command, rollback_evidence)
+                    with self._journal_lock:
+                        self._operation_journal.finish(
+                            operation_id,
+                            OperationStatus.FAILED,
+                            "ADD prepare failed; no borrower runtime remains",
+                        )
+                    return
                 evidence = ray.get(trainer.bootstrap_and_publish.remote(operation))
                 if (
                     isinstance(evidence, OperationEvidence)

@@ -513,6 +513,55 @@ def test_taskrunner_verified_add_rollback_finishes_failed_and_advances_lease():
     ]
 
 
+def test_taskrunner_verified_add_prepare_failure_skips_trainer_and_finishes_failed():
+    runner = taskrunner_class()()
+    runner.task_session = "task-a"
+    runner._control_ready = True
+    runner._launch_operation = lambda operation_id: None
+    key = ReplicaKey("task-a", "borrowed-0")
+    calls = []
+
+    class Rollouter:
+        prepare_replica = RemoteMethod(
+            lambda target, **kwargs: OperationEvidence(
+                kwargs["operation_id"],
+                EvidenceType.RELEASED,
+                2,
+                ("u0",),
+            )
+        )
+
+    class Trainer:
+        bootstrap_and_publish = RemoteMethod(
+            lambda operation: (_ for _ in ()).throw(
+                AssertionError("known-safe prepare failure must not enter Trainer")
+            )
+        )
+
+    class GroupScheduler:
+        advance_lease = RemoteMethod(
+            lambda lease_id, evidence: calls.append(
+                ("advance_lease", lease_id, evidence.type, evidence.released_gpu_uuids)
+            )
+            or {"add_rolled_back": True}
+        )
+
+    runner.components = {"rollouter": Rollouter(), "trainer": Trainer()}
+    runner.group_scheduler = GroupScheduler()
+    runner.submit_operation(
+        OperationCommand("op-add-prepare-fail", OperationKind.ADD, key, "l1"),
+        lease=taskrunner_lease(),
+    )
+    runner._execute_operation("op-add-prepare-fail")
+
+    record = runner.query_operation("op-add-prepare-fail")
+    assert record.status is OperationStatus.FAILED
+    assert record.result == "ADD prepare failed; no borrower runtime remains"
+    assert calls == [
+        ("advance_lease", "l1", EvidenceType.RELEASED, ("u0",)),
+    ]
+
+
 def test_taskrunner_replays_identical_lease_evidence_after_ack_loss():
     runner = taskrunner_class()()
     command = OperationCommand(
@@ -1534,6 +1583,25 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         manager._resolve_placement_groups(
             manager.validate_borrowed_spec(wrong_namespace)["claims"]
         )
+
+    # Failure before a runtime object exists is a known zero-side-effect
+    # landing: the Manager records RELEASED rather than quarantining the key.
+    original_resolver = manager._resolve_placement_groups
+    manager._resolve_placement_groups = lambda claims: (_ for _ in ()).throw(
+        RuntimeError("placement lookup failed before runtime creation")
+    )
+    pre_runtime_failure = dict(
+        valid_spec,
+        operation_id="op-add-pre-runtime-failure",
+        lease_id="borrower-lease-pre-runtime-failure",
+        borrower_replica_id="borrowed-pre-runtime-failure",
+        replica_rank=None,
+    )
+    with pytest.raises(RuntimeError, match="before runtime creation"):
+        asyncio.run(manager.create_borrowed_replica(pre_runtime_failure))
+    pre_runtime_key = ReplicaKey("task-a", "borrowed-pre-runtime-failure", 0)
+    assert manager.replica_state[pre_runtime_key] is ReplicaState.RELEASED
+    manager._resolve_placement_groups = original_resolver
 
     wrong_node = dict(valid_spec)
     wrong_node["claims"] = [
@@ -4143,6 +4211,40 @@ def test_rollouter_add_pre_publish_rollback_destroys_creating_borrower():
         ("destroy", key, "op-add"),
         ("state", ReplicaState.RELEASED),
     ]
+
+
+def test_rollouter_add_prepare_returns_release_when_manager_proves_cleanup():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "borrowed-0")
+
+    class Manager:
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.RELEASED}
+            self.replica_kind = {key: ReplicaKind.BORROWED}
+
+        async def create_borrowed_replica(self, spec):
+            raise RuntimeError("create failed after verified cleanup")
+
+    rollouter.llm_server_manager = Manager()
+    spec = {
+        "operation_id": "op-add",
+        "borrower_task_id": "task-a",
+        "borrower_replica_id": "borrowed-0",
+        "claims": [{"gpu_uuid": "u0"}],
+    }
+
+    evidence = asyncio.run(
+        rollouter.prepare_replica(
+            key,
+            operation_id="op-add",
+            spec=spec,
+        )
+    )
+
+    assert evidence.type is EvidenceType.RELEASED
+    assert evidence.released_gpu_uuids == ("u0",)
+    assert "op-add" not in rollouter._pending_operation_targets
 
 
 def test_rollouter_prepare_replica_reuses_existing_entry_for_native_restore():

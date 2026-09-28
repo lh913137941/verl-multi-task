@@ -228,8 +228,11 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         """Emit one metadata report per distinct paused surplus set."""
         while True:
             await asyncio.sleep(1.0)
+            # fit() owns cancellation of this reporter. Do not exit merely
+            # because native super().fit() has not set running=True yet.
             if not getattr(self, "running", False):
-                return
+                self._idle_report_signature = None
+                continue
             if not getattr(self, "paused", False) or self.group_scheduler is None:
                 self._idle_report_signature = None
                 continue
@@ -304,7 +307,34 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
             raise ValueError("placement spec belongs to another replica")
 
         self._pending_operation_targets[operation_id] = replica_key
-        return await manager.create_borrowed_replica(spec)
+        try:
+            return await manager.create_borrowed_replica(spec)
+        except BaseException:
+            state = manager.replica_state.get(replica_key)
+            kind = manager.replica_kind.get(replica_key)
+            # create_borrowed_replica reaches RELEASED only after verified
+            # cleanup. A missing M entry means validation failed before runtime
+            # registration, which is also a zero-side-effect failure.
+            if state is None or (
+                kind is ReplicaKind.BORROWED and state is ReplicaState.RELEASED
+            ):
+                gpu_uuids = tuple(
+                    dict.fromkeys(
+                        claim.get("gpu_uuid")
+                        for claim in tuple(spec.get("claims") or ())
+                        if isinstance(claim, dict)
+                        and isinstance(claim.get("gpu_uuid"), str)
+                        and claim["gpu_uuid"]
+                    )
+                )
+                if gpu_uuids:
+                    self._pending_operation_targets.pop(operation_id, None)
+                    return OperationEvidence.now(
+                        operation_id,
+                        EvidenceType.RELEASED,
+                        released_gpu_uuids=gpu_uuids,
+                    )
+            raise
 
     async def prepare_exit(
         self,

@@ -438,9 +438,13 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
 
             async with self.replica_operation_lock:
                 current = self.borrowed_operations[lease_id]
+                # Before a runtime object exists, create_borrowed_replica has not
+                # entered init_from_lease(), so no borrower actor/server side
+                # effect is owned by this operation. That is a known-safe landing,
+                # equivalent to verified cleanup for lifecycle compensation.
                 cleanup_verified = bool(
-                    runtime is not None
-                    and getattr(runtime, "borrowed_cleanup_verified", False)
+                    runtime is None
+                    or getattr(runtime, "borrowed_cleanup_verified", False)
                 )
                 if self.replica_state.get(replica_key) is ReplicaState.CREATING:
                     self.transition_replica(
