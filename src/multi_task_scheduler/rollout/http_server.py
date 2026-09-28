@@ -74,16 +74,7 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
             await asyncio.to_thread(engine.shutdown)
             self.engine = None
 
-        address = self._server_address
-        port = self._server_port
         self._server_port = None
-        return {
-            "node_id": ray.get_runtime_context().get_node_id(),
-            "replica_rank": self.replica_rank,
-            "server_address": address,
-            "server_port": port,
-            "shutdown": True,
-        }
 
     def _require_sleep_engine(self):
         if self.nnodes != 1 or self.node_rank != 0:
