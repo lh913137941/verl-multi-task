@@ -58,6 +58,9 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         self.retired_replica_ranks: set[int] = set()
         self._allocated_replica_ranks: set[int] = set()
         self.borrowed_operations: dict[str, dict] = {}
+        self._native_release_evidence: dict[
+            str, tuple[ReplicaKey, OperationEvidence]
+        ] = {}
         self.replica_operation_lock = asyncio.Lock()
 
     async def _initialize_llm_servers(self, start_rank: int = 0):
@@ -141,11 +144,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         if new_state is ReplicaState.RELEASED:
             self._runtime_inventory.pop(key, None)
         return new_state
-
-    def _native_release_receipts(self) -> dict[str, tuple[ReplicaKey, OperationEvidence]]:
-        if not hasattr(self, "_native_release_evidence"):
-            self._native_release_evidence = {}
-        return self._native_release_evidence
 
     def replica_meta(self, key: ReplicaKey) -> tuple[ReplicaKind, ReplicaState]:
         return self.replica_kind[key], self.replica_state[key]
@@ -602,7 +600,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         if self.replica_kind.get(key) is not ReplicaKind.NATIVE:
             raise ValueError("sleep is valid only for NATIVE replicas")
 
-        previous = self._native_release_receipts().get(operation_id)
+        previous = self._native_release_evidence.get(operation_id)
         if previous is not None:
             previous_key, evidence = previous
             if previous_key != key:
@@ -647,7 +645,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             EvidenceType.RELEASED,
             released_gpu_uuids=tuple(gpu_uuids),
         )
-        self._native_release_receipts()[operation_id] = (key, evidence)
+        self._native_release_evidence[operation_id] = (key, evidence)
         return evidence
 
     async def destroy(
