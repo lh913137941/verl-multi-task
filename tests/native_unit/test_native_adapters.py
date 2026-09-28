@@ -16,6 +16,7 @@ from multi_task_scheduler.integration.verl.experimental_fully_async.llm_server_m
     MultiTaskLLMServerManager,
 )
 from multi_task_scheduler.integration.verl.experimental_fully_async.message_queue import (
+    DuplicateCompletionError,
     MultiTaskMessageQueue,
 )
 from multi_task_scheduler.integration.verl.experimental_fully_async.rollouter import (
@@ -35,7 +36,6 @@ from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
     ReplicaKey,
 )
-from multi_task_scheduler.orchestration.exactly_once import DuplicateCompletionError
 from multi_task_scheduler.rollout.load_balancer import MultiTaskGlobalRequestLoadBalancer
 
 pytestmark = pytest.mark.native
