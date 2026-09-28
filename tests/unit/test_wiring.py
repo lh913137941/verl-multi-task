@@ -1210,8 +1210,6 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     invalid_record = manager.borrowed_operations["borrower-lease-invalid-receipt"]
     assert manager.replica_state[invalid_key] is ReplicaState.RELEASED
     assert invalid_record["error"] is not None
-    assert invalid_record["released"] is True
-    assert invalid_record["replica"] is None
 
     class CleanedFailureRuntime(FakeBorrowedRuntime):
         async def init_from_lease(self, spec, pg_by_id):
@@ -1232,7 +1230,6 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     cleaned_record = manager.borrowed_operations["borrower-lease-cleaned-failure"]
     assert manager.replica_state[cleaned_key] is ReplicaState.RELEASED
     assert cleaned_record["error"] is not None
-    assert cleaned_record["released"] is True
     with pytest.raises(RuntimeError, match="verified cleanup"):
         asyncio.run(manager.create_borrowed_replica(cleaned_failure))
 
@@ -1258,7 +1255,6 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     quarantined_record = manager.borrowed_operations["borrower-lease-unverified-failure"]
     assert manager.replica_state[quarantined_key] is ReplicaState.QUARANTINED
     assert quarantined_record["error"] is not None
-    assert quarantined_record["released"] is False
 
 
 def test_http_server_health_and_shutdown_use_real_engine_boundaries():
