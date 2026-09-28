@@ -512,10 +512,4 @@ class MultiTaskvLLMReplica(vLLMReplica):
                 raise RuntimeError("native server did not confirm full wake")
         return tuple(receipts)
 
-    def _setup_env_cuda_visible_devices(self, *args, **kwargs):
-        if self.replica_kind is ReplicaKind.BORROWED:
-            raise NotImplementedError(
-                "borrowed replica requires a verified lease-aware GPU binding backend"
-            )
-        return super()._setup_env_cuda_visible_devices(*args, **kwargs)
 
