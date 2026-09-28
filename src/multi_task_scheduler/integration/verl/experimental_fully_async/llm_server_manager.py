@@ -253,6 +253,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
 
         normalized = dict(spec)
         normalized.pop("world_size", None)
+        normalized.pop("max_colocate_count", None)
         normalized["claims"] = claims
         normalized["placement_epoch"] = placement_epoch
         normalized["expires_at"] = lease.expires_at
