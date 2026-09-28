@@ -1108,7 +1108,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
 
     wrong_namespace = dict(valid_spec)
     wrong_namespace["claims"] = [
-        dict(valid_spec["selected_slots"][0], pg_namespace="other")
+        dict(valid_spec["claims"][0], pg_namespace="other")
     ]
     with pytest.raises(ValueError, match="another Ray namespace"):
         manager._resolve_placement_groups(
@@ -1117,7 +1117,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
 
     wrong_node = dict(valid_spec)
     wrong_node["claims"] = [
-        dict(valid_spec["selected_slots"][0], node_id="n9")
+        dict(valid_spec["claims"][0], node_id="n9")
     ]
     with pytest.raises(ValueError, match="node_id does not match"):
         manager._resolve_placement_groups(
