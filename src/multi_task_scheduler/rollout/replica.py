@@ -249,71 +249,51 @@ class MultiTaskvLLMReplica(vLLMReplica):
         spec: dict,
         pg_by_id: dict[str, object],
     ) -> RayWorkerGroup:
-        """Create borrower-owned CE actors on the exact claimed PG bundles.
-
-        Manager uses this only for the hidden borrowed runtime transaction;
-        service publication remains separate and fail-closed until bootstrap is
-        verified end to end.
-        """
-        plan = self.build_borrowed_worker_plan(spec)
-        expected_pg_ids = {item["pg_id"] for item in plan}
-        if set(pg_by_id) != expected_pg_ids:
+        """Create the verified TP=1 borrower CE actor on its claimed PG bundle."""
+        item = self.build_borrowed_worker_plan(spec)[0]
+        if set(pg_by_id) != {item["pg_id"]}:
             raise ValueError("placement-group handles do not exactly cover claims")
 
-        first = plan[0]
+        pg = pg_by_id[item["pg_id"]]
         master_addr, master_port = await self._get_master_addr_port_for_slot(
-            pg_by_id[first["pg_id"]],
-            first["bundle_index"],
+            pg, item["bundle_index"]
         )
         base = self.get_ray_class_with_init_args()
-        workers = []
-        names = []
+        actor_args = RayClassWithInitArgs(base.cls, *base.args, **base.kwargs)
+        env_vars = dict(item["env_vars"], MASTER_ADDR=str(master_addr), MASTER_PORT=str(master_port))
+        actor_args.update_options(
+            {
+                "name": item["actor_name"],
+                "num_cpus": item["num_cpus"],
+                "runtime_env": {"env_vars": env_vars},
+            }
+        )
+        worker = None
         try:
-            for item in plan:
-                actor_args = RayClassWithInitArgs(
-                    base.cls,
-                    *base.args,
-                    **base.kwargs,
-                )
-                env_vars = dict(item["env_vars"])
-                env_vars["MASTER_ADDR"] = str(master_addr)
-                env_vars["MASTER_PORT"] = str(master_port)
-                actor_args.update_options(
-                    {
-                        "name": item["actor_name"],
-                        "num_cpus": item["num_cpus"],
-                        "runtime_env": {"env_vars": env_vars},
-                    }
-                )
-                worker = actor_args(
-                    placement_group=pg_by_id[item["pg_id"]],
-                    placement_group_bundle_idx=item["bundle_index"],
-                    use_gpu=True,
-                    num_gpus=item["num_gpus"],
-                    device_name=get_device_name(),
-                )
-                workers.append(worker)
-                names.append(item["actor_name"])
-
-            bind_args = RayClassWithInitArgs(
-                base.cls,
-                *base.args,
-                **base.kwargs,
+            worker = actor_args(
+                placement_group=pg,
+                placement_group_bundle_idx=item["bundle_index"],
+                use_gpu=True,
+                num_gpus=item["num_gpus"],
+                device_name=get_device_name(),
             )
             worker_group = RayWorkerGroup.from_detached(
-                worker_handles=workers,
-                ray_cls_with_init=bind_args,
+                worker_handles=[worker],
+                ray_cls_with_init=RayClassWithInitArgs(base.cls, *base.args, **base.kwargs),
                 name_prefix=f"borrowed_ce_{self.replica_rank}_",
                 use_gpu=True,
                 device_name=get_device_name(),
             )
             self.workers = list(worker_group.workers)
-            self.borrowed_worker_names = tuple(names)
+            self.borrowed_worker_names = (item["actor_name"],)
             await self.validate_worker_placement()
             return worker_group
         except BaseException as exc:
             try:
-                await self._kill_workers_verified(workers, tuple(names))
+                await self._kill_workers_verified(
+                    [] if worker is None else [worker],
+                    (item["actor_name"],) if worker is not None else (),
+                )
             except BaseException as cleanup_exc:
                 self.workers = []
                 raise RuntimeError(
