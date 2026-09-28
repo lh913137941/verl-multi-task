@@ -127,7 +127,11 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             daemon=True,
         )
         self._operation_threads[operation_id] = worker
-        worker.start()
+        try:
+            worker.start()
+        except BaseException:
+            self._operation_threads.pop(operation_id, None)
+            raise
 
     def submit_operation(
         self,
@@ -192,6 +196,8 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                 self._launch_operation(command.operation_id)
             except BaseException as exc:
                 with self._journal_lock:
+                    self._operation_threads.pop(command.operation_id, None)
+                    self._operation_leases.pop(command.operation_id, None)
                     self._ensure_journal().finish(
                         command.operation_id,
                         OperationStatus.FAILED,
