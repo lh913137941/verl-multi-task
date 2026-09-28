@@ -1866,13 +1866,22 @@ def test_standalone_server_rejects_configs_that_cannot_use_level2_sleep():
         (),
         {"enable_sleep_mode": True, "free_cache_engine": True},
     )()
+    class Event:
+        def __init__(self):
+            self.clear_calls = 0
+
+        def clear(self):
+            self.clear_calls += 1
+
     server.engine = Engine()
     server._resolve_sleep_level = lambda: 1
     server._submission_paused = False
-    server._resume_event = type("Event", (), {"clear": lambda self: None})()
+    server._resume_event = Event()
 
     with pytest.raises(NotImplementedError, match="level-2 sleep"):
         asyncio.run(server.sleep())
+    assert server._submission_paused is False
+    assert server._resume_event.clear_calls == 0
 
 
 def test_restore_partial_wake_makes_release_kv_cache_idempotent():
