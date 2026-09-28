@@ -394,9 +394,10 @@ def _training_sender_class():
                 raise RuntimeError("acceptance model output embedding has no weight")
             with torch.no_grad():
                 weight.zero_()
+            local_weight = weight.to_local() if hasattr(weight, "to_local") else weight
             return {
                 "shape": tuple(weight.shape),
-                "abs_sum": float(weight.detach().float().abs().sum().item()),
+                "abs_sum": float(local_weight.detach().float().abs().sum().item()),
             }
 
         @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
