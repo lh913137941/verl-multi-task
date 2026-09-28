@@ -206,8 +206,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
                 raise RuntimeError(
                     f"borrower rank {claim['rank']} landed on unexpected GPU UUID"
                 )
-        self.borrowed_worker_placement = tuple(dict(item) for item in placements)
-        return self.borrowed_worker_placement
+        return placements
 
     @staticmethod
     def _non_dead_actor_names(
@@ -373,8 +372,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
             expected_node = self.placement_claims[0]["node_id"]
             if health.get("node_id") != expected_node:
                 raise RuntimeError("borrowed server landed on unexpected node")
-            self.borrowed_server_health = dict(health)
-            return self.borrowed_server_health
+            return dict(health)
 
         if self.replica_kind is not ReplicaKind.NATIVE:
             raise ValueError("unsupported replica kind for runtime validation")
@@ -447,16 +445,14 @@ class MultiTaskvLLMReplica(vLLMReplica):
         self.rollout_mode = RolloutMode.STANDALONE
         self.nnodes = 1
         self.gpus_per_replica_node = self.world_size
-        self.borrowed_runtime_state = "CREATING"
         self.borrowed_cleanup_verified = False
 
         try:
             await self._create_workers_from_claims(spec, pg_by_id)
             await self.launch_servers()
             health = await self.validate_server_runtime()
-            self.borrowed_runtime_state = "RUNTIME_READY"
             return {
-                "state": self.borrowed_runtime_state,
+                "state": "RUNTIME_READY",
                 "replica_rank": self.replica_rank,
                 "worker_names": tuple(self.borrowed_worker_names),
                 "server_names": tuple(self.borrowed_server_names),
@@ -467,11 +463,9 @@ class MultiTaskvLLMReplica(vLLMReplica):
             try:
                 await self.cleanup_borrowed_runtime()
             except BaseException as cleanup_exc:
-                self.borrowed_runtime_state = "FAILED"
                 raise RuntimeError(
                     "borrowed runtime creation failed and cleanup is unverified"
                 ) from cleanup_exc
-            self.borrowed_runtime_state = "FAILED"
             raise exc
 
     async def sleep(self):
