@@ -406,6 +406,29 @@ def test_taskrunner_minimal_journal_surface_and_replay_does_not_relaunch():
     assert runner.query_operation("missing").status is OperationStatus.UNKNOWN
 
 
+def test_taskrunner_admission_policy_only_allows_natural_remove():
+    runner = taskrunner_class()()
+    key = ReplicaKey("task-a", "r0")
+
+    assert runner._unverified_reason(
+        OperationCommand("op-remove", OperationKind.REMOVE, key, "l1")
+    ) is None
+    assert "target-only parameter bootstrap" in runner._unverified_reason(
+        OperationCommand("op-add", OperationKind.ADD, key, "l1")
+    )
+    assert "STANDALONE sleep backend" in runner._unverified_reason(
+        OperationCommand("op-donate", OperationKind.DONATE, key, "l1")
+    )
+    assert "wake/bootstrap backend" in runner._unverified_reason(
+        OperationCommand("op-restore", OperationKind.RESTORE, key, "l1")
+    )
+    assert "targeted abort/continuation backend" in runner._unverified_reason(
+        OperationCommand(
+            "op-force", OperationKind.REMOVE, key, "l1", force=True
+        )
+    )
+
+
 def test_taskrunner_add_fails_before_hidden_runtime_creation():
     runner = taskrunner_class()()
     runner.task_session = "task-a"
@@ -479,8 +502,10 @@ def test_taskrunner_executes_natural_borrowed_remove_and_advances_lease():
     runner.submit_operation(
         OperationCommand("op-remove", OperationKind.REMOVE, key, "l1")
     )
+    runner._operation_threads["op-remove"] = object()
     runner._execute_operation("op-remove")
 
+    assert "op-remove" not in runner._operation_threads
     record = runner.query_operation("op-remove")
     assert record.status is OperationStatus.SUCCEEDED
     assert record.result == EvidenceType.RELEASED.value
@@ -623,6 +648,7 @@ def test_taskrunner_launch_failure_cleans_temp_thread_and_lease_state():
     )
 
     def fail_launch(operation_id):
+        runner._operation_threads[operation_id] = object()
         runner._operation_leases[operation_id] = taskrunner_lease()
         raise RuntimeError("thread start failed")
 
@@ -630,6 +656,7 @@ def test_taskrunner_launch_failure_cleans_temp_thread_and_lease_state():
     with pytest.raises(RuntimeError, match="thread start failed"):
         runner.submit_operation(command)
 
+    assert "op-remove-launch-fail" not in runner._operation_threads
     assert "op-remove-launch-fail" not in runner._operation_leases
     record = runner.query_operation("op-remove-launch-fail")
     assert record.status is OperationStatus.FAILED
