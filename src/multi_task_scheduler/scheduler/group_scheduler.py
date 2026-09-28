@@ -144,12 +144,17 @@ class GroupScheduler:
                     raise ValueError(
                         "RESTORE target does not match the lease donor replica"
                     )
-                if any(
-                    self.active_gpu_owner.get(gpu_uuid) == command.lease_id
+                gpu_owners = tuple(
+                    self.active_gpu_owner.get(gpu_uuid)
                     for gpu_uuid in lease.gpu_uuids
-                ):
+                )
+                bundle_owners = tuple(
+                    self.active_bundle_owner.get(bundle_key)
+                    for bundle_key in lease.bundle_keys
+                )
+                if any(owner is not None for owner in gpu_owners + bundle_owners):
                     raise ValueError(
-                        "RESTORE requires borrower claims to be fully returned"
+                        "RESTORE requires donor GPU/bundle claims to be fully returned and unclaimed"
                     )
 
         task_runner = self.task_runners.get(command.target.task_session)
