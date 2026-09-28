@@ -306,66 +306,37 @@ def test_taskrunner_minimal_journal_surface_and_replay_does_not_relaunch():
 
     command = OperationCommand(
         "op",
-        OperationKind.ADD,
-        ReplicaKey("task-a", "r0"),
+        OperationKind.REMOVE,
+        ReplicaKey("task-a", "borrowed-0"),
         "l1",
     )
-    lease = taskrunner_lease()
-    assert runner.submit_operation(command, lease=lease).status is OperationStatus.ACCEPTED
-    assert runner.submit_operation(command, lease=lease).status is OperationStatus.ACCEPTED
+    assert runner.submit_operation(command).status is OperationStatus.ACCEPTED
+    assert runner.submit_operation(command).status is OperationStatus.ACCEPTED
     assert launched == ["op"]
     assert runner.query_operation("missing").status is OperationStatus.UNKNOWN
 
 
-def test_taskrunner_executes_add_and_commits_terminal_record():
-    cls = taskrunner_class()
-    runner = cls()
+def test_taskrunner_add_fails_before_hidden_runtime_creation():
+    runner = taskrunner_class()()
     runner.task_session = "task-a"
     runner._control_ready = True
-    runner._launch_operation = lambda operation_id: None
-
-    prepared = []
-
-    class Rollouter:
-        prepare_replica = RemoteMethod(
-            lambda target, **kwargs: prepared.append((target, kwargs)) or None
-        )
-
-    class Trainer:
-        bootstrap_and_publish = RemoteMethod(
-            lambda operation: OperationEvidence(
-                operation.operation_id,
-                EvidenceType.SERVICE_COMMITTED,
-                1,
-            )
-        )
-
-    runner.components = {"rollouter": Rollouter(), "trainer": Trainer()}
+    launched = []
+    runner._launch_operation = launched.append
     command = OperationCommand(
-        "op",
+        "op-add",
         OperationKind.ADD,
-        ReplicaKey("task-a", "r0"),
+        ReplicaKey("task-a", "borrowed-0"),
         "l1",
     )
-    runner.submit_operation(command, lease=taskrunner_lease())
-    runner._execute_operation("op")
 
-    record = runner.query_operation("op")
-    assert record.status is OperationStatus.SUCCEEDED
-    assert record.result == EvidenceType.SERVICE_COMMITTED.value
-    assert prepared[0][0] == command.target
-    assert prepared[0][1]["operation_id"] == "op"
-    spec = prepared[0][1]["spec"]
-    assert spec["lease_id"] == "l1"
-    assert spec["lease_ids"] == ["source-lease-0"]
-    assert spec["borrower_task_id"] == "task-a"
-    assert spec["borrower_replica_id"] == "r0"
-    assert spec["selected_slots"][0]["rank"] == 0
-    assert spec["max_colocate_count"] == FIRST_RELEASE_MAX_COLOCATE_COUNT
-    assert (
-        spec["selected_slots"][0]["gpu_fraction"]
-        == FIRST_RELEASE_RAY_GPU_FRACTION
-    )
+    with pytest.raises(
+        NotImplementedError,
+        match="verified target-only parameter bootstrap",
+    ):
+        runner.submit_operation(command, lease=taskrunner_lease())
+
+    assert launched == []
+    assert runner._ensure_journal().query("op-add") is None
 
 
 def test_taskrunner_borrowed_spec_rebuilds_rank_view_from_claim_order():
@@ -412,42 +383,50 @@ def test_taskrunner_add_requires_matching_lease_snapshot_before_launch():
         runner.submit_operation(command, lease=wrong)
 
 
-def test_release_failure_after_service_commit_keeps_operation_unknown_and_fenced():
+def test_taskrunner_unverified_native_donate_fails_before_drain_or_journal():
     runner = taskrunner_class()()
     runner.task_session = "task-a"
     runner._control_ready = True
-    runner._launch_operation = lambda operation_id: None
-    key = ReplicaKey("task-a", "r0")
+    launched = []
+    runner._launch_operation = launched.append
+    key = ReplicaKey("task-a", "native-0")
 
-    class Rollouter:
-        prepare_exit = RemoteMethod(
-            lambda target, **kwargs: OperationEvidence(
-                kwargs["operation_id"], EvidenceType.EXIT_READY, 1
-            )
-        )
-        finalize_release = RemoteMethod(
-            lambda operation: (_ for _ in ()).throw(
-                NotImplementedError("native sleep not verified")
-            )
-        )
-
-    class Trainer:
-        remove_and_commit = RemoteMethod(
-            lambda operation: OperationEvidence(
-                operation.operation_id, EvidenceType.SERVICE_COMMITTED, 2
-            )
-        )
-
-    runner.components = {"rollouter": Rollouter(), "trainer": Trainer()}
-    runner.submit_operation(OperationCommand("op-1", OperationKind.DONATE, key, "l1"))
-    runner._execute_operation("op-1")
-
-    assert runner.query_operation("op-1").status is OperationStatus.UNKNOWN
-    assert runner._ensure_journal().active_operation("task-a") == "op-1"
-    with pytest.raises(Exception, match="another lifecycle operation"):
+    with pytest.raises(
+        NotImplementedError,
+        match="verified native STANDALONE sleep backend",
+    ):
         runner.submit_operation(
-            OperationCommand("op-2", OperationKind.DONATE, key, "l1")
+            OperationCommand("op-donate", OperationKind.DONATE, key, "l1")
         )
+
+    assert launched == []
+    assert runner._ensure_journal().query("op-donate") is None
+
+
+def test_taskrunner_force_remove_fails_before_drain_or_journal():
+    runner = taskrunner_class()()
+    runner.task_session = "task-a"
+    runner._control_ready = True
+    launched = []
+    runner._launch_operation = launched.append
+    key = ReplicaKey("task-a", "borrowed-0")
+
+    with pytest.raises(
+        NotImplementedError,
+        match="verified targeted abort/continuation backend",
+    ):
+        runner.submit_operation(
+            OperationCommand(
+                "op-force",
+                OperationKind.REMOVE,
+                key,
+                "l1",
+                force=True,
+            )
+        )
+
+    assert launched == []
+    assert runner._ensure_journal().query("op-force") is None
 
 
 def test_manager_owns_state_kind_and_runtime_inventory_separately():
