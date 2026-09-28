@@ -109,6 +109,8 @@ def _exercise_same_gpu_borrower(
     )
     from multi_task_scheduler.orchestration.contracts import (
         EvidenceType,
+        FIRST_RELEASE_MAX_COLOCATE_COUNT,
+        FIRST_RELEASE_RAY_GPU_FRACTION,
         ReplicaKey,
         ReplicaState,
     )
@@ -238,8 +240,6 @@ def test_real_standalone_level2_sleep_releases_device_memory_and_weights_wake_st
     )
     from multi_task_scheduler.orchestration.contracts import (
         EvidenceType,
-        FIRST_RELEASE_MAX_COLOCATE_COUNT,
-        FIRST_RELEASE_RAY_GPU_FRACTION,
         ReplicaKey,
         ReplicaKind,
         ReplicaState,
