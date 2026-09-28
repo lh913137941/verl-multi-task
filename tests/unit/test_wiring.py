@@ -22,6 +22,7 @@ from multi_task_scheduler.orchestration.contracts import (
     ReplicaState,
 )
 from multi_task_scheduler.orchestration.operation_journal import OperationJournal
+from multi_task_scheduler.orchestration.replica_sync_gate import GateKind, ReplicaSyncGate
 
 SOURCE = Path(__file__).resolve().parents[2] / "src/multi_task_scheduler"
 INTEGRATION = "integration/verl/experimental_fully_async"
@@ -103,6 +104,27 @@ def taskrunner_class():
         ray=FakeRay,
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
         logger=type("Logger", (), {"exception": lambda *args, **kwargs: None})(),
+    )
+
+
+def trainer_class():
+    class Parent:
+        def __init__(self, *args, **kwargs):
+            self.rollouter = None
+            self.checkpoint_manager = None
+            self.current_param_version = 0
+
+    return isolated(
+        f"{INTEGRATION}/trainer.py",
+        "MultiTaskFullyAsyncTrainer",
+        Parent,
+        OperationRecord=OperationRecord,
+        OperationEvidence=OperationEvidence,
+        EvidenceType=EvidenceType,
+        ReplicaKey=ReplicaKey,
+        ReplicaKind=ReplicaKind,
+        GateKind=GateKind,
+        ReplicaSyncGate=ReplicaSyncGate,
     )
 
 
@@ -538,6 +560,153 @@ def test_taskrunner_force_remove_fails_before_drain_or_journal():
 
     assert launched == []
     assert runner._ensure_journal().query("op-force") is None
+
+
+def test_trainer_donate_parks_native_ce_member_in_existing_pending_set():
+    key = ReplicaKey("task-a", "native-0")
+    runtime = type("Runtime", (), {"replica_kind": ReplicaKind.NATIVE})()
+    calls = []
+
+    class CE:
+        def __init__(self):
+            self.effective_replicas = {key: ((runtime,), 7)}
+            self.pending_bootstrap = {}
+
+        def remove_effective(self, target):
+            calls.append(("remove_effective", target))
+            self.effective_replicas.pop(target)
+
+        def register_pending(self, target, replicas, *, operation_id):
+            calls.append(("register_pending", target, operation_id))
+            self.pending_bootstrap[target] = (tuple(replicas), operation_id)
+
+    class Rollouter:
+        get_pending_target = AsyncRemoteMethod(lambda operation_id: key)
+        commit_service_change = AsyncRemoteMethod(
+            lambda operation: calls.append(("commit_service", operation.operation_id))
+            or OperationEvidence(
+                operation.operation_id,
+                EvidenceType.SERVICE_COMMITTED,
+                1,
+            )
+        )
+
+    trainer = trainer_class()()
+    trainer.rollouter = Rollouter()
+    trainer.checkpoint_manager = CE()
+    evidence = asyncio.run(
+        trainer.remove_and_commit(
+            OperationRecord("op-donate", OperationStatus.RUNNING)
+        )
+    )
+
+    assert evidence.type is EvidenceType.SERVICE_COMMITTED
+    assert trainer.checkpoint_manager.pending_bootstrap[key] == (
+        (runtime,),
+        "op-donate",
+    )
+    assert calls == [
+        ("remove_effective", key),
+        ("register_pending", key, "op-donate"),
+        ("commit_service", "op-donate"),
+    ]
+
+
+def test_trainer_borrowed_remove_does_not_park_destroyed_ce_member():
+    key = ReplicaKey("task-a", "borrowed-0")
+    runtime = type("Runtime", (), {"replica_kind": ReplicaKind.BORROWED})()
+
+    class CE:
+        def __init__(self):
+            self.effective_replicas = {key: ((runtime,), 7)}
+            self.pending_bootstrap = {}
+
+        def remove_effective(self, target):
+            self.effective_replicas.pop(target)
+
+        def register_pending(self, *args, **kwargs):
+            raise AssertionError("borrowed REMOVE must not park a destroyed runtime")
+
+    class Rollouter:
+        get_pending_target = AsyncRemoteMethod(lambda operation_id: key)
+        commit_service_change = AsyncRemoteMethod(
+            lambda operation: OperationEvidence(
+                operation.operation_id,
+                EvidenceType.SERVICE_COMMITTED,
+                1,
+            )
+        )
+
+    trainer = trainer_class()()
+    trainer.rollouter = Rollouter()
+    trainer.checkpoint_manager = CE()
+    evidence = asyncio.run(
+        trainer.remove_and_commit(
+            OperationRecord("op-remove", OperationStatus.RUNNING)
+        )
+    )
+    assert evidence.type is EvidenceType.SERVICE_COMMITTED
+    assert trainer.checkpoint_manager.pending_bootstrap == {}
+
+
+def test_trainer_internal_restore_rebinds_parked_native_and_publishes_current_vpub():
+    key = ReplicaKey("task-a", "native-0")
+    runtime = type("Runtime", (), {"replica_kind": ReplicaKind.NATIVE})()
+    calls = []
+
+    class CE:
+        def __init__(self):
+            self.pending_bootstrap = {key: ((runtime,), "op-donate")}
+
+        def discard_pending(self, target):
+            calls.append(("discard_pending", target))
+            self.pending_bootstrap.pop(target, None)
+
+        def register_pending(self, target, replicas, *, operation_id):
+            calls.append(("register_pending", target, operation_id))
+            self.pending_bootstrap[target] = (tuple(replicas), operation_id)
+
+        async def bootstrap_target(self, target, *, operation_id, loaded_version):
+            calls.append(("bootstrap_target", target, operation_id, loaded_version))
+            return OperationEvidence(
+                operation_id,
+                EvidenceType.WEIGHT_READY,
+                2,
+            )
+
+        def commit_pending(self, target, evidence, *, loaded_version):
+            calls.append(("commit_pending", target, loaded_version))
+            assert evidence.type is EvidenceType.WEIGHT_READY
+
+    class Rollouter:
+        get_pending_target = AsyncRemoteMethod(lambda operation_id: key)
+        commit_service_change = AsyncRemoteMethod(
+            lambda operation: calls.append(("commit_service", operation.operation_id))
+            or OperationEvidence(
+                operation.operation_id,
+                EvidenceType.SERVICE_COMMITTED,
+                3,
+            )
+        )
+
+    trainer = trainer_class()()
+    trainer.rollouter = Rollouter()
+    trainer.checkpoint_manager = CE()
+    trainer.current_param_version = 11
+
+    evidence = asyncio.run(
+        trainer.restore_and_publish(
+            OperationRecord("op-restore", OperationStatus.RUNNING)
+        )
+    )
+    assert evidence.type is EvidenceType.SERVICE_COMMITTED
+    assert calls == [
+        ("discard_pending", key),
+        ("register_pending", key, "op-restore"),
+        ("bootstrap_target", key, "op-restore", 11),
+        ("commit_pending", key, 11),
+        ("commit_service", "op-restore"),
+    ]
 
 
 def test_manager_owns_state_kind_and_runtime_inventory_separately():
