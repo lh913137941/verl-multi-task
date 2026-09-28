@@ -279,6 +279,13 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                 )
 
             elif command.kind is OperationKind.RESTORE:
+                ray.get(
+                    rollouter.prepare_replica.remote(
+                        command.target,
+                        operation_id=operation_id,
+                        spec=None,
+                    )
+                )
                 evidence = ray.get(trainer.restore_and_publish.remote(operation))
                 final_evidence = self._require_evidence(
                     evidence,
