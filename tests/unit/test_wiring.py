@@ -758,6 +758,70 @@ def test_taskrunner_unknown_remove_replay_uses_verified_release_without_repeatin
     ]
 
 
+def test_taskrunner_exit_preflight_rejection_finishes_failed_without_unknown_fence():
+    runner = taskrunner_class()()
+    runner.task_session = "task-a"
+    runner._control_ready = True
+    runner._launch_operation = lambda operation_id: None
+    key = ReplicaKey("task-a", "native-0")
+    command = OperationCommand("op-donate-preflight", OperationKind.DONATE, key, "l1")
+
+    class Rollouter:
+        prepare_exit = RemoteMethod(
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                ValueError("target is not ACTIVE")
+            )
+        )
+        get_pending_target = RemoteMethod(
+            lambda operation_id: (_ for _ in ()).throw(
+                KeyError(operation_id)
+            )
+        )
+
+    class Trainer:
+        remove_and_commit = RemoteMethod(
+            lambda operation: (_ for _ in ()).throw(
+                AssertionError("preflight failure must not enter Trainer")
+            )
+        )
+
+    runner.components = {"rollouter": Rollouter(), "trainer": Trainer()}
+    runner._operation_journal.begin(command)
+    runner._execute_operation(command.operation_id)
+
+    record = runner.query_operation(command.operation_id)
+    assert record.status is OperationStatus.FAILED
+    assert "before owner mutation" in record.result
+
+
+def test_taskrunner_exit_failure_after_pending_binding_remains_unknown():
+    runner = taskrunner_class()()
+    runner.task_session = "task-a"
+    runner._control_ready = True
+    runner._launch_operation = lambda operation_id: None
+    key = ReplicaKey("task-a", "native-0")
+    command = OperationCommand("op-donate-mutated", OperationKind.DONATE, key, "l1")
+
+    class Rollouter:
+        prepare_exit = RemoteMethod(
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("drain outcome unknown")
+            )
+        )
+        get_pending_target = RemoteMethod(lambda operation_id: key)
+
+    class Trainer:
+        remove_and_commit = RemoteMethod(lambda operation: None)
+
+    runner.components = {"rollouter": Rollouter(), "trainer": Trainer()}
+    runner._operation_journal.begin(command)
+    runner._execute_operation(command.operation_id)
+
+    record = runner.query_operation(command.operation_id)
+    assert record.status is OperationStatus.UNKNOWN
+    assert "drain outcome unknown" in record.result
+
+
 def test_taskrunner_executes_natural_borrowed_remove_and_advances_lease():
     runner = taskrunner_class()()
     runner.task_session = "task-a"

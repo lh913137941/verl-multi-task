@@ -332,13 +332,34 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                     )
 
                 if service_evidence is None:
-                    exit_evidence = ray.get(
-                        rollouter.prepare_exit.remote(
-                            command.target,
-                            operation_id=operation_id,
-                            force=bool(command.force),
+                    try:
+                        exit_evidence = ray.get(
+                            rollouter.prepare_exit.remote(
+                                command.target,
+                                operation_id=operation_id,
+                                force=bool(command.force),
+                            )
                         )
-                    )
+                    except BaseException as exc:
+                        # prepare_exit binds operation -> target immediately when
+                        # it begins owner mutation (before drain/abort). If no
+                        # binding exists after rejection, the error is a proven
+                        # no-side-effect preflight failure and may close FAILED
+                        # without fencing this task.
+                        try:
+                            ray.get(
+                                rollouter.get_pending_target.remote(operation_id)
+                            )
+                        except BaseException:
+                            with self._journal_lock:
+                                self._operation_journal.finish(
+                                    operation_id,
+                                    OperationStatus.FAILED,
+                                    "exit preflight rejected before owner mutation: "
+                                    f"{type(exc).__name__}: {exc}",
+                                )
+                            return
+                        raise
                     self._require_evidence(
                         exit_evidence,
                         operation_id=operation_id,
