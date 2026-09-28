@@ -151,10 +151,9 @@ def test_real_standalone_level2_sleep_releases_device_memory_and_weights_wake_st
             trust_remote_code=True,
         )
         prompt_ids = normalize_token_ids(
-            tokenizer.apply_chat_template(
-                [{"role": "user", "content": "Say hello in one short sentence."}],
-                add_generation_prompt=True,
-                tokenize=True,
+            tokenizer.encode(
+                "Hello from the real GPU sleep acceptance test.",
+                add_special_tokens=True,
             )
         )
         output = ray.get(
@@ -382,10 +381,9 @@ def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
         asyncio.run(replica.init_standalone())
 
         prompt_ids = normalize_token_ids(
-            model_config.tokenizer.apply_chat_template(
-                [{"role": "user", "content": "Reply with exactly: hello"}],
-                add_generation_prompt=True,
-                tokenize=True,
+            model_config.tokenizer.encode(
+                "Hello from the current-Vpub RESTORE acceptance test.",
+                add_special_tokens=True,
             )
         )
 
