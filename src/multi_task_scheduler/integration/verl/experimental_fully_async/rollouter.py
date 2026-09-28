@@ -25,6 +25,14 @@ from multi_task_scheduler.orchestration.contracts import (
 from .llm_server_manager import MultiTaskLLMServerManager
 
 
+def _require_evidence(value, operation_id: str, expected: EvidenceType, label: str):
+    if not isinstance(value, OperationEvidence):
+        raise TypeError(f"{label} did not return OperationEvidence")
+    if value.operation_id != operation_id or value.type is not expected:
+        raise ValueError(f"{label} evidence does not match {operation_id}/{expected.value}")
+    return value
+
+
 def _continuation_prefix_digest(prompt_ids, token_ids) -> str:
     """Digest the exact token prefix the native FullyAsync client will retry."""
     digest = hashlib.sha256()
@@ -370,12 +378,12 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                         server_handle,
                         operation.operation_id,
                     )
-                    if not isinstance(evidence, OperationEvidence):
-                        raise TypeError("RESTORE routing commit returned non-evidence")
-                    if evidence.operation_id != operation.operation_id:
-                        raise ValueError("RESTORE service evidence belongs to another operation")
-                    if evidence.type is not EvidenceType.SERVICE_COMMITTED:
-                        raise ValueError("RESTORE routing commit did not produce SERVICE_COMMITTED")
+                    _require_evidence(
+                        evidence,
+                        operation.operation_id,
+                        EvidenceType.SERVICE_COMMITTED,
+                        "RESTORE routing commit",
+                    )
                 except BaseException as commit_exc:
                     try:
                         reconciled = await lb.query_ready_operation.remote(
@@ -389,18 +397,17 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                         ) from reconcile_exc
 
                     if reconciled is not None:
-                        if not isinstance(reconciled, OperationEvidence):
-                            raise RuntimeError(
-                                "RESTORE routing ledger returned invalid evidence"
-                            ) from commit_exc
-                        if (
-                            reconciled.operation_id != operation.operation_id
-                            or reconciled.type is not EvidenceType.SERVICE_COMMITTED
-                        ):
+                        try:
+                            evidence = _require_evidence(
+                                reconciled,
+                                operation.operation_id,
+                                EvidenceType.SERVICE_COMMITTED,
+                                "RESTORE routing ledger",
+                            )
+                        except (TypeError, ValueError) as exc:
                             raise RuntimeError(
                                 "RESTORE routing ledger conflicts with the operation"
-                            ) from commit_exc
-                        evidence = reconciled
+                            ) from exc
                     else:
                         # E is already effective, so a definite R failure cannot
                         # safely re-sleep here. Retract local service/capacity and
@@ -483,15 +490,12 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                 )
                 target_state = ReplicaState.RELEASED
 
-            if not isinstance(evidence, OperationEvidence):
-                raise TypeError("runtime release did not return OperationEvidence")
-            if evidence.operation_id != operation.operation_id:
-                raise ValueError("release evidence belongs to another operation")
-            if evidence.type is not EvidenceType.RELEASED:
-                raise ValueError(
-                    f"expected RELEASED evidence, got {evidence.type.value}"
-                )
-
+            _require_evidence(
+                evidence,
+                operation.operation_id,
+                EvidenceType.RELEASED,
+                "runtime release",
+            )
             manager.transition_replica(target, target_state)
             self._pending_operation_targets.pop(operation.operation_id, None)
             return evidence
