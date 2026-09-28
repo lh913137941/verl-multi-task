@@ -211,22 +211,18 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         if not isinstance(raw_claims, (list, tuple)) or not raw_claims:
             raise ValueError("borrowed placement requires nonempty claims")
 
-        world_size = spec.get("world_size")
-        if type(world_size) is not int or world_size <= 0:
-            raise ValueError("borrowed placement world_size must be a positive integer")
-        if world_size != len(raw_claims):
-            raise ValueError("borrowed placement world_size must equal len(claims)")
-
-        configured_world_size = (
-            int(self.rollout_config.tensor_model_parallel_size)
-            * int(self.rollout_config.data_parallel_size)
-            * int(self.rollout_config.pipeline_model_parallel_size)
-        )
-        if world_size != configured_world_size:
-            raise ValueError(
-                "first release borrowed world_size must match the borrower task "
-                f"parallel topology ({configured_world_size})"
+        if any(
+            int(getattr(self.rollout_config, field)) != 1
+            for field in (
+                "tensor_model_parallel_size",
+                "data_parallel_size",
+                "pipeline_model_parallel_size",
             )
+        ):
+            raise ValueError("current borrowed runtime requires TP=DP=PP=1")
+        world_size = spec.get("world_size")
+        if world_size != 1 or len(raw_claims) != 1:
+            raise ValueError("current borrowed runtime requires world_size=1")
 
         max_colocate_count = spec.get(
             "max_colocate_count",
@@ -256,26 +252,15 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         if lease.expires_at and time.time() >= lease.expires_at:
             raise ValueError("borrowed placement lease is expired")
 
-        claims = [dict(claim) for claim in lease.claims]
-        for rank, claim in enumerate(claims):
-            supplied_rank = claim.get("rank", rank)
-            if type(supplied_rank) is not int or supplied_rank != rank:
-                raise ValueError(
-                    "borrowed claim ranks must cover 0..world_size-1 in list order"
-                )
-            claim["rank"] = rank
-
-            node_rank = claim.get("node_rank")
-            local_rank = claim.get("local_rank")
-            if type(node_rank) is not int or node_rank != 0:
-                raise ValueError("first release requires single-node node_rank=0")
-            if type(local_rank) is not int or local_rank != rank:
-                raise ValueError(
-                    "first release requires local_rank to match rank on one node"
-                )
-
-        if len({claim["node_id"] for claim in claims}) != 1:
-            raise ValueError("first release borrowed placement must be single-node")
+        claim = dict(lease.claims[0])
+        if (
+            claim.get("rank", 0) != 0
+            or claim.get("node_rank") != 0
+            or claim.get("local_rank") != 0
+        ):
+            raise ValueError("current borrowed claim requires rank=node_rank=local_rank=0")
+        claim["rank"] = 0
+        claims = [claim]
 
         normalized = dict(spec)
         normalized["claims"] = claims
