@@ -333,6 +333,14 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         except KeyError as exc:
             raise KeyError(f"no pending lifecycle target for {operation_id!r}") from exc
 
+    def get_pending_replicas(self, operation_id: str):
+        """Return the prepared runtime bound to one lifecycle operation."""
+        target = self.get_pending_target(operation_id)
+        runtime = self.llm_server_manager.inspect_runtime(target)
+        if runtime is None:
+            raise RuntimeError("pending lifecycle target has no runtime")
+        return (runtime,)
+
     async def commit_service_change(self, operation: OperationRecord) -> OperationEvidence:
         """Commit the R/C part of a drained exit while Manager keeps M=DRAINING."""
         if not isinstance(operation, OperationRecord):
@@ -341,6 +349,67 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         manager = self.llm_server_manager
         kind, state = manager.replica_meta(target)
         lb = manager.global_load_balancer
+
+        if state is ReplicaState.CREATING:
+            if kind is not ReplicaKind.BORROWED:
+                raise ValueError("only BORROWED replicas may publish from CREATING")
+            runtime = manager.inspect_runtime(target)
+            if runtime is None:
+                raise RuntimeError("borrowed runtime is unavailable for ADD commit")
+            server_id = getattr(runtime, "_server_address", None)
+            server_handle = getattr(runtime, "_server_handle", None)
+            if not isinstance(server_id, str) or not server_id or server_handle is None:
+                raise RuntimeError("borrowed ADD runtime lacks routable server identity")
+
+            activated = False
+            try:
+                manager.activate_service(target)
+                activated = True
+                self._update_max_concurrent_samples()
+                manager.transition_replica(target, ReplicaState.ACTIVE)
+                try:
+                    evidence = await lb.commit_ready.remote(
+                        target,
+                        server_id,
+                        server_handle,
+                        operation.operation_id,
+                    )
+                    _require_evidence(
+                        evidence,
+                        operation.operation_id,
+                        EvidenceType.SERVICE_COMMITTED,
+                        "ADD routing commit",
+                    )
+                except BaseException as commit_exc:
+                    try:
+                        reconciled = await lb.query_ready_operation.remote(
+                            operation.operation_id
+                        )
+                    except BaseException as reconcile_exc:
+                        raise RuntimeError(
+                            "ADD routing commit outcome is unknown"
+                        ) from reconcile_exc
+                    if reconciled is not None:
+                        evidence = _require_evidence(
+                            reconciled,
+                            operation.operation_id,
+                            EvidenceType.SERVICE_COMMITTED,
+                            "ADD routing ledger",
+                        )
+                    else:
+                        manager.transition_replica(target, ReplicaState.DRAINING)
+                        if activated:
+                            manager.deactivate_service(target)
+                            self._update_max_concurrent_samples()
+                        manager.transition_replica(target, ReplicaState.QUARANTINED)
+                        raise commit_exc
+
+                self._pending_operation_targets.pop(operation.operation_id, None)
+                return evidence
+            except BaseException:
+                if manager.replica_state.get(target) is ReplicaState.CREATING:
+                    manager.transition_replica(target, ReplicaState.QUARANTINED)
+                raise
 
         # RESTORE reuses the same service-commit boundary after Trainer has
         # proved current Vpub under G.  The vLLM engine may already be fully
@@ -471,9 +540,10 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         target = self.get_pending_target(operation.operation_id)
         manager = self.llm_server_manager
         kind, state = manager.replica_meta(target)
-        if state is not ReplicaState.DRAINING:
+        add_rollback = kind is ReplicaKind.BORROWED and state is ReplicaState.CREATING
+        if not add_rollback and state is not ReplicaState.DRAINING:
             raise ValueError(
-                f"finalize_release requires DRAINING replica, got {state.value}"
+                f"finalize_release requires DRAINING or borrowed CREATING replica, got {state.value}"
             )
 
         try:
@@ -500,6 +570,9 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
             self._pending_operation_targets.pop(operation.operation_id, None)
             return evidence
         except BaseException:
-            if manager.replica_state.get(target) is ReplicaState.DRAINING:
+            if manager.replica_state.get(target) in {
+                ReplicaState.CREATING,
+                ReplicaState.DRAINING,
+            }:
                 manager.transition_replica(target, ReplicaState.QUARANTINED)
             raise
