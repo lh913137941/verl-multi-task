@@ -1606,6 +1606,7 @@ def test_trainer_restore_definite_no_route_removes_e_then_resleeps():
     assert key not in trainer.checkpoint_manager.effective_replicas
     assert key in trainer.checkpoint_manager.pending_bootstrap
     assert calls == [
+        ("register_pending", key, "op-restore"),
         ("remove_effective", key),
         ("register_pending", key, "op-restore"),
         ("finalize_release", "op-restore"),
@@ -1922,7 +1923,10 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     record = manager.borrowed_operations["borrower-lease"]
     assert receipt["state"] == "RUNTIME_READY"
     assert receipt["server_address"] == "s-borrowed"
-    assert record["resolved_spec"]["replica_rank"] == 0
+    # Rank 0 was consumed by the earlier failed allocation attempt. Runtime
+    # actor ranks are monotonic and are not recycled after verified cleanup.
+    assigned_rank = record["resolved_spec"]["replica_rank"]
+    assert assigned_rank == 1
     borrowed_key = ReplicaKey("task-a", "borrowed-0", 0)
     assert ReplicaKey(
         record["resolved_spec"]["borrower_task_id"],
@@ -1933,16 +1937,16 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     assert manager.replica_state[borrowed_key] is ReplicaState.CREATING
     borrowed_runtime = manager.inspect_runtime(borrowed_key)
     assert borrowed_runtime is not None
-    assert manager.next_replica_rank == 1
+    assert manager.next_replica_rank == assigned_rank + 1
 
     # Exact replay returns the same hidden runtime receipt without another rank.
     assert asyncio.run(manager.create_borrowed_replica(valid_spec)) == receipt
-    assert manager.next_replica_rank == 1
+    assert manager.next_replica_rank == assigned_rank + 1
 
     # A retry may carry the rank recovered from the manager's first record.
-    resolved_retry = dict(valid_spec, replica_rank=0)
+    resolved_retry = dict(valid_spec, replica_rank=assigned_rank)
     assert asyncio.run(manager.create_borrowed_replica(resolved_retry)) == receipt
-    assert manager.next_replica_rank == 1
+    assert manager.next_replica_rank == assigned_rank + 1
 
     release = asyncio.run(
         manager.destroy(borrowed_key, operation_id="op-remove")
@@ -1975,7 +1979,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     conflicting = dict(valid_spec, operation_id="op-other")
     with pytest.raises(ValueError, match="conflicting borrowed create replay"):
         asyncio.run(manager.create_borrowed_replica(conflicting))
-    assert manager.next_replica_rank == 1
+    assert manager.next_replica_rank == assigned_rank + 1
 
     class InvalidReceiptRuntime(FakeBorrowedRuntime):
         async def init_from_lease(self, spec, pg_by_id):
