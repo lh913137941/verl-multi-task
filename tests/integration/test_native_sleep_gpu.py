@@ -571,14 +571,6 @@ def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
         baseline = generate_once("before-restore")
         assert getattr(baseline, "token_ids", None)
 
-        # Create a genuinely different sender Vpub before the native runtime
-        # sleeps.  This prevents global_steps=17 from acting as a mere label:
-        # successful RESTORE must carry changed tensor data from the sender.
-        mutation_receipts = ray.get(
-            actor_wg.zero_output_weights_for_restore_acceptance()
-        )
-        assert all(receipt["abs_sum"] == 0.0 for receipt in mutation_receipts)
-
         key = ReplicaKey("gpu-acceptance", "native-0")
         manager = MultiTaskLLMServerManager.__new__(MultiTaskLLMServerManager)
         manager.replica_kind = {key: ReplicaKind.NATIVE}
@@ -602,6 +594,14 @@ def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
             token="gpu-restore-cycle",
         )
         assert destroy_evidence.released_gpu_uuids == release.released_gpu_uuids
+
+        # Simulate Vpub advancing while the native rollout runtime is dormant
+        # and its physical GPU has been lent to another task.  This makes the
+        # acceptance stronger than replaying the sleep-time weights.
+        mutation_receipts = ray.get(
+            actor_wg.zero_output_weights_for_restore_acceptance()
+        )
+        assert all(receipt["abs_sum"] == 0.0 for receipt in mutation_receipts)
 
         checkpoint_manager = MultiTaskCheckpointEngineManager(
             config=checkpoint_config,
