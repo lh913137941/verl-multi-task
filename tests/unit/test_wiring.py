@@ -427,29 +427,6 @@ def test_taskrunner_minimal_journal_surface_and_replay_does_not_relaunch():
     assert runner.query_operation("missing").status is OperationStatus.UNKNOWN
 
 
-def test_taskrunner_admission_policy_allows_add_and_force_remove():
-    runner = taskrunner_class()()
-    key = ReplicaKey("task-a", "r0")
-
-    assert runner._unverified_reason(
-        OperationCommand("op-remove", OperationKind.REMOVE, key, "l1")
-    ) is None
-    assert runner._unverified_reason(
-        OperationCommand("op-add", OperationKind.ADD, key, "l1")
-    ) is None
-    assert runner._unverified_reason(
-        OperationCommand(
-            "op-force", OperationKind.REMOVE, key, "l1", force=True
-        )
-    ) is None
-    assert "STANDALONE sleep backend" in runner._unverified_reason(
-        OperationCommand("op-donate", OperationKind.DONATE, key, "l1")
-    )
-    assert "wake/bootstrap backend" in runner._unverified_reason(
-        OperationCommand("op-restore", OperationKind.RESTORE, key, "l1")
-    )
-
-
 def test_taskrunner_add_is_admitted_with_matching_lease_snapshot():
     runner = taskrunner_class()()
     runner.task_session = "task-a"
@@ -585,7 +562,7 @@ def test_taskrunner_executes_natural_borrowed_remove_and_advances_lease():
     ]
 
 
-def test_taskrunner_restore_fails_before_journal_or_worker_launch():
+def test_taskrunner_restore_is_admitted_and_launched():
     runner = taskrunner_class()()
     runner.task_session = "task-a"
     runner._control_ready = True
@@ -593,30 +570,21 @@ def test_taskrunner_restore_fails_before_journal_or_worker_launch():
     runner._launch_operation = launched.append
     key = ReplicaKey("task-a", "native-0")
 
-    with pytest.raises(
-        NotImplementedError,
-        match="verified native wake/bootstrap backend",
-    ):
-        runner.submit_operation(
-            OperationCommand("op-restore", OperationKind.RESTORE, key, "l1")
-        )
+    record = runner.submit_operation(
+        OperationCommand("op-restore", OperationKind.RESTORE, key, "l1")
+    )
 
-    assert launched == []
-    assert runner._operation_journal.query("op-restore") is None
+    assert record.status is OperationStatus.ACCEPTED
+    assert launched == ["op-restore"]
+    assert runner._operation_journal.query("op-restore") is not None
 
 
-def test_taskrunner_internal_restore_closes_gs_lease_after_service_commit():
+def test_taskrunner_restore_closes_gs_lease_after_service_commit():
     runner = taskrunner_class()()
     runner.task_session = "task-a"
     runner._control_ready = True
+    runner._launch_operation = lambda operation_id: None
     key = ReplicaKey("task-a", "native-0")
-    command = OperationCommand(
-        "op-restore-internal",
-        OperationKind.RESTORE,
-        key,
-        "l1",
-    )
-    runner._operation_journal.begin(command)
     calls = []
 
     class Rollouter:
@@ -648,14 +616,17 @@ def test_taskrunner_internal_restore_closes_gs_lease_after_service_commit():
 
     runner.components = {"rollouter": Rollouter(), "trainer": Trainer()}
     runner.group_scheduler = GroupScheduler()
-    runner._execute_operation("op-restore-internal")
+    runner.submit_operation(
+        OperationCommand("op-restore", OperationKind.RESTORE, key, "l1")
+    )
+    runner._execute_operation("op-restore")
 
-    record = runner.query_operation("op-restore-internal")
+    record = runner.query_operation("op-restore")
     assert record.status is OperationStatus.SUCCEEDED
     assert record.result == EvidenceType.SERVICE_COMMITTED.value
     assert calls == [
-        ("prepare_replica", key, "op-restore-internal", None),
-        ("restore_and_publish", "op-restore-internal"),
+        ("prepare_replica", key, "op-restore", None),
+        ("restore_and_publish", "op-restore"),
         ("advance_lease", "l1", EvidenceType.SERVICE_COMMITTED),
     ]
 
@@ -730,24 +701,67 @@ def test_taskrunner_launch_failure_cleans_temp_thread_and_lease_state():
     assert record.status is OperationStatus.FAILED
 
 
-def test_taskrunner_unverified_native_donate_fails_before_drain_or_journal():
+def test_taskrunner_executes_native_donate_and_advances_lease():
     runner = taskrunner_class()()
     runner.task_session = "task-a"
     runner._control_ready = True
-    launched = []
-    runner._launch_operation = launched.append
+    runner._launch_operation = lambda operation_id: None
     key = ReplicaKey("task-a", "native-0")
+    calls = []
 
-    with pytest.raises(
-        NotImplementedError,
-        match="verified native STANDALONE sleep backend",
-    ):
-        runner.submit_operation(
-            OperationCommand("op-donate", OperationKind.DONATE, key, "l1")
+    class Rollouter:
+        prepare_exit = RemoteMethod(
+            lambda target, **kwargs: calls.append(
+                ("prepare_exit", target, kwargs["operation_id"], kwargs["force"])
+            )
+            or OperationEvidence(
+                kwargs["operation_id"], EvidenceType.EXIT_READY, 1
+            )
+        )
+        finalize_release = RemoteMethod(
+            lambda operation: calls.append(("finalize_release", operation.operation_id))
+            or OperationEvidence(
+                operation.operation_id,
+                EvidenceType.RELEASED,
+                3,
+                ("u0",),
+            )
         )
 
-    assert launched == []
-    assert runner._operation_journal.query("op-donate") is None
+    class Trainer:
+        remove_and_commit = RemoteMethod(
+            lambda operation: calls.append(("remove_and_commit", operation.operation_id))
+            or OperationEvidence(
+                operation.operation_id,
+                EvidenceType.SERVICE_COMMITTED,
+                2,
+            )
+        )
+
+    class GroupScheduler:
+        advance_lease = RemoteMethod(
+            lambda lease_id, evidence: calls.append(
+                ("advance_lease", lease_id, evidence.type, evidence.released_gpu_uuids)
+            )
+            or {"released": True}
+        )
+
+    runner.components = {"rollouter": Rollouter(), "trainer": Trainer()}
+    runner.group_scheduler = GroupScheduler()
+    runner.submit_operation(
+        OperationCommand("op-donate", OperationKind.DONATE, key, "l1")
+    )
+    runner._execute_operation("op-donate")
+
+    record = runner.query_operation("op-donate")
+    assert record.status is OperationStatus.SUCCEEDED
+    assert record.result == EvidenceType.RELEASED.value
+    assert calls == [
+        ("prepare_exit", key, "op-donate", False),
+        ("remove_and_commit", "op-donate"),
+        ("finalize_release", "op-donate"),
+        ("advance_lease", "l1", EvidenceType.RELEASED, ("u0",)),
+    ]
 
 
 def test_taskrunner_force_remove_is_admitted_and_dispatched():
