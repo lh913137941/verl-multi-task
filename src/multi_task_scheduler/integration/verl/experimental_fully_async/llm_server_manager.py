@@ -450,11 +450,11 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         return matches[0]
 
     async def create_borrowed_replica(self, spec: dict) -> dict:
-        """Idempotently register create intent, then stop at the unverified GPU boundary.
+        """Idempotently create one hidden borrowed runtime on verified lease placement.
 
-        The durable-in-process identity/rank fence is useful before the actor backend
-        exists: a retry of the same borrower lease cannot allocate a second rank, and
-        a conflicting replay cannot reach future Ray side effects.
+        The in-process identity/rank fence prevents a retry of the same borrower
+        lease from allocating a second rank.  R/C/E publication remains a separate
+        boundary; RUNTIME_READY alone is not end-to-end ADD success.
         """
         normalized = self.validate_borrowed_spec(spec)
         lease_id = normalized["lease_id"]
