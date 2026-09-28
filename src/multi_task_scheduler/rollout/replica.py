@@ -441,7 +441,8 @@ class MultiTaskvLLMReplica(vLLMReplica):
         Manager calls this low-level transaction for hidden creation only;
         target-only bootstrap and service publication remain separate gates.
         """
-        self.validate_placement(spec)
+        # _create_workers_from_claims() validates the normalized Lease
+        # before its first Ray side effect.
         self.rollout_mode = RolloutMode.STANDALONE
         self.nnodes = 1
         self.gpus_per_replica_node = self.world_size
