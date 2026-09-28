@@ -503,14 +503,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 "borrower_task_id": normalized["borrower_task_id"],
                 "replica_key": replica_key,
                 "replica_rank": rank,
-                "claim_ids": [claim["claim_id"] for claim in normalized["claims"]],
-                "source_lease_ids": list(normalized["lease_ids"]),
                 "state": "CREATING",
-                "cancel_requested": False,
-                "replica": None,
-                "worker_handles": [],
-                "server_handles": [],
-                "created_actor_names": [],
                 "result": None,
                 "error": None,
                 # Manager-local replay fence and resolved placement; neither is
@@ -545,13 +538,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             async with self.replica_operation_lock:
                 current = self.borrowed_operations[lease_id]
                 replica_key = current["replica_key"]
-                current["replica"] = runtime
-                current["worker_handles"] = list(getattr(runtime, "workers", ()) or ())
-                current["server_handles"] = list(getattr(runtime, "servers", ()) or ())
-                current["created_actor_names"] = list(
-                    tuple(getattr(runtime, "borrowed_worker_names", ()) or ())
-                    + tuple(getattr(runtime, "borrowed_server_names", ()) or ())
-                )
                 current["state"] = "RUNTIME_READY"
                 current["error"] = None
                 current["result"] = {
