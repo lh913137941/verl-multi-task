@@ -96,12 +96,11 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
 
         confirmed = self._bootstrap_ready_map.get(key)
         member = self._effective_replica_map.get(key)
-        if (
-            key not in self._pending_bootstrap_map
-            and confirmed == (evidence.operation_id, loaded_version, evidence)
-            and member is not None
-            and member[1] == loaded_version
-        ):
+        if key not in self._pending_bootstrap_map and confirmed is not None and member is not None:
+            if confirmed != (evidence.operation_id, loaded_version, evidence):
+                raise ValueError("WEIGHT_READY does not match confirmed bootstrap")
+            if member[1] != loaded_version:
+                raise ValueError("conflicting bootstrap commit replay")
             return
 
         try:
