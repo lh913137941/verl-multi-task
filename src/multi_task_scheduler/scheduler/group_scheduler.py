@@ -173,6 +173,25 @@ class GroupScheduler:
             self.operation_commands[command.operation_id] = command
             if command.kind is OperationKind.ADD:
                 self.borrower_targets[command.lease_id] = command.target
+            elif command.kind is OperationKind.RESTORE:
+                # RESTORE was validated only while every physical claim was
+                # free.  Re-reserve the donor slot before this serialized GS
+                # method returns so another open_lease cannot race the native
+                # wake and claim the same GPU/bundle.
+                for bundle_key in lease.bundle_keys:
+                    owner = self.active_bundle_owner.get(bundle_key)
+                    if owner is not None:
+                        raise RuntimeError(
+                            "RESTORE bundle ownership changed during submission"
+                        )
+                    self.active_bundle_owner[bundle_key] = command.lease_id
+                for gpu_uuid in lease.gpu_uuids:
+                    owner = self.active_gpu_owner.get(gpu_uuid)
+                    if owner is not None:
+                        raise RuntimeError(
+                            "RESTORE GPU ownership changed during submission"
+                        )
+                    self.active_gpu_owner[gpu_uuid] = command.lease_id
         return result
 
     @staticmethod
