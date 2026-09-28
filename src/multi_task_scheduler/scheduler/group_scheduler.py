@@ -131,6 +131,15 @@ class GroupScheduler:
 
             donor_task_id = lease.claims[0]["donor_task_id"]
             if command.kind is OperationKind.DONATE:
+                if history:
+                    last_command = self.operation_commands.get(history[-1])
+                    if (
+                        last_command is not None
+                        and last_command.kind is OperationKind.REMOVE
+                    ):
+                        raise ValueError(
+                            "lease awaits RESTORE after borrowed REMOVE"
+                        )
                 if command.target.task_session != donor_task_id:
                     raise ValueError("DONATE target does not own the lease claims")
                 if not self._target_matches_donor(command.target, lease):
