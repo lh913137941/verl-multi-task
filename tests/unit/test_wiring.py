@@ -2417,7 +2417,153 @@ def test_rollouter_restore_commit_publishes_r_c_then_marks_native_active():
         ("wake_up",),
         ("activate_service", key),
         ("capacity",),
+        ("state", ReplicaState.ACTIVE),
         ("commit_ready", key, "s0", "h0", "op-restore"),
+    ]
+
+
+def test_rollouter_restore_ack_loss_reconciles_committed_route_without_sleep():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "native-0")
+    calls = []
+    committed = OperationEvidence(
+        "op-restore",
+        EvidenceType.SERVICE_COMMITTED,
+        7,
+    )
+
+    class Runtime:
+        _server_address = "s0"
+        _server_handle = "h0"
+
+        async def wake_up(self):
+            calls.append(("wake_up",))
+            return ({"sleeping": False, "fully_awake": True},)
+
+        async def sleep(self):
+            raise AssertionError("committed route must never be rolled back to sleep")
+
+    class LB:
+        commit_ready = AsyncRemoteMethod(
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("reply lost after commit")
+            )
+        )
+        query_ready_operation = AsyncRemoteMethod(
+            lambda operation_id: calls.append(("query_ready", operation_id))
+            or committed
+        )
+
+    class Manager:
+        global_load_balancer = LB()
+
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.DORMANT}
+            self.replica_kind = {key: ReplicaKind.NATIVE}
+
+        def replica_meta(self, target):
+            return self.replica_kind[target], self.replica_state[target]
+
+        def inspect_runtime(self, target):
+            return Runtime()
+
+        def activate_service(self, target):
+            calls.append(("activate_service", target))
+
+        def transition_replica(self, target, state):
+            calls.append(("state", state))
+            self.replica_state[target] = state
+
+    manager = Manager()
+    rollouter.llm_server_manager = manager
+    rollouter._pending_operation_targets["op-restore"] = key
+    rollouter._update_max_concurrent_samples = lambda: calls.append(("capacity",))
+
+    evidence = asyncio.run(
+        rollouter.commit_service_change(
+            OperationRecord("op-restore", OperationStatus.RUNNING)
+        )
+    )
+
+    assert evidence == committed
+    assert manager.replica_state[key] is ReplicaState.ACTIVE
+    assert "op-restore" not in rollouter._pending_operation_targets
+    assert calls == [
+        ("wake_up",),
+        ("activate_service", key),
+        ("capacity",),
+        ("state", ReplicaState.ACTIVE),
+        ("query_ready", "op-restore"),
+    ]
+
+
+def test_rollouter_restore_unknown_route_outcome_keeps_runtime_active_and_awake():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "native-0")
+    calls = []
+
+    class Runtime:
+        _server_address = "s0"
+        _server_handle = "h0"
+
+        async def wake_up(self):
+            calls.append(("wake_up",))
+            return ({"sleeping": False, "fully_awake": True},)
+
+        async def sleep(self):
+            raise AssertionError("unknown route outcome must not sleep the runtime")
+
+    class LB:
+        commit_ready = AsyncRemoteMethod(
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("reply lost")
+            )
+        )
+        query_ready_operation = AsyncRemoteMethod(
+            lambda operation_id: (_ for _ in ()).throw(
+                RuntimeError("LB unavailable")
+            )
+        )
+
+    class Manager:
+        global_load_balancer = LB()
+
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.DORMANT}
+            self.replica_kind = {key: ReplicaKind.NATIVE}
+
+        def replica_meta(self, target):
+            return self.replica_kind[target], self.replica_state[target]
+
+        def inspect_runtime(self, target):
+            return Runtime()
+
+        def activate_service(self, target):
+            calls.append(("activate_service", target))
+
+        def transition_replica(self, target, state):
+            calls.append(("state", state))
+            self.replica_state[target] = state
+
+    manager = Manager()
+    rollouter.llm_server_manager = manager
+    rollouter._pending_operation_targets["op-restore"] = key
+    rollouter._update_max_concurrent_samples = lambda: calls.append(("capacity",))
+
+    with pytest.raises(RuntimeError, match="routing commit outcome is unknown"):
+        asyncio.run(
+            rollouter.commit_service_change(
+                OperationRecord("op-restore", OperationStatus.RUNNING)
+            )
+        )
+
+    assert manager.replica_state[key] is ReplicaState.ACTIVE
+    assert calls == [
+        ("wake_up",),
+        ("activate_service", key),
+        ("capacity",),
         ("state", ReplicaState.ACTIVE),
     ]
 
@@ -2446,6 +2592,7 @@ def test_rollouter_restore_routing_failure_rolls_back_to_verified_dormant():
                 RuntimeError("routing commit failed")
             )
         )
+        query_ready_operation = AsyncRemoteMethod(lambda operation_id: None)
 
     class Manager:
         global_load_balancer = LB()
@@ -2486,9 +2633,12 @@ def test_rollouter_restore_routing_failure_rolls_back_to_verified_dormant():
         ("wake_up",),
         ("activate_service", key),
         ("capacity",),
+        ("state", ReplicaState.ACTIVE),
+        ("state", ReplicaState.DRAINING),
         ("deactivate_service", key),
         ("capacity",),
         ("sleep",),
+        ("state", ReplicaState.DORMANT),
     ]
 
 
@@ -2513,6 +2663,7 @@ def test_rollouter_restore_unverified_rollback_quarantines_native():
                 RuntimeError("routing commit failed")
             )
         )
+        query_ready_operation = AsyncRemoteMethod(lambda operation_id: None)
 
     class Manager:
         global_load_balancer = LB()
