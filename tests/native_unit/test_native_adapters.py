@@ -22,6 +22,7 @@ from multi_task_scheduler.integration.verl.experimental_fully_async.message_queu
 from multi_task_scheduler.integration.verl.experimental_fully_async.rollouter import (
     MultiTaskFullyAsyncRollouter,
     _ContinuationAwareServer,
+    _MultiTaskFullyAsyncLLMServerClient,
     _continuation_prefix_digest,
 )
 from multi_task_scheduler.integration.verl.experimental_fully_async.task_runner import (
@@ -132,6 +133,101 @@ class _AsyncRemote:
 
     async def remote(self, *args, **kwargs):
         return self._fn(*args, **kwargs)
+
+
+def test_fully_async_client_retries_exact_partial_prefix_on_another_server():
+    calls = []
+    acquire_count = {"value": 0}
+
+    class Output:
+        def __init__(self, token_ids, stop_reason, global_steps):
+            self.token_ids = list(token_ids)
+            self.log_probs = []
+            self.routed_experts = None
+            self.num_preempted = 0
+            self.stop_reason = stop_reason
+            self.extra_fields = {"global_steps": global_steps}
+
+    class Server:
+        def __init__(self, name, output):
+            self.name = name
+            self.output = output
+            self.generate = _AsyncRemote(self._generate)
+
+        def _generate(self, **kwargs):
+            calls.append(
+                (
+                    "generate",
+                    self.name,
+                    tuple(kwargs["prompt_ids"]),
+                )
+            )
+            return self.output
+
+    first = Server("target", Output([31, 32], "aborted", 1))
+    second = Server("alternate", Output([33, 34], "stop", 2))
+
+    class ImmediateRemote:
+        def __init__(self, fn):
+            self._fn = fn
+
+        def remote(self, *args, **kwargs):
+            return self._fn(*args, **kwargs)
+
+    class LB:
+        require_acquire_fields = _AsyncRemote(lambda: [])
+        require_release_fields = _AsyncRemote(lambda: ["request_id"])
+
+        async def _acquire(self, request_id, **kwargs):
+            acquire_count["value"] += 1
+            server = first if acquire_count["value"] == 1 else second
+            calls.append(("acquire", request_id, server.name))
+            return server.name, server
+
+        acquire_server = type(
+            "AcquireRemote",
+            (),
+            {"remote": lambda self, *args, **kwargs: LB()._acquire(*args, **kwargs)},
+        )()
+        release_server = ImmediateRemote(
+            lambda server_id, request_id=None:
+            calls.append(("release", server_id, request_id))
+        )
+        confirm_continuation = _AsyncRemote(
+            lambda request_id, client_id, prefix_digest:
+            calls.append(("confirm", request_id, client_id, prefix_digest))
+        )
+
+    config = SimpleNamespace(
+        actor_rollout_ref=SimpleNamespace(
+            rollout=SimpleNamespace(
+                name="vllm",
+                full_determinism=False,
+                response_length=16,
+            )
+        ),
+        async_training=SimpleNamespace(partial_rollout=True),
+    )
+    client = _MultiTaskFullyAsyncLLMServerClient(
+        config=config,
+        load_balancer_handle=LB(),
+        client_id="task-a",
+    )
+
+    output = asyncio.run(
+        client.generate(
+            request_id="logical-1",
+            prompt_ids=[11, 12],
+            sampling_params={"max_tokens": 4},
+        )
+    )
+
+    assert output.token_ids == [31, 32, 33, 34]
+    assert output.stop_reason == "length"
+    assert ("generate", "target", (11, 12)) in calls
+    assert ("generate", "alternate", (11, 12, 31, 32)) in calls
+    assert any(item[0] == "confirm" for item in calls)
+    assert acquire_count["value"] == 2
 
 
 def test_continuation_proxy_records_aborted_prefix_before_native_retry():
