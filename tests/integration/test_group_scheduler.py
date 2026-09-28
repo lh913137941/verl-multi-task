@@ -37,7 +37,7 @@ def claim(
     return {
         "claim_id": claim_id,
         "source_lease_id": source_lease_id,
-        "donor_task_id": "donor-task",
+        "donor_task_id": "task-a",
         "donor_replica_rank": 0,
         "gpu_uuid": uuid,
         "pg_id": "pg",
