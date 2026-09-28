@@ -110,11 +110,12 @@ def validate_runtime_profile(config) -> bool:
         lora = model.get("lora", {}) or {}
         if not isinstance(lora, Mapping):
             raise ProfileConfigurationError("actor_rollout_ref.model.lora must be a mapping")
-        if (type(lora_rank) is int and lora_rank > 0) or (
+        lora_enabled = (type(lora_rank) is int and lora_rank > 0) or (
             type(lora.get("rank", 0)) is int and lora.get("rank", 0) > 0
-        ):
+        )
+        if lora_enabled and lora.get("merge", False) is not True:
             raise ProfileConfigurationError(
-                "first release whole-GPU DONATE requires level-2 sleep and does not support LoRA rollout"
+                "first release whole-GPU DONATE requires level-2 sleep and does not support unmerged LoRA rollout"
             )
 
     backend = _select(config, f"{prefix}.checkpoint_engine.backend")
