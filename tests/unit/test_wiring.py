@@ -1824,6 +1824,7 @@ def test_standalone_server_level2_sleep_and_two_phase_wake_keep_admission_fenced
         {"enable_sleep_mode": True, "free_cache_engine": True},
     )()
     server.engine = Engine()
+    server._resolve_sleep_level = lambda: 2
     server._submission_paused = False
     server._resume_event = Event()
 
@@ -1844,10 +1845,102 @@ def test_standalone_server_level2_sleep_and_two_phase_wake_keep_admission_fenced
     assert wake_receipt["sleeping"] is False
     assert server._submission_paused is False
     assert server._resume_event.is_set is True
-    assert ("sleep", 2, "wait") in calls
+    assert ("sleep", 2, "abort") in calls
     assert ("wake_up", ("weights",)) in calls
     assert ("reset_prefix_cache", True) in calls
     assert calls[-2:] == [("health",), ("gate", "set")]
+
+
+def test_standalone_server_rejects_configs_that_cannot_use_level2_sleep():
+    class Engine:
+        async def wait_for_requests_to_drain(self):
+            raise AssertionError("incompatible level must fail before runtime sleep")
+
+    server = http_server_class()()
+    server.nnodes = 1
+    server.node_rank = 0
+    server.replica_rank = 0
+    server.global_steps = 1
+    server.config = type(
+        "Config",
+        (),
+        {"enable_sleep_mode": True, "free_cache_engine": True},
+    )()
+    server.engine = Engine()
+    server._resolve_sleep_level = lambda: 1
+    server._submission_paused = False
+    server._resume_event = type("Event", (), {"clear": lambda self: None})()
+
+    with pytest.raises(NotImplementedError, match="level-2 sleep"):
+        asyncio.run(server.sleep())
+
+
+def test_restore_partial_wake_makes_release_kv_cache_idempotent():
+    class Engine:
+        async def is_sleeping(self):
+            return True
+
+    server = http_server_class()()
+    server.nnodes = 1
+    server.node_rank = 0
+    server.replica_rank = 0
+    server.config = type(
+        "Config",
+        (),
+        {"enable_sleep_mode": True, "free_cache_engine": True},
+    )()
+    server.engine = Engine()
+
+    receipt = asyncio.run(server.release_kv_cache())
+    assert receipt == {"kv_cache_released": True, "already_sleeping": True}
+
+
+def test_final_wake_can_commit_admission_after_ce_already_restored_kv():
+    calls = []
+
+    class Event:
+        def __init__(self):
+            self.is_set = False
+
+        def clear(self):
+            self.is_set = False
+
+        def set(self):
+            self.is_set = True
+            calls.append(("gate", "set"))
+
+    class Engine:
+        async def is_sleeping(self):
+            return False
+
+        async def wake_up(self, *, tags=None):
+            raise AssertionError("fully resident engine must not be woken twice")
+
+        async def reset_prefix_cache(self, *, reset_connector):
+            calls.append(("reset", reset_connector))
+
+        async def check_health(self):
+            calls.append(("health",))
+
+    server = http_server_class()()
+    server.nnodes = 1
+    server.node_rank = 0
+    server.replica_rank = 0
+    server.global_steps = 9
+    server.config = type(
+        "Config",
+        (),
+        {"enable_sleep_mode": True, "free_cache_engine": True},
+    )()
+    server.engine = Engine()
+    server._submission_paused = True
+    server._resume_event = Event()
+
+    receipt = asyncio.run(server.wake_up())
+    assert receipt["fully_awake"] is True
+    assert server._submission_paused is False
+    assert server._resume_event.is_set is True
+    assert calls == [("reset", True), ("health",), ("gate", "set")]
 
 
 def test_native_replica_requires_verified_server_receipts_for_sleep_and_wake():
