@@ -116,7 +116,6 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         self.group_scheduler = group_scheduler
         self.task_session = task_session
         self._pending_operation_targets: dict[str, ReplicaKey] = {}
-        self._continuation_client_ready = False
         super().__init__(
             config,
             tokenizer,
@@ -153,7 +152,6 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                 else None
             ),
         )
-        self._continuation_client_ready = True
 
     @property
     def committed_capacity(self) -> int:
