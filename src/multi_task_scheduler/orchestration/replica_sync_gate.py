@@ -68,10 +68,6 @@ class ReplicaSyncGate:
     def health(self) -> str:
         return "BLOCKED" if self._blocked_reason is not None else "HEALTHY"
 
-    @property
-    def blocked_reason(self) -> str | None:
-        return self._blocked_reason
-
     def block(self, owner: GateOwner, reason: str) -> None:
         """Latch uncertain side effects; releasing the lock does not prove recovery.
 
