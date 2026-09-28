@@ -113,7 +113,7 @@ Lease(lease_id, claims, expires_at)
 - native 参数同步继续复用原生实现，但进入同一个 Trainer G；CE Manager 增加 owner-local pending-bootstrap 投影，borrowed runtime 在 `WEIGHT_READY` 前不会进入父类 `replicas` effective set/普通全成员同步；`bootstrap_target()` 已复用原生 CE `prepare/build_topology/init/update/finalize` 协议只同步 pending target，并要求目标 server 的 `global_steps` 精确等于当前发布版本后才生成幂等 `WEIGHT_READY` receipt，匹配 operation 的证据才能提升为 effective；
 - Queue exactly-once 仍是原生样本之上的逻辑 key + digest 薄层；
 - 空泡上报只选择“移除后仍能保持当前 committed capacity”的 ACTIVE surplus replica，不再把所有 ACTIVE replica 都当作可捐候选；
-- borrowed placement 入口已在任何 Ray Actor 副作用前校验 borrower/source lease、claim、world_size、单节点 rank/local_rank、整卡约束和过期时间；Manager 同时按 borrower lease 建立幂等 `borrowed_operations` 记录并单调分配 `replica_rank`，相同 create 重试不会二次分配 rank、冲突重放会被拒绝；随后通过 Ray placement-group table 以 `pg_id` 核验 CREATED 状态、namespace、bundle/node 落点，并借 PG name 恢复后反查 handle id；Manager 内部 runtime backend 已接通 hidden borrowed runtime 创建和 verified borrowed destroy：创建成功只登记 `RUNTIME_READY/CREATING`，不会提前进入 E/R/C；destroy 只有在 server/worker 清理验证完成后才生成带完整 GPU UUID 的 `RELEASED`；`MultiTaskvLLMReplica` 进一步生成确定性的 borrower CE actor name、PG/bundle、Ray GPU/CPU 份额和 borrower rank/world 环境计划；底层 `_create_workers_from_claims()` 已按 claim clone `RayClassWithInitArgs`、建立 borrower 自己的 MASTER 通信根并用 `RayWorkerGroup.from_detached()` 包装新 handles，Worker 也新增只读 node/Ray accelerator/物理 GPU UUID 探针；worker 创建后必须逐 rank 与 claim 核对 node/GPU UUID，失败时按确定性 actor name 执行 kill，并通过 Ray State API 确认不存在非 `DEAD` actor。`MultiTaskvLLMHttpServer` 现在还提供 vLLM `check_health()` 驱动的健康事实与单节点 graceful shutdown；`MultiTaskvLLMReplica.init_from_lease()` 能在底层完成 worker → 原生 `launch_servers()` → engine/server 健康校验，并在失败时按 server/worker 名称执行 shutdown/kill + Ray State `DEAD` 核验。该事务 primitive 仍暂未接入 Manager，真实 ADD 继续停在显式 `NotImplementedError`，直到 target-only bootstrap 和失败后的 E/R/M 补偿链同时完成；
+- borrowed placement 入口已在任何 Ray Actor 副作用前校验 borrower/source lease、claim、world_size、单节点 rank/local_rank、整卡约束和过期时间；Manager 同时按 borrower lease 建立幂等 `borrowed_operations` 记录并单调分配 `replica_rank`，相同 create 重试不会二次分配 rank、冲突重放会被拒绝；随后通过 Ray placement-group table 以 `pg_id` 核验 CREATED 状态、namespace、bundle/node 落点，并借 PG name 恢复后反查 handle id；Manager 内部 runtime backend 已接通 hidden borrowed runtime 创建和 verified borrowed destroy：创建成功只登记 `RUNTIME_READY/CREATING`，不会提前进入 E/R/C；destroy 只有在 server/worker 清理验证完成后才生成带完整 GPU UUID 的 `RELEASED`；`MultiTaskvLLMReplica` 进一步生成确定性的 borrower CE actor name、PG/bundle、Ray GPU/CPU 份额和 borrower rank/world 环境计划；底层 `_create_workers_from_claims()` 已按 claim clone `RayClassWithInitArgs`、建立 borrower 自己的 MASTER 通信根并用 `RayWorkerGroup.from_detached()` 包装新 handles，Worker 也新增只读 node/Ray accelerator/物理 GPU UUID 探针；worker 创建后必须逐 rank 与 claim 核对 node/GPU UUID，失败时按确定性 actor name 执行 kill，并通过 Ray State API 确认不存在非 `DEAD` actor。`MultiTaskvLLMHttpServer` 现在还提供 vLLM `check_health()` 驱动的健康事实与单节点 graceful shutdown；`MultiTaskvLLMReplica.init_from_lease()` 能在底层完成 worker → 原生 `launch_servers()` → engine/server 健康校验，并在失败时按 server/worker 名称执行 shutdown/kill + Ray State `DEAD` 核验。该 hidden-create primitive 已由 Manager 调用，但端到端 ADD 在 TaskRunner 受理阶段仍显式 `NotImplementedError`：target-only bootstrap / Vpub 边界尚未完成真实验收，因此不会先创建 runtime 再以 UNKNOWN 收场；
 - GS 句柄只保留在 TaskRunner/Rollouter 跨任务边界，不再下沉到 Manager/LB；Manager/LB 只维护本任务 M/R 与 runtime/request 事实；
 - 对外 `OperationCommand` 仍只携带 `lease_id`；GS 在转发给 TaskRunner 时附带同一份已校验 Lease 快照，TaskRunner 只在内部生成 borrowed placement spec，再交给 Rollouter/Manager 校验。
 
@@ -122,12 +122,11 @@ Lease(lease_id, claims, expires_at)
 以下能力仍必须在真实 VERL/vLLM/CUDA/NCCL 组合完成验证后实现；未接通的路径继续
 显式抛出 `NotImplementedError`，不会用假 handle 或合成证据伪造成功：
 
-- borrowed hidden runtime 创建与 lease-aware GPU 绑定；
-- native DONATE 的真实 sleep/release；
-- target-only 参数 bootstrap / replay；
-- RESTORE 的真实 wake 与参数恢复；
-- FORCE_VERIFIED 已接通 VERL 原生 partial-rollout abort/resume：仅 borrowed、`partial_rollout=true` 且存在其他活动 server 时允许进入；目标 replica 的真实 abort 输出必须先触发 Client continuation 证明，LB 无 `ADMITTED` request 后才形成 `EXIT_READY`；
-- sleep/destroy 后基于真实进程/设备事实生成 RELEASED。
+- borrowed hidden runtime 的创建/销毁 primitive 已实现并有 placement/actor 清理校验，但端到端 ADD 的 target-only 参数 bootstrap / Vpub 提交尚未完成真实验收；
+- native DONATE 的真实 STANDALONE sleep/release；
+- RESTORE 的真实 wake、当前参数恢复与版本确认；
+- FORCE_VERIFIED 的 targeted abort + continuation 真实闭环；当前只保留 continuation-aware Client/LB 控制面 wiring，TaskRunner/Rollouter 都在任何 drain/abort 副作用前 fail-closed；
+- native sleep 后基于真实进程/设备事实生成 RELEASED。
 
 因此 `multitask.enabled=true` 目前表示“启用 092203 控制面与 native subclass
 绑定”，不表示 GPU 借还闭环已经通过验收。
