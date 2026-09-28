@@ -28,6 +28,8 @@ FORCE_VERIFIED is borrowed-only. It reuses VERL's native Fully Async partial-rol
 
 RESTORE wakes the same native runtime, restores current parameters and re-enters E/R/C/M. A partial restore returns to DORMANT only after proven re-sleep, otherwise QUARANTINED.
 
+Current branch status: natural borrowed REMOVE is the only lifecycle path admitted end-to-end. ADD, native DONATE, RESTORE and FORCE are rejected by TaskRunner before journal/worker creation because their native/GPU completion boundary is not yet verified; Rollouter also keeps FORCE fail-closed before M/R mutation or abort. Lower-level borrowed create/destroy, CE target bootstrap and continuation wiring remain available for isolated validation and do not by themselves certify those end-to-end operations.
+
 Idle detection is Rollouter-local: production window + C + read-only Manager M. LB request state does not decide bubbles. Rollouter reports metadata directly to GS; draining starts only after GS issues a lifecycle operation.
 
 The sample path remains Rollouter -> Queue -> Trainer. Exactly-once is a thin logical-key/digest layer over native `RolloutSample`.
