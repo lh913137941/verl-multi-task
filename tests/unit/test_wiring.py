@@ -585,7 +585,7 @@ def test_taskrunner_borrowed_spec_rebuilds_rank_view_from_claim_order():
 
     spec = taskrunner_class()._build_borrowed_spec(command, lease)
 
-    slot = spec["selected_slots"][0]
+    slot = spec["claims"][0]
     assert slot["rank"] == 0
     assert slot["node_rank"] == 0
     assert slot["local_rank"] == 0
@@ -1052,7 +1052,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         "lease_id": "borrower-lease",
         "borrower_task_id": "task-a",
         "borrower_replica_id": "borrowed-0",
-        "selected_slots": [
+        "claims": [
             {
                 "claim_id": "claim-0",
                 "source_lease_id": "source-lease-0",
@@ -1075,7 +1075,6 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         "placement_epoch": 0,
     }
     normalized = manager.validate_borrowed_spec(valid_spec)
-    assert "selected_slots" not in normalized
     assert normalized["max_colocate_count"] == FIRST_RELEASE_MAX_COLOCATE_COUNT
     assert normalized["claims"][0]["rank"] == 0
 
@@ -1097,8 +1096,8 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         manager.validate_borrowed_spec(wrong_m)
 
     wrong_share = dict(valid_spec)
-    wrong_share["selected_slots"] = [
-        dict(valid_spec["selected_slots"][0], gpu_fraction=1.0)
+    wrong_share["claims"] = [
+        dict(valid_spec["claims"][0], gpu_fraction=1.0)
     ]
     with pytest.raises(ValueError, match="Ray GPU accounting share"):
         manager.validate_borrowed_spec(wrong_share)
@@ -1108,7 +1107,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         manager.validate_borrowed_spec(expired)
 
     wrong_namespace = dict(valid_spec)
-    wrong_namespace["selected_slots"] = [
+    wrong_namespace["claims"] = [
         dict(valid_spec["selected_slots"][0], pg_namespace="other")
     ]
     with pytest.raises(ValueError, match="another Ray namespace"):
@@ -1117,7 +1116,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         )
 
     wrong_node = dict(valid_spec)
-    wrong_node["selected_slots"] = [
+    wrong_node["claims"] = [
         dict(valid_spec["selected_slots"][0], node_id="n9")
     ]
     with pytest.raises(ValueError, match="node_id does not match"):
