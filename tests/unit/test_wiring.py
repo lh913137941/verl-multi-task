@@ -2581,10 +2581,26 @@ def test_group_scheduler_restore_requires_original_donor_and_returned_claims():
             )
         )
 
-    # Simulate the already-verified borrowed REMOVE release boundary.  The
-    # RESTORE command may proceed only after no lease-owned GPU/bundle remains.
+    # Simulate the already-verified borrowed REMOVE release boundary.
     gs.active_gpu_owner.pop("u0")
     gs.active_bundle_owner.pop(("pg", 0))
+
+    # A different lease may claim the released physical slot before RESTORE.
+    # The original donor must not wake onto somebody else's active ownership.
+    gs.active_gpu_owner["u0"] = "l2"
+    gs.active_bundle_owner[("pg", 0)] = "l2"
+    with pytest.raises(ValueError, match="fully returned and unclaimed"):
+        gs.submit_operation(
+            OperationCommand(
+                "op-reallocated",
+                OperationKind.RESTORE,
+                ReplicaKey("task-a", "native-0"),
+                "l1",
+            )
+        )
+    gs.active_gpu_owner.pop("u0")
+    gs.active_bundle_owner.pop(("pg", 0))
+
     record = gs.submit_operation(
         OperationCommand(
             "op-restore",
