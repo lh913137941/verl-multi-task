@@ -278,7 +278,7 @@ def test_real_standalone_level2_sleep_releases_device_memory_and_weights_wake_st
         assert len(replica.workers) == 1
         assert len(replica.servers) == 1
 
-        placement = ray.get(replica.workers[0].runtime_placement.remote())
+        placement = asyncio.run(replica.worker_placements())[0]
         gpu_uuid = placement["gpu_uuid"]
         assert gpu_uuid.startswith("GPU-")
 
@@ -545,7 +545,7 @@ def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
             replica_kind=ReplicaKind.NATIVE,
         )
         asyncio.run(replica.init_standalone())
-        placement = ray.get(replica.workers[0].runtime_placement.remote())
+        placement = asyncio.run(replica.worker_placements())[0]
 
         prompt_ids = normalize_token_ids(
             model_config.tokenizer.encode(
