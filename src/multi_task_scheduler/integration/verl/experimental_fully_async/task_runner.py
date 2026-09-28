@@ -101,15 +101,11 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
 
     @staticmethod
     def _unverified_reason(command: OperationCommand) -> str | None:
-        """Return the current profile admission fence, if any."""
-        if command.kind is OperationKind.ADD:
-            return "ADD requires verified target-only parameter bootstrap"
+        """Return the remaining profile admission fence, if any."""
         if command.kind is OperationKind.DONATE:
             return "DONATE requires verified native STANDALONE sleep backend"
         if command.kind is OperationKind.RESTORE:
             return "RESTORE requires verified native wake/bootstrap backend"
-        if command.kind is OperationKind.REMOVE and command.force:
-            return "FORCE REMOVE requires verified targeted abort/continuation backend"
         return None
 
     def _advance_lease(
