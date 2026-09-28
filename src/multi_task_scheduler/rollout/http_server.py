@@ -98,10 +98,22 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         self._submission_paused = True
         self._resume_event.clear()
 
-        # Normal DONATE has already drained at R, but keep the runtime boundary
-        # independently safe: level-2 sleep must never abort a hidden late request.
+        # Reuse VERL's own compatibility decision (MTP/LoRA/NPU may only
+        # support level 1). Whole-GPU lending requires level 2, so do not emit
+        # RELEASED evidence when the underlying rollout cannot safely discard
+        # its weights.
+        sleep_level = self._resolve_sleep_level()
+        if sleep_level != 2:
+            raise NotImplementedError(
+                "whole-GPU DONATE requires a vLLM configuration safe for level-2 sleep"
+            )
+
+        # Normal DONATE has already drained at R. Close the local gate and wait
+        # again at the runtime boundary; with no requests left, vLLM's portable
+        # abort mode cannot abort user work and is compatible with both async-MP
+        # and in-process engine clients.
         await engine.wait_for_requests_to_drain()
-        await engine.sleep(level=2, mode="wait")
+        await engine.sleep(level=2, mode="abort")
         if not await engine.is_sleeping():
             raise RuntimeError("vLLM engine did not enter level-2 sleep")
 
@@ -123,10 +135,16 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         engine = self._require_sleep_engine()
         self._submission_paused = True
         self._resume_event.clear()
-        if not await engine.is_sleeping():
-            raise RuntimeError("native wake requires a sleeping vLLM engine")
-
-        await engine.wake_up(tags=tags)
+        sleeping_before = bool(await engine.is_sleeping())
+        if not sleeping_before:
+            # CE target bootstrap wakes KV cache itself.  The final no-tag wake
+            # is therefore allowed to act as an admission/health commit after
+            # parameters and KV are already resident.  Tagged wakes on an awake
+            # engine remain an error so stale sequencing cannot be hidden.
+            if tags is not None:
+                raise RuntimeError("tagged native wake requires a sleeping vLLM engine")
+        else:
+            await engine.wake_up(tags=tags)
         sleeping = bool(await engine.is_sleeping())
         if sleeping:
             return {
@@ -150,6 +168,18 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
             "fully_awake": True,
             "global_steps": self.global_steps,
         }
+
+    async def release_kv_cache(self):
+        """Preserve VERL sync semantics, but make RESTORE's partial wake idempotent."""
+        if self.node_rank != 0 or not getattr(self.config, "free_cache_engine", False):
+            return None
+        engine = self._require_sleep_engine()
+        if await engine.is_sleeping():
+            # After level-2 -> wake_weights, KV memory is already absent.  CE
+            # bootstrap should transfer current weights directly rather than
+            # issuing another sleep/wake cycle.
+            return {"kv_cache_released": True, "already_sleeping": True}
+        return await super().release_kv_cache()
 
     async def wake_weights(self) -> dict:
         """Allocate weight memory only; parameters must be refreshed before full wake."""
