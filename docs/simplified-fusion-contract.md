@@ -54,11 +54,11 @@ confirmation. The opt-in real GPU acceptance mutates sender tensor data before
 transfer so a version tag alone cannot satisfy the check; that test must actually
 pass before TaskRunner admission is enabled.
 
-For NCCL/HCCL, enabled profiles require the explicit boolean
-`actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.<backend>.rebuild_group=true`.
+The first-release profile is CUDA/NCCL-only and requires
+`actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nccl.rebuild_group=true`.
 Native finalize otherwise retains the collective group, which cannot safely be
-reused when receiver membership changes. This check does not certify a backend
-or device combination, and disabled profiles preserve native configuration.
+reused when receiver membership changes. Other device/transport combinations
+remain outside the verified first-release boundary.
 
 `Vpub` denotes a version, not a cached weight snapshot. Wiring ADD/RESTORE must
 also prove that the sender's actual weights match that version: the membership
