@@ -32,6 +32,9 @@ class GroupScheduler:
         # exact operation and lease instead of accepting a bare GPU list.
         self.operation_commands: dict[str, OperationCommand] = {}
         self.borrower_targets: dict[str, ReplicaKey] = {}
+        # advance_lease completion ledger.  RELEASED closes DONATE/REMOVE
+        # stages; RESTORE uses SERVICE_COMMITTED to close the one-shot lease
+        # cycle without adding another GS interface.
         self.release_evidence: dict[tuple[str, str], OperationEvidence] = {}
         self.release_history: dict[str, list[str]] = {}
         # Internal derived phase: donor RELEASED has made the reserved claims
@@ -109,6 +112,17 @@ class GroupScheduler:
         if previous is not None and previous != command:
             raise ValueError("conflicting operation replay at GroupScheduler")
         if previous is None:
+            history = self.release_history.get(command.lease_id, ())
+            if history:
+                last_command = self.operation_commands.get(history[-1])
+                if (
+                    last_command is not None
+                    and last_command.kind is OperationKind.RESTORE
+                ):
+                    raise ValueError(
+                        "lease lifecycle is complete after RESTORE; open a new lease"
+                    )
+
             expired = bool(lease.expires_at and time.time() >= lease.expires_at)
             if expired and command.kind is OperationKind.ADD:
                 raise ValueError(
@@ -173,6 +187,22 @@ class GroupScheduler:
             self.operation_commands[command.operation_id] = command
             if command.kind is OperationKind.ADD:
                 self.borrower_targets[command.lease_id] = command.target
+            elif command.kind is OperationKind.RESTORE:
+                # Reservation is temporary: it prevents another lease from
+                # claiming the donor slot while the native runtime is waking.
+                # RESTORE SERVICE_COMMITTED later releases it via advance_lease.
+                for bundle_key in lease.bundle_keys:
+                    if self.active_bundle_owner.get(bundle_key) is not None:
+                        raise RuntimeError(
+                            "RESTORE bundle ownership changed during submission"
+                        )
+                    self.active_bundle_owner[bundle_key] = command.lease_id
+                for gpu_uuid in lease.gpu_uuids:
+                    if self.active_gpu_owner.get(gpu_uuid) is not None:
+                        raise RuntimeError(
+                            "RESTORE GPU ownership changed during submission"
+                        )
+                    self.active_gpu_owner[gpu_uuid] = command.lease_id
         return result
 
     @staticmethod
@@ -223,38 +253,79 @@ class GroupScheduler:
         return lease
 
     def advance_lease(self, lease_id: str, evidence: OperationEvidence) -> dict:
-        """GS-internal release commit after exact operation/lease/GPU validation."""
+        """GS-internal lease progression after exact operation evidence validation."""
         lease = self.leases.get(lease_id)
         if lease is None:
             raise ValueError(f"unknown lease {lease_id!r}")
         if not isinstance(evidence, OperationEvidence):
             raise TypeError("advance_lease requires OperationEvidence")
-        if evidence.type is not EvidenceType.RELEASED:
-            raise ValueError("lease handoff requires RELEASED evidence")
 
         command = self.operation_commands.get(evidence.operation_id)
         if command is None:
-            raise ValueError("RELEASED evidence references an unknown operation")
+            raise ValueError("operation evidence references an unknown operation")
         if command.lease_id != lease_id:
-            raise ValueError("RELEASED evidence operation belongs to another lease")
-        if command.kind not in _RELEASE_KINDS:
-            raise ValueError("only DONATE/REMOVE operations may release lease GPUs")
-        if set(evidence.released_gpu_uuids) != set(lease.gpu_uuids):
-            raise ValueError("RELEASED evidence must exactly cover lease GPU claims")
+            raise ValueError("operation evidence belongs to another lease")
 
         evidence_key = (lease_id, evidence.operation_id)
         existing = self.release_evidence.get(evidence_key)
         if existing is not None:
             if existing != evidence:
-                raise ValueError("conflicting release evidence replay")
+                raise ValueError("conflicting lease evidence replay")
+            result = {
+                "lease_id": lease_id,
+                "operation_id": evidence.operation_id,
+            }
+            if command.kind is OperationKind.RESTORE:
+                result["restored"] = True
+            else:
+                result["released"] = True
+            return result
+
+        if command.kind is OperationKind.RESTORE:
+            if evidence.type is not EvidenceType.SERVICE_COMMITTED:
+                raise ValueError(
+                    "RESTORE lease completion requires SERVICE_COMMITTED evidence"
+                )
+            if any(
+                self.active_bundle_owner.get(bundle_key) != lease_id
+                for bundle_key in lease.bundle_keys
+            ) or any(
+                self.active_gpu_owner.get(gpu_uuid) != lease_id
+                for gpu_uuid in lease.gpu_uuids
+            ):
+                raise ValueError(
+                    "RESTORE completion requires its temporary claim reservation"
+                )
+
+            self.release_evidence[evidence_key] = evidence
+            self.release_history.setdefault(lease_id, []).append(
+                evidence.operation_id
+            )
+            self.handoff_ready_leases.discard(lease_id)
+            self.borrower_targets.pop(lease_id, None)
+            for bundle_key in lease.bundle_keys:
+                self.active_bundle_owner.pop(bundle_key, None)
+            for gpu_uuid in lease.gpu_uuids:
+                self.active_gpu_owner.pop(gpu_uuid, None)
             return {
                 "lease_id": lease_id,
                 "operation_id": evidence.operation_id,
-                "released": True,
+                "restored": True,
             }
 
+        if command.kind not in _RELEASE_KINDS:
+            raise ValueError(
+                "only DONATE/REMOVE RELEASED or RESTORE SERVICE_COMMITTED may advance a lease"
+            )
+        if evidence.type is not EvidenceType.RELEASED:
+            raise ValueError("lease handoff requires RELEASED evidence")
+        if set(evidence.released_gpu_uuids) != set(lease.gpu_uuids):
+            raise ValueError("RELEASED evidence must exactly cover lease GPU claims")
+
         self.release_evidence[evidence_key] = evidence
-        self.release_history.setdefault(lease_id, []).append(evidence.operation_id)
+        self.release_history.setdefault(lease_id, []).append(
+            evidence.operation_id
+        )
 
         # DONATE hands the already-reserved claims to the borrower; it must not
         # expose the same physical slot to another lease. Only borrowed REMOVE
