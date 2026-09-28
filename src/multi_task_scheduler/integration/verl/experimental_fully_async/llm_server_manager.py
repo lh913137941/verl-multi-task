@@ -336,7 +336,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             "lease_id": record["lease_id"],
             "replica_rank": record["replica_rank"],
             "state": record["state"],
-            "released": False,
+            "released": bool(record.get("released", False)),
             "error": record.get("error"),
         }
 
@@ -425,20 +425,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             max_colocate_count=resolved_spec["max_colocate_count"],
         )
 
-    async def create_hidden(
-        self,
-        resolved_spec: dict,
-        pg_by_id: dict[str, object],
-    ) -> tuple[object, dict]:
-        """Create one hidden borrower runtime; R/C/E remain untouched."""
-        runtime = self._new_borrowed_runtime(resolved_spec)
-        receipt = await runtime.init_from_lease(resolved_spec, pg_by_id)
-        if not isinstance(receipt, dict) or receipt.get("state") != "RUNTIME_READY":
-            raise RuntimeError("borrowed runtime did not reach RUNTIME_READY")
-        if receipt.get("replica_rank") != resolved_spec["replica_rank"]:
-            raise RuntimeError("borrowed runtime returned a conflicting replica_rank")
-        return runtime, dict(receipt)
-
     def _borrowed_record_for_key(self, key: ReplicaKey) -> dict:
         matches = [
             record
@@ -524,10 +510,21 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             if set(pg_by_id) != {claim["pg_id"] for claim in resolved_spec["claims"]}:
                 raise RuntimeError("placement-group resolution returned incomplete coverage")
 
-            runtime, runtime_receipt = await self.create_hidden(
+            # Keep ownership of the runtime before any awaited initialization so
+            # a failing init can still report/perform verified cleanup.
+            runtime = self._new_borrowed_runtime(resolved_spec)
+            runtime_receipt = await runtime.init_from_lease(
                 resolved_spec,
                 pg_by_id,
             )
+            if (
+                not isinstance(runtime_receipt, dict)
+                or runtime_receipt.get("state") != "RUNTIME_READY"
+            ):
+                raise RuntimeError("borrowed runtime did not reach RUNTIME_READY")
+            if runtime_receipt.get("replica_rank") != resolved_spec["replica_rank"]:
+                raise RuntimeError("borrowed runtime returned a conflicting replica_rank")
+
             async with self.replica_operation_lock:
                 current = self.borrowed_operations[lease_id]
                 replica_key = current["replica_key"]
@@ -551,6 +548,18 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 self._runtime_inventory[replica_key] = runtime
                 return self._borrowed_receipt(current)
         except BaseException as exc:
+            if runtime is not None and not getattr(
+                runtime,
+                "borrowed_cleanup_verified",
+                False,
+            ):
+                try:
+                    await runtime.cleanup_borrowed_runtime()
+                except BaseException:
+                    # The original create failure remains authoritative; M below
+                    # records QUARANTINED when cleanup cannot be proved.
+                    pass
+
             async with self.replica_operation_lock:
                 current = self.borrowed_operations[lease_id]
                 replica_key = current["replica_key"]
@@ -569,14 +578,16 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                     )
                 if cleanup_verified:
                     self.retired_replica_ranks.add(current["replica_rank"])
-                current["state"] = (
-                    "RELEASED" if cleanup_verified else "FAILED"
-                )
+                # Runtime cleanup success is a resource fact, not create
+                # success. Keep the operation FAILED so exact replay raises the
+                # original failure instead of synthesizing RUNTIME_READY.
+                current["state"] = "FAILED"
+                current["released"] = cleanup_verified
                 current["error"] = {
                     "type": type(exc).__name__,
                     "message": str(exc),
                 }
-                current["result"] = self._borrowed_receipt(current)
+                current["result"] = None
             raise
 
     async def sleep(
