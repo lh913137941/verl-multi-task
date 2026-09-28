@@ -245,7 +245,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
         self,
         spec: dict,
         pg_by_id: dict[str, object],
-    ) -> RayWorkerGroup:
+    ) -> None:
         """Create the verified TP=1 borrower CE actor on its claimed PG bundle."""
         item = self.build_borrowed_worker_plan(spec)[0]
         if set(pg_by_id) != {item["pg_id"]}:
@@ -276,7 +276,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
             )
             worker_group = RayWorkerGroup.from_detached(
                 worker_handles=[worker],
-                ray_cls_with_init=RayClassWithInitArgs(base.cls, *base.args, **base.kwargs),
+                ray_cls_with_init=base,
                 name_prefix=f"borrowed_ce_{self.replica_rank}_",
                 use_gpu=True,
                 device_name=get_device_name(),
@@ -284,7 +284,6 @@ class MultiTaskvLLMReplica(vLLMReplica):
             self.workers = list(worker_group.workers)
             self.borrowed_worker_names = (item["actor_name"],)
             await self.validate_worker_placement()
-            return worker_group
         except BaseException as exc:
             try:
                 await self._kill_workers_verified(
