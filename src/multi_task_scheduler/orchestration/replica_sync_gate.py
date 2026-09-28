@@ -163,12 +163,3 @@ class GateLease:
             raise GateFencedError("Gate ownership or health changed before the result was committed")
         return result
 
-    async def __aenter__(self) -> GateLease:
-        if not self.active:
-            raise GateFencedError(
-                f"cannot enter inactive gate lease for {self.owner.operation_id}"
-            )
-        return self
-
-    async def __aexit__(self, exc_type, exc, traceback) -> None:
-        await self.release()
