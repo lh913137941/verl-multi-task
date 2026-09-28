@@ -557,10 +557,14 @@ class MultiTaskvLLMReplica(vLLMReplica):
         receipts = await asyncio.gather(
             *[server.wake_up.remote(*args, **kwargs) for server in servers]
         )
+        weights_only = kwargs.get("tags") == ["weights"]
         for receipt in receipts:
             if not isinstance(receipt, dict):
                 raise TypeError("native server wake returned a non-dict receipt")
-            if receipt.get("fully_awake") is not True or receipt.get("sleeping") is not False:
+            if weights_only:
+                if receipt.get("fully_awake") is not False or receipt.get("sleeping") is not True:
+                    raise RuntimeError("native server did not confirm weights-only wake")
+            elif receipt.get("fully_awake") is not True or receipt.get("sleeping") is not False:
                 raise RuntimeError("native server did not confirm full wake")
         return tuple(receipts)
 
