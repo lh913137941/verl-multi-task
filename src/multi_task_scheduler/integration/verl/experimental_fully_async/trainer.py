@@ -188,11 +188,15 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                     raise RuntimeError(
                         "ADD bootstrap failed and prepared runtime cleanup is unverified"
                     ) from cleanup_error
-            else:
-                gate.block(
-                    lease.owner,
-                    f"ADD publish outcome unknown: {type(exc).__name__}",
-                )
+                # The target never entered E/R/C/M and the hidden runtime is
+                # proven RELEASED. Return that existing evidence so TaskRunner
+                # can close this operation as FAILED and let GS roll back only
+                # the staged borrower target while preserving lease handoff.
+                return release_evidence
+            gate.block(
+                lease.owner,
+                f"ADD publish outcome unknown: {type(exc).__name__}",
+            )
             raise
         finally:
             await lease.release()
