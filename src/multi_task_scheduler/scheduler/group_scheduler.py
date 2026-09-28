@@ -63,7 +63,10 @@ class GroupScheduler:
         self.task_runners[task_id] = task_runner
 
     def detach_task(self, task_id: str) -> None:
-        self.task_runners.pop(str(task_id), None)
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("task_id must be a nonempty string")
+        self.task_runners.pop(task_id, None)
+        self.idle_reports.pop(task_id, None)
 
     def get_task_runners(self) -> dict[str, ActorHandle]:
         return dict(self.task_runners)
