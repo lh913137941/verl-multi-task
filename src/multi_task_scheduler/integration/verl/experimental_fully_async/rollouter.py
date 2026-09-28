@@ -314,10 +314,21 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             manager.transition_replica(replica_key, ReplicaState.DRAINING)
         self._pending_operation_targets[operation_id] = replica_key
 
-        server_id = await lb.begin_drain.remote(replica_key, operation_id)
+        try:
+            try:
+                server_id = await lb.begin_drain.remote(replica_key, operation_id)
+            except BaseException:
+                # begin_drain is idempotent for the same operation. One retry
+                # reconciles the common case where R committed but the reply was
+                # lost; a second failure leaves the drain outcome unverified.
+                server_id = await lb.begin_drain.remote(replica_key, operation_id)
 
-        while await lb.has_unsettled_requests.remote(server_id):
-            await asyncio.sleep(0.1)
+            while await lb.has_unsettled_requests.remote(server_id):
+                await asyncio.sleep(0.1)
+        except BaseException:
+            if manager.replica_state.get(replica_key) is ReplicaState.DRAINING:
+                manager.transition_replica(replica_key, ReplicaState.QUARANTINED)
+            raise
 
         return OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
 
