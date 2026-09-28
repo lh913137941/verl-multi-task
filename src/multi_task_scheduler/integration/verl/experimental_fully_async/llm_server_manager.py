@@ -217,7 +217,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         if not isinstance(raw_claims, (list, tuple)) or not raw_claims:
             raise ValueError("borrowed placement requires nonempty claims")
 
-        world_size = spec.get("world_size", spec.get("borrower_world_size"))
+        world_size = spec.get("world_size")
         if type(world_size) is not int or world_size <= 0:
             raise ValueError("borrowed placement world_size must be a positive integer")
         if world_size != len(raw_claims):
