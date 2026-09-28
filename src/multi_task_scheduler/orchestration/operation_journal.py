@@ -94,11 +94,3 @@ class OperationJournal:
             self._active_by_task.pop(command.target.task_session, None)
         return record
 
-    def active_operation(self, task_session: str) -> str | None:
-        operation_id = self._active_by_task.get(task_session)
-        if operation_id is None:
-            return None
-        if self._records[operation_id].status in _RESOLVED:
-            self._active_by_task.pop(task_session, None)
-            return None
-        return operation_id
