@@ -19,9 +19,15 @@ class CompletionEvidence:
     dropped_oldest: bool
     original_return_value: bool
 
+    def __post_init__(self) -> None:
+        if not self.task_session or not self.logical_sample_id or not self.payload_digest:
+            raise ValueError("CompletionEvidence identity/digest fields must be nonempty")
+        if self.enqueue_seq < 0:
+            raise ValueError("enqueue_seq must be nonnegative")
+
 
 class DuplicateCompletionError(RuntimeError):
-    pass
+    """Same logical sample was re-submitted with a different payload digest."""
 
 
 logger = logging.getLogger(__name__)
