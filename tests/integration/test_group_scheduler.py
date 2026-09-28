@@ -250,6 +250,18 @@ def test_restore_temporary_reservation_closes_one_shot_lease():
             )
         )
 
+        with pytest.raises(ValueError, match="awaits RESTORE"):
+            ray.get(
+                gs.submit_operation.remote(
+                    OperationCommand(
+                        "op-repeat-donate",
+                        OperationKind.DONATE,
+                        ReplicaKey("task-a", "native-0"),
+                        "l1",
+                    )
+                )
+            )
+
         restore = OperationCommand(
             "op-restore",
             OperationKind.RESTORE,
