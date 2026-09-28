@@ -220,8 +220,6 @@ class MultiTaskvLLMReplica(vLLMReplica):
             )
         placements = await self.worker_placements()
         for claim, actual in zip(claims, placements, strict=True):
-            if not isinstance(actual, dict):
-                raise TypeError("runtime placement probe returned a non-dict result")
             if actual.get("node_id") != claim["node_id"]:
                 raise RuntimeError(
                     f"borrower rank {claim['rank']} landed on unexpected node"
