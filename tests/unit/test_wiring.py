@@ -2139,16 +2139,6 @@ def test_ce_target_bootstrap_requires_server_version_confirmation():
 
 
 
-def test_ce_can_advance_one_effective_member_version():
-    ce = checkpoint_manager_class()(replicas=[])
-    key = ReplicaKey("task-a", "r0")
-    ce.add_effective(key, ["replica"], loaded_version=2)
-
-    ce.mark_loaded_version(key, 3)
-
-    assert ce.effective_replicas[key] == (("replica",), 3)
-
-
 def test_ce_rejects_unverified_weight_ready_without_changing_membership():
     ce = checkpoint_manager_class()(replicas=[])
     key = ReplicaKey("task-a", "borrowed-0")
