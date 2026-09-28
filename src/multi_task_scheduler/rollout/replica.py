@@ -520,16 +520,6 @@ class MultiTaskvLLMReplica(vLLMReplica):
             replica_rank=self.replica_rank,
         )
 
-    def prepare_create(self) -> dict:
-        raise NotImplementedError(
-            "replica creation requires verified native runtime backend"
-        )
-
-    def mark_weight_ready(self, operation_id: str):
-        raise NotImplementedError(
-            "weight readiness requires verified replay/bootstrap backend"
-        )
-
     async def sleep(self, *args, **kwargs):
         """Deep-sleep the retained native runtime through verified server receipts."""
         if self.replica_kind is not ReplicaKind.NATIVE:
@@ -568,16 +558,6 @@ class MultiTaskvLLMReplica(vLLMReplica):
                 raise RuntimeError("native server did not confirm full wake")
         return tuple(receipts)
 
-    def prepare_exit(self, operation_id: str):
-        raise NotImplementedError(
-            "exit readiness requires verified vLLM sleep/drain backend"
-        )
-
-    def release_gpu(self, operation_id: str, gpu_uuids):
-        raise NotImplementedError(
-            "GPU release evidence requires verified runtime destroy backend"
-        )
-
     def _setup_env_cuda_visible_devices(self, *args, **kwargs):
         if self.replica_kind is ReplicaKind.BORROWED:
             raise NotImplementedError(
@@ -585,7 +565,3 @@ class MultiTaskvLLMReplica(vLLMReplica):
             )
         return super()._setup_env_cuda_visible_devices(*args, **kwargs)
 
-    def abort_target(self, request_ids):
-        raise NotImplementedError(
-            "targeted abort requires verified FORCE_VERIFIED backend"
-        )
