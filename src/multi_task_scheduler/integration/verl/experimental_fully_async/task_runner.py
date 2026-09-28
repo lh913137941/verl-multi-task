@@ -99,15 +99,6 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             )
         return value
 
-    @staticmethod
-    def _unverified_reason(command: OperationCommand) -> str | None:
-        """Return the remaining profile admission fence, if any."""
-        if command.kind is OperationKind.DONATE:
-            return "DONATE requires verified native STANDALONE sleep backend"
-        if command.kind is OperationKind.RESTORE:
-            return "RESTORE requires verified native wake/bootstrap backend"
-        return None
-
     def _advance_lease(
         self,
         command: OperationCommand,
@@ -159,13 +150,6 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                 raise RuntimeError("TaskRunner control plane is not ready")
             if command.target.task_session != self.task_session:
                 raise ValueError("operation targets another task session")
-
-            # Admission is narrower than the internal orchestration surface:
-            # isolated tests may exercise staged paths, while the production
-            # profile admits only capabilities with verified native/GPU closure.
-            reason = self._unverified_reason(command)
-            if reason is not None:
-                raise NotImplementedError(reason)
 
             journal = self._operation_journal
             existing = journal.query(command.operation_id)
