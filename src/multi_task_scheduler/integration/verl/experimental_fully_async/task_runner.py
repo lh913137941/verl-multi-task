@@ -292,6 +292,13 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                     operation_id=operation_id,
                     expected=EvidenceType.SERVICE_COMMITTED,
                 )
+                ray.get(
+                    self.group_scheduler.advance_lease.remote(
+                        command.lease_id,
+                        final_evidence,
+                    ),
+                    timeout=30,
+                )
 
             else:  # pragma: no cover - OperationKind construction already fences this.
                 raise ValueError(f"unsupported operation kind: {command.kind!r}")
