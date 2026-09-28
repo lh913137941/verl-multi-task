@@ -617,9 +617,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         if not workers:
             raise RuntimeError("native runtime has no CE workers for placement proof")
 
-        placements = await asyncio.gather(
-            *[worker.runtime_placement.remote() for worker in workers]
-        )
+        placements = await runtime.worker_placements()
         gpu_uuids = []
         for placement in placements:
             if not isinstance(placement, dict):
