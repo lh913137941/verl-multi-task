@@ -154,15 +154,6 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
             ),
         )
 
-    @property
-    def committed_capacity(self) -> int:
-        value = getattr(self, "max_concurrent_samples", None)
-        return 0 if value is None else int(value)
-
-    @property
-    def production_window_open(self) -> bool:
-        return not bool(getattr(self, "paused", False))
-
     def collect_idle_candidates(self) -> tuple[tuple[ReplicaKey, ReplicaKind], ...]:
         """Return only ACTIVE replicas whose removal preserves committed C.
 
@@ -171,7 +162,8 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         committed capacity and report only the surplus. This stays Rollouter-local
         and deliberately does not read LB/R.
         """
-        if self.production_window_open or self.committed_capacity <= 0:
+        committed_capacity = int(getattr(self, "max_concurrent_samples", 0) or 0)
+        if not getattr(self, "paused", False) or committed_capacity <= 0:
             return ()
         manager = getattr(self, "llm_server_manager", None)
         if manager is None:
@@ -186,7 +178,7 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
             for key, state in manager.replica_state.items()
             if state is ReplicaState.ACTIVE
         ]
-        required_active = (self.committed_capacity + per_replica - 1) // per_replica
+        required_active = (committed_capacity + per_replica - 1) // per_replica
         surplus_count = max(0, len(active) - required_active)
         return tuple(active[:surplus_count])
 
