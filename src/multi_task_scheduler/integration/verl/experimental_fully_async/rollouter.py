@@ -280,65 +280,15 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                     f"FORCE prepare_exit requires ACTIVE replica, got {state.value}"
                 )
 
-            async_training = getattr(self.config, "async_training", None)
-            if not bool(getattr(async_training, "partial_rollout", False)):
-                raise RuntimeError(
-                    "FORCE REMOVE requires async_training.partial_rollout=true"
-                )
-            if not self._continuation_client_ready:
-                raise RuntimeError(
-                    "FORCE REMOVE continuation-aware client is not ready"
-                )
-
-            runtime = manager.inspect_runtime(replica_key)
-            if runtime is None or not callable(
-                getattr(runtime, "abort_all_requests", None)
-            ):
-                raise RuntimeError(
-                    "FORCE REMOVE target runtime cannot abort in-flight requests"
-                )
-
-            target_server = await lb.server_for_replica.remote(replica_key)
-            if not target_server:
-                raise RuntimeError("FORCE REMOVE target has no routable server")
-            available_servers = set(await lb.get_all_servers.remote())
-            if target_server not in available_servers:
-                raise RuntimeError(
-                    "FORCE REMOVE target server is not active in the load balancer"
-                )
-            if not (available_servers - {target_server}):
-                raise RuntimeError(
-                    "FORCE REMOVE requires another healthy rollout server"
-                )
-
-            self._pending_operation_targets[operation_id] = replica_key
-            manager.transition_replica(replica_key, ReplicaState.DRAINING)
-            try:
-                server_id = await lb.begin_drain.remote(replica_key, operation_id)
-                if server_id != target_server:
-                    raise RuntimeError(
-                        "FORCE drain target changed during preparation"
-                    )
-
-                # VERL vLLM abort produces stop_reason=aborted/abort. The
-                # continuation-aware client records confirm_continuation()
-                # before native release_server(), then the native FullyAsync
-                # retry loop re-acquires another server with prompt+partial tokens.
-                await runtime.abort_all_requests()
-
-                while await lb.has_unsettled_requests.remote(server_id):
-                    await asyncio.sleep(0.1)
-                return OperationEvidence.now(
-                    operation_id,
-                    EvidenceType.EXIT_READY,
-                )
-            except BaseException:
-                if manager.replica_state.get(replica_key) is ReplicaState.DRAINING:
-                    manager.transition_replica(
-                        replica_key,
-                        ReplicaState.QUARANTINED,
-                    )
-                raise
+            # FORCE reclaim is a first-release requirement, but this branch has
+            # not completed the required native/GPU targeted-abort + continuation
+            # validation.  Configuration and control-plane wiring are not proof
+            # that an in-flight request can be handed off safely.  Fail before
+            # changing M/R or aborting requests so an unsupported FORCE attempt
+            # cannot create a partially-drained replica.
+            raise NotImplementedError(
+                "FORCE REMOVE requires verified targeted abort/continuation backend"
+            )
 
         self._pending_operation_targets[operation_id] = replica_key
         if state is ReplicaState.ACTIVE:
