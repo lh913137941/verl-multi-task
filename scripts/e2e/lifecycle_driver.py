@@ -64,7 +64,12 @@ def _discover(ray, timeout_s: float):
     )
 
     deadline = time.monotonic() + timeout_s
-    requested = os.environ.get("MT_E2E_TASK_SESSION")
+    donor_session = os.environ.get("MT_E2E_DONOR_SESSION")
+    borrower_session = os.environ.get("MT_E2E_BORROWER_SESSION")
+    if bool(donor_session) != bool(borrower_session):
+        raise RuntimeError(
+            "set both MT_E2E_DONOR_SESSION and MT_E2E_BORROWER_SESSION"
+        )
     last_error = None
     while time.monotonic() < deadline:
         try:
@@ -73,27 +78,48 @@ def _discover(ray, timeout_s: float):
                 namespace=GROUP_SCHEDULER_NAMESPACE,
             )
             runners = ray.get(gs.get_task_runners.remote(), timeout=10)
-            if requested:
-                runner = runners.get(requested)
-                if runner is not None:
-                    return gs, requested, runner
-            elif len(runners) == 1:
-                task_session, runner = next(iter(runners.items()))
-                return gs, task_session, runner
-            elif len(runners) > 1:
+            if donor_session and borrower_session:
+                donor_runner = runners.get(donor_session)
+                borrower_runner = runners.get(borrower_session)
+                if donor_runner is not None and borrower_runner is not None:
+                    if donor_session == borrower_session:
+                        raise RuntimeError(
+                            "donor and borrower must be different task_session values"
+                        )
+                    return (
+                        gs,
+                        donor_session,
+                        donor_runner,
+                        borrower_session,
+                        borrower_runner,
+                    )
+            elif len(runners) == 2:
                 raise RuntimeError(
-                    "multiple TaskRunners are attached; set MT_E2E_TASK_SESSION: "
+                    "two TaskRunners are attached but their roles are ambiguous; "
+                    "set MT_E2E_DONOR_SESSION and MT_E2E_BORROWER_SESSION: "
+                    + ", ".join(sorted(runners))
+                )
+            elif len(runners) > 2:
+                raise RuntimeError(
+                    "multiple TaskRunners are attached; select donor/borrower with "
+                    "MT_E2E_DONOR_SESSION and MT_E2E_BORROWER_SESSION: "
                     + ", ".join(sorted(runners))
                 )
         except Exception as exc:
             last_error = exc
         time.sleep(0.5)
     raise RuntimeError(
-        f"no usable attached TaskRunner before timeout; last_error={last_error}"
+        f"no usable donor/borrower TaskRunner pair before timeout; "
+        f"last_error={last_error}"
     )
 
 
-def _load_fixture(path: Path, task_session: str, run_id: str):
+def _load_fixture(
+    path: Path,
+    donor_session: str,
+    borrower_session: str,
+    run_id: str,
+):
     from multi_task_scheduler.orchestration.contracts import Lease, ReplicaKey
 
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -102,7 +128,7 @@ def _load_fixture(path: Path, task_session: str, run_id: str):
         claim = dict(source)
         donor = claim.get("donor_task_id")
         if donor in (None, "", "__TASK_SESSION__", "$TASK_SESSION"):
-            claim["donor_task_id"] = task_session
+            claim["donor_task_id"] = donor_session
         claim.setdefault("source_lease_id", f"e2e-source-{run_id}")
         claim.setdefault("claim_id", f"e2e-claim-{run_id}-{index}")
         claim.setdefault("gpu_fraction", 0.5)
@@ -119,9 +145,9 @@ def _load_fixture(path: Path, task_session: str, run_id: str):
 
     lease = Lease(lease_id=lease_id, claims=tuple(claims), expires_at=float(expires_at))
     donor_rank = claims[0]["donor_replica_rank"]
-    donor = ReplicaKey(task_session, f"native-{donor_rank}", 0)
+    donor = ReplicaKey(donor_session, f"native-{donor_rank}", 0)
     borrower = ReplicaKey(
-        task_session,
+        borrower_session,
         str(raw.get("borrower_replica_id") or f"borrowed-e2e-{run_id}"),
         int(raw.get("runtime_epoch", time.time_ns() % 2_000_000_000)),
     )
@@ -203,9 +229,21 @@ def main() -> int:
             OperationKind,
         )
 
-        gs, task_session, runner = _discover(ray, args.attach_timeout_s)
-        result["task_session"] = task_session
-        lease, donor, borrower = _load_fixture(args.lease_file, task_session, run_id)
+        (
+            gs,
+            donor_session,
+            donor_runner,
+            borrower_session,
+            borrower_runner,
+        ) = _discover(ray, args.attach_timeout_s)
+        result["donor_task_session"] = donor_session
+        result["borrower_task_session"] = borrower_session
+        lease, donor, borrower = _load_fixture(
+            args.lease_file,
+            donor_session,
+            borrower_session,
+            run_id,
+        )
         opened = ray.get(gs.open_lease.remote(lease), timeout=30)
         result["lease"] = _jsonable(opened)
 
@@ -223,6 +261,11 @@ def main() -> int:
         ]
         for label, kind, target, force, expected in sequence:
             operation_id = f"e2e-{run_id}-{label}"
+            runner = (
+                donor_runner
+                if target.task_session == donor_session
+                else borrower_runner
+            )
             command = OperationCommand(
                 operation_id=operation_id,
                 kind=kind,
