@@ -330,7 +330,9 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                 status.value,
             )
         finally:
-            self._operation_threads.pop(operation_id, None)
+            with self._journal_lock:
+                self._operation_threads.pop(operation_id, None)
+                self._operation_leases.pop(operation_id, None)
 
     def run(self, config):
         self.group_scheduler = get_or_create_group_scheduler()
