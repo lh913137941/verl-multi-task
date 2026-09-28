@@ -346,6 +346,7 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                 raise ValueError("only NATIVE replicas may restore from DORMANT")
             runtime = None
             activated = False
+            rollback_complete = False
             try:
                 runtime = manager.inspect_runtime(target)
                 if runtime is None:
@@ -443,6 +444,7 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                                 target,
                                 ReplicaState.DORMANT,
                             )
+                            rollback_complete = True
                         except BaseException as rollback_exc:
                             if manager.replica_state.get(target) is ReplicaState.DRAINING:
                                 manager.transition_replica(
@@ -460,7 +462,10 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                 # Failures before M becomes ACTIVE are still provably pre-route.
                 # Return to DORMANT when possible; once M is ACTIVE, only the
                 # commit/query branch above may decide whether rollback is safe.
-                if manager.replica_state.get(target) is ReplicaState.DORMANT:
+                if (
+                    manager.replica_state.get(target) is ReplicaState.DORMANT
+                    and not rollback_complete
+                ):
                     compensated = False
                     try:
                         if activated:
