@@ -248,7 +248,9 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                     "spec-free prepare_replica is valid only for DORMANT native RESTORE"
                 )
             self._pending_operation_targets[operation_id] = replica_key
-            return await manager.wake_weights(replica_key)
+            # RESTORE GPU/weight mutation must happen under Trainer G.  This
+            # pre-step only binds the operation to its retained DORMANT target.
+            return None
 
         if not isinstance(spec, dict):
             raise TypeError("prepare_replica requires placement spec or None for RESTORE")
