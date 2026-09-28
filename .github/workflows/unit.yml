@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - chatgpt/092203-simplified-fusion
+      - chatgpt/0928-merge-verl-expansion
   workflow_dispatch:
 
 jobs:
