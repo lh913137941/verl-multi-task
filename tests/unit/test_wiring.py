@@ -2613,6 +2613,20 @@ def test_group_scheduler_restore_requires_original_donor_and_returned_claims():
     assert gs.operation_commands["op-restore"].target == ReplicaKey(
         "task-a", "native-0"
     )
+    assert gs.active_gpu_owner["u0"] == "l1"
+    assert gs.active_bundle_owner[("pg", 0)] == "l1"
+
+    # Exact command replay is allowed even though RESTORE has already
+    # re-reserved the claims under the same lease.
+    replay = gs.submit_operation(
+        OperationCommand(
+            "op-restore",
+            OperationKind.RESTORE,
+            ReplicaKey("task-a", "native-0"),
+            "l1",
+        )
+    )
+    assert replay.operation_id == "op-restore"
 
 
 def rollouter_class():
