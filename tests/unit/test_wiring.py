@@ -759,12 +759,12 @@ def test_trainer_internal_restore_rebinds_parked_native_and_publishes_current_vp
         ("discard_pending", key),
         ("register_pending", key, "op-restore"),
         ("bootstrap_target", key, "op-restore", 11),
-        ("commit_service", "op-restore"),
         ("commit_pending", key, 11),
+        ("commit_service", "op-restore"),
     ]
 
 
-def test_trainer_restore_service_failure_leaves_ce_pending_not_effective():
+def test_trainer_restore_service_failure_keeps_e_effective_and_blocks_g():
     key = ReplicaKey("task-a", "native-0")
     runtime = type("Runtime", (), {"replica_kind": ReplicaKind.NATIVE})()
     calls = []
@@ -790,8 +790,10 @@ def test_trainer_restore_service_failure_leaves_ce_pending_not_effective():
                 2,
             )
 
-        def commit_pending(self, *args, **kwargs):
-            raise AssertionError("failed service publish must not promote E")
+        def commit_pending(self, target, evidence, *, loaded_version):
+            calls.append(("commit_pending", target, loaded_version))
+            self.pending_bootstrap.pop(target, None)
+            self.effective_replicas[target] = ((runtime,), loaded_version)
 
     class Rollouter:
         get_pending_target = AsyncRemoteMethod(lambda operation_id: key)
@@ -813,8 +815,9 @@ def test_trainer_restore_service_failure_leaves_ce_pending_not_effective():
             )
         )
 
-    assert key in trainer.checkpoint_manager.pending_bootstrap
-    assert trainer.checkpoint_manager.effective_replicas == {}
+    assert key not in trainer.checkpoint_manager.pending_bootstrap
+    assert trainer.checkpoint_manager.effective_replicas[key][1] == 13
+    assert ("commit_pending", key, 13) in calls
     assert trainer.replica_sync_gate.health == "BLOCKED"
 
 
