@@ -92,6 +92,119 @@ def _config(model_path: str):
     return config
 
 
+def _exercise_same_gpu_borrower(
+    *,
+    donor_replica,
+    donor_key,
+    placement: dict,
+    rollout_config,
+    model_config,
+    prompt_ids,
+    token: str,
+):
+    import ray
+
+    from multi_task_scheduler.integration.verl.experimental_fully_async.llm_server_manager import (
+        MultiTaskLLMServerManager,
+    )
+    from multi_task_scheduler.orchestration.contracts import (
+        EvidenceType,
+        ReplicaKey,
+        ReplicaState,
+    )
+    from multi_task_scheduler.rollout.replica import MultiTaskvLLMReplica
+
+    gpu_uuid = placement["gpu_uuid"]
+    pg = donor_replica.resource_pool.get_placement_groups()[0]
+
+    borrower_manager = MultiTaskLLMServerManager.__new__(
+        MultiTaskLLMServerManager
+    )
+    borrower_task = f"{token}-borrower"
+    borrower_manager.task_session = borrower_task
+    borrower_manager.rollout_replica_class = MultiTaskvLLMReplica
+    borrower_manager.rollout_config = rollout_config
+    borrower_manager.model_config = model_config
+    borrower_manager.replica_state = {}
+    borrower_manager.replica_kind = {}
+    borrower_manager._runtime_inventory = {}
+    borrower_manager.next_replica_rank = 0
+    borrower_manager.retired_replica_ranks = set()
+    borrower_manager._allocated_replica_ranks = set()
+    borrower_manager.borrowed_operations = {}
+    borrower_manager.replica_operation_lock = asyncio.Lock()
+
+    borrowed_key = ReplicaKey(borrower_task, "borrowed-0")
+    borrowed_spec = {
+        "operation_id": f"{token}-add",
+        "lease_id": f"{token}-lease",
+        "borrower_task_id": borrowed_key.task_session,
+        "borrower_replica_id": borrowed_key.replica_id,
+        "replica_rank": None,
+        "claims": [
+            {
+                "claim_id": f"{token}-claim",
+                "source_lease_id": f"{token}-source-lease",
+                "donor_task_id": donor_key.task_session,
+                "donor_replica_rank": 0,
+                "pg_id": pg.id.hex(),
+                "bundle_index": 0,
+                "node_id": placement["node_id"],
+                "gpu_uuid": gpu_uuid,
+                "rank": 0,
+                "node_rank": 0,
+                "local_rank": 0,
+                "gpu_fraction": FIRST_RELEASE_RAY_GPU_FRACTION,
+                "cpu_request": 1.0,
+            }
+        ],
+        "world_size": 1,
+        "max_colocate_count": FIRST_RELEASE_MAX_COLOCATE_COUNT,
+        "expires_at": 0,
+        "placement_epoch": 0,
+    }
+    create_receipt = asyncio.run(
+        borrower_manager.create_borrowed_replica(borrowed_spec)
+    )
+    assert create_receipt["state"] == "RUNTIME_READY"
+
+    borrowed_runtime = borrower_manager.inspect_runtime(borrowed_key)
+    assert borrowed_runtime is not None
+    borrowed_placement = asyncio.run(
+        borrowed_runtime.validate_worker_placement()
+    )
+    assert borrowed_placement[0]["gpu_uuid"] == gpu_uuid
+    assert borrowed_placement[0]["node_id"] == placement["node_id"]
+
+    borrowed_output = ray.get(
+        borrowed_runtime._server_handle.generate.remote(
+            request_id=f"{token}-generate-{uuid4().hex}",
+            prompt_ids=prompt_ids,
+            sampling_params={
+                "temperature": 0.0,
+                "max_tokens": 16,
+            },
+            image_data=None,
+        ),
+        timeout=120,
+    )
+    assert getattr(borrowed_output, "token_ids", None)
+
+    destroy_evidence = asyncio.run(
+        borrower_manager.destroy(
+            borrowed_key,
+            operation_id=f"{token}-remove",
+        )
+    )
+    assert destroy_evidence.type is EvidenceType.RELEASED
+    assert destroy_evidence.released_gpu_uuids == (gpu_uuid,)
+    borrower_manager.transition_replica(
+        borrowed_key,
+        ReplicaState.RELEASED,
+    )
+    return destroy_evidence
+
+
 def test_real_standalone_level2_sleep_releases_device_memory_and_weights_wake_stays_fenced():
     """Prove the DONATE sleep primitive on a real physical GPU.
 
@@ -221,93 +334,16 @@ def test_real_standalone_level2_sleep_releases_device_memory_and_weights_wake_st
         )
         assert replay == release
 
-        # A separate borrower task now consumes the second Ray accounting
-        # share of the exact donor PG bundle.  This is the physical proof that
-        # the level-2 release is sufficient for same-GPU runtime creation.
-        pg = replica.resource_pool.get_placement_groups()[0]
-        borrower_manager = MultiTaskLLMServerManager.__new__(
-            MultiTaskLLMServerManager
+        destroy_evidence = _exercise_same_gpu_borrower(
+            donor_replica=replica,
+            donor_key=key,
+            placement=placement,
+            rollout_config=rollout_config,
+            model_config=model_config,
+            prompt_ids=prompt_ids,
+            token="gpu-cycle",
         )
-        borrower_manager.task_session = "gpu-borrower"
-        borrower_manager.rollout_replica_class = MultiTaskvLLMReplica
-        borrower_manager.rollout_config = rollout_config
-        borrower_manager.model_config = model_config
-        borrower_manager.replica_state = {}
-        borrower_manager.replica_kind = {}
-        borrower_manager._runtime_inventory = {}
-        borrower_manager.next_replica_rank = 0
-        borrower_manager.retired_replica_ranks = set()
-        borrower_manager._allocated_replica_ranks = set()
-        borrower_manager.borrowed_operations = {}
-        borrower_manager.replica_operation_lock = asyncio.Lock()
-
-        borrowed_key = ReplicaKey("gpu-borrower", "borrowed-0")
-        borrowed_spec = {
-            "operation_id": "gpu-add",
-            "lease_id": "gpu-lease",
-            "borrower_task_id": borrowed_key.task_session,
-            "borrower_replica_id": borrowed_key.replica_id,
-            "replica_rank": None,
-            "claims": [
-                {
-                    "claim_id": "gpu-claim",
-                    "source_lease_id": "gpu-source-lease",
-                    "donor_task_id": key.task_session,
-                    "donor_replica_rank": 0,
-                    "pg_id": pg.id.hex(),
-                    "bundle_index": 0,
-                    "node_id": placement["node_id"],
-                    "gpu_uuid": gpu_uuid,
-                    "rank": 0,
-                    "node_rank": 0,
-                    "local_rank": 0,
-                    "gpu_fraction": FIRST_RELEASE_RAY_GPU_FRACTION,
-                    "cpu_request": 1.0,
-                }
-            ],
-            "world_size": 1,
-            "max_colocate_count": FIRST_RELEASE_MAX_COLOCATE_COUNT,
-            "expires_at": 0,
-            "placement_epoch": 0,
-        }
-        create_receipt = asyncio.run(
-            borrower_manager.create_borrowed_replica(borrowed_spec)
-        )
-        assert create_receipt["state"] == "RUNTIME_READY"
-        borrowed_runtime = borrower_manager.inspect_runtime(borrowed_key)
-        assert borrowed_runtime is not None
-        borrowed_placement = asyncio.run(
-            borrowed_runtime.validate_worker_placement()
-        )
-        assert borrowed_placement[0]["gpu_uuid"] == gpu_uuid
-        assert borrowed_placement[0]["node_id"] == placement["node_id"]
-
-        borrowed_output = ray.get(
-            borrowed_runtime._server_handle.generate.remote(
-                request_id=f"borrowed-same-gpu-{uuid4().hex}",
-                prompt_ids=prompt_ids,
-                sampling_params={
-                    "temperature": 0.0,
-                    "max_tokens": 16,
-                },
-                image_data=None,
-            ),
-            timeout=120,
-        )
-        assert getattr(borrowed_output, "token_ids", None)
-
-        destroy_evidence = asyncio.run(
-            borrower_manager.destroy(
-                borrowed_key,
-                operation_id="gpu-remove",
-            )
-        )
-        assert destroy_evidence.type is EvidenceType.RELEASED
         assert destroy_evidence.released_gpu_uuids == (gpu_uuid,)
-        borrower_manager.transition_replica(
-            borrowed_key,
-            ReplicaState.RELEASED,
-        )
 
         weights_receipts = asyncio.run(manager.wake_weights(key))
         assert all(
@@ -490,6 +526,7 @@ def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
             replica_kind=ReplicaKind.NATIVE,
         )
         asyncio.run(replica.init_standalone())
+        placement = ray.get(replica.workers[0].runtime_placement.remote())
 
         prompt_ids = normalize_token_ids(
             model_config.tokenizer.encode(
@@ -525,7 +562,19 @@ def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
             manager.sleep(key, operation_id="gpu-restore-donate")
         )
         assert release.type is EvidenceType.RELEASED
+        assert release.released_gpu_uuids == (placement["gpu_uuid"],)
         manager.replica_state[key] = ReplicaState.DORMANT
+
+        destroy_evidence = _exercise_same_gpu_borrower(
+            donor_replica=replica,
+            donor_key=key,
+            placement=placement,
+            rollout_config=rollout_config,
+            model_config=model_config,
+            prompt_ids=prompt_ids,
+            token="gpu-restore-cycle",
+        )
+        assert destroy_evidence.released_gpu_uuids == release.released_gpu_uuids
 
         weights_receipts = asyncio.run(manager.wake_weights(key))
         assert all(
