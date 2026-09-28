@@ -641,32 +641,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         self._native_release_receipts()[operation_id] = (key, evidence)
         return evidence
 
-    async def wake_weights(self, key: ReplicaKey) -> tuple[dict, ...]:
-        """Wake only native weight allocations; service admission stays closed."""
-        if not isinstance(key, ReplicaKey):
-            raise TypeError("wake_weights requires ReplicaKey")
-        if self.replica_kind.get(key) is not ReplicaKind.NATIVE:
-            raise ValueError("wake_weights is valid only for NATIVE replicas")
-        if self.replica_state.get(key) is not ReplicaState.DORMANT:
-            raise ValueError("wake_weights requires a DORMANT native replica")
-
-        runtime = self._runtime_inventory.get(key)
-        if runtime is None:
-            raise RuntimeError("native runtime handle is unavailable for wake")
-        servers = tuple(getattr(runtime, "servers", ()) or ())
-        if not servers:
-            raise RuntimeError("native runtime has no rollout servers to wake")
-
-        receipts = await asyncio.gather(
-            *[server.wake_weights.remote() for server in servers]
-        )
-        for receipt in receipts:
-            if not isinstance(receipt, dict):
-                raise TypeError("native weight wake returned a non-dict receipt")
-            if receipt.get("sleeping") is not True or receipt.get("fully_awake") is not False:
-                raise RuntimeError("native weight wake did not keep the runtime fenced")
-        return tuple(receipts)
-
     async def destroy(
         self,
         key: ReplicaKey,
@@ -712,6 +686,3 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         record["released"] = True
         self.retired_replica_ranks.add(record["replica_rank"])
         return evidence
-
-    def query_runtime(self, key: ReplicaKey):
-        return self.inspect_runtime(key)
