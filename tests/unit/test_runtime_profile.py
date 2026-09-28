@@ -34,6 +34,7 @@ def config():
             },
         },
         "rollout": {"nnodes": 1, "n_gpus_per_node": 8},
+        "trainer": {"device": "cuda"},
         "async_training": {
             "use_trainer_do_validate": False,
             "use_dynamic_resource_scheduling": False,
@@ -88,6 +89,7 @@ def test_enabled_switch_requires_boolean(value):
         ("actor_rollout_ref.rollout.calculate_log_probs", False),
         ("actor_rollout_ref.rollout.enable_sleep_mode", False),
         ("actor_rollout_ref.rollout.free_cache_engine", False),
+        ("trainer.device", "npu"),
         ("data.train_batch_size", 1),
         ("data.gen_batch_size", 2),
     ],
@@ -180,29 +182,26 @@ def test_level2_sleep_profile_allows_merged_lora(model):
     assert validate_runtime_profile(current)
 
 
-def test_non_naive_checkpoint_engine_is_required():
+@pytest.mark.parametrize("backend", ["naive", "hccl", "nixl"])
+def test_only_nccl_checkpoint_engine_is_in_first_release(backend):
     current = config()
-    current["actor_rollout_ref"]["rollout"]["checkpoint_engine"]["backend"] = "naive"
-    with pytest.raises(ProfileConfigurationError, match="non-naive"):
+    current["actor_rollout_ref"]["rollout"]["checkpoint_engine"]["backend"] = backend
+    with pytest.raises(ProfileConfigurationError, match="backend='nccl'"):
         validate_runtime_profile(current)
 
 
-@pytest.mark.parametrize("backend", ["nccl", "hccl"])
 @pytest.mark.parametrize("value", [None, False, "true", 1])
-def test_dynamic_collective_membership_requires_explicit_rebuild(backend, value):
+def test_dynamic_collective_membership_requires_explicit_rebuild(value):
     current = config()
     ce = current["actor_rollout_ref"]["rollout"]["checkpoint_engine"]
-    ce["backend"] = backend
-    ce["engine_kwargs"] = {backend: {"rebuild_group": value}}
+    ce["engine_kwargs"] = {"nccl": {"rebuild_group": value}}
     with pytest.raises(ProfileConfigurationError, match="rebuild_group"):
         validate_runtime_profile(current)
 
 
-@pytest.mark.parametrize("backend", ["nccl", "hccl"])
-def test_collective_rebuild_missing_is_rejected(backend):
+def test_collective_rebuild_missing_is_rejected():
     current = config()
     ce = current["actor_rollout_ref"]["rollout"]["checkpoint_engine"]
-    ce["backend"] = backend
     ce.pop("engine_kwargs", None)
     with pytest.raises(ProfileConfigurationError, match="rebuild_group"):
         validate_runtime_profile(current)
