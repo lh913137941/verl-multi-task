@@ -108,7 +108,11 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             if self.replica_kind[key] is not kind or self.replica_state[key] is not state:
                 raise ValueError("conflicting lifecycle registration")
             if runtime is not None:
-                self._runtime_inventory.setdefault(key, runtime)
+                existing_runtime = self._runtime_inventory.get(key)
+                if existing_runtime is not None and existing_runtime is not runtime:
+                    raise ValueError("ReplicaKey is already bound to another runtime")
+                if existing_runtime is None:
+                    self._runtime_inventory[key] = runtime
             return
         self._validate_kind_state(kind, state)
         self.replica_kind[key] = kind
