@@ -19,6 +19,16 @@ from multi_task_scheduler.orchestration.contracts import (
 from multi_task_scheduler.orchestration.replica_sync_gate import GateKind, ReplicaSyncGate
 
 
+def _require_evidence(value, operation_id: str, expected: EvidenceType, label: str):
+    if not isinstance(value, OperationEvidence):
+        raise TypeError(f"{label} did not return OperationEvidence")
+    if value.operation_id != operation_id:
+        raise ValueError(f"{label} evidence belongs to another operation")
+    if value.type is not expected:
+        raise ValueError(f"expected {expected.value}, got {value.type.value}")
+    return value
+
+
 @ray.remote(num_cpus=10)
 class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
     def __init__(self, *args, task_session=None, **kwargs):
@@ -134,15 +144,12 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                 self.rollouter.commit_service_change.remote,
                 operation,
             )
-            if not isinstance(evidence, OperationEvidence):
-                raise TypeError("service commit did not return OperationEvidence")
-            if evidence.operation_id != operation.operation_id:
-                raise ValueError("service evidence belongs to another operation")
-            if evidence.type is not EvidenceType.SERVICE_COMMITTED:
-                raise ValueError(
-                    f"expected SERVICE_COMMITTED, got {evidence.type.value}"
-                )
-            return evidence
+            return _require_evidence(
+                evidence,
+                operation.operation_id,
+                EvidenceType.SERVICE_COMMITTED,
+                "service commit",
+            )
         except BaseException as exc:
             if mutated:
                 gate.block(
@@ -201,14 +208,12 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                 operation_id=operation.operation_id,
                 loaded_version=self.current_param_version,
             )
-            if not isinstance(weight_evidence, OperationEvidence):
-                raise TypeError("RESTORE bootstrap did not return OperationEvidence")
-            if weight_evidence.operation_id != operation.operation_id:
-                raise ValueError("RESTORE weight evidence belongs to another operation")
-            if weight_evidence.type is not EvidenceType.WEIGHT_READY:
-                raise ValueError(
-                    f"expected WEIGHT_READY, got {weight_evidence.type.value}"
-                )
+            _require_evidence(
+                weight_evidence,
+                operation.operation_id,
+                EvidenceType.WEIGHT_READY,
+                "RESTORE bootstrap",
+            )
 
             # Promote the proven current-Vpub receiver into E before
             # opening R. A routed replica must never be absent from native
@@ -225,15 +230,12 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                 self.rollouter.commit_service_change.remote,
                 operation,
             )
-            if not isinstance(service_evidence, OperationEvidence):
-                raise TypeError("RESTORE service commit did not return OperationEvidence")
-            if service_evidence.operation_id != operation.operation_id:
-                raise ValueError("RESTORE service evidence belongs to another operation")
-            if service_evidence.type is not EvidenceType.SERVICE_COMMITTED:
-                raise ValueError(
-                    f"expected SERVICE_COMMITTED, got {service_evidence.type.value}"
-                )
-            return service_evidence
+            return _require_evidence(
+                service_evidence,
+                operation.operation_id,
+                EvidenceType.SERVICE_COMMITTED,
+                "RESTORE service commit",
+            )
         except BaseException as exc:
             if mutated:
                 gate.block(
