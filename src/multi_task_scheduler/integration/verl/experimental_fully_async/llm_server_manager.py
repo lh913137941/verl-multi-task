@@ -320,16 +320,10 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
 
     @staticmethod
     def _same_borrowed_create_request(record: dict, incoming: dict) -> bool:
-        expected = dict(record["request_spec"])
         current = dict(incoming)
-        expected_rank = expected.get("replica_rank")
-        current_rank = current.get("replica_rank")
-        resolved_rank = record["replica_rank"]
-        if expected_rank is None and current_rank == resolved_rank:
-            current["replica_rank"] = None
-        elif current_rank is None and expected_rank == resolved_rank:
-            expected["replica_rank"] = None
-        return expected == current
+        if current.get("replica_rank") is None:
+            current["replica_rank"] = record["replica_rank"]
+        return record["resolved_spec"] == current
 
     def _resolve_placement_groups(self, claims) -> dict[str, object]:
         """Resolve verified PG handles from serialized claim metadata.
@@ -453,9 +447,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                     return dict(existing["result"])
                 raise RuntimeError("borrowed create is already in progress")
 
-            request_spec = dict(normalized)
-            request_spec["claims"] = [dict(claim) for claim in normalized["claims"]]
-            request_spec["lease_ids"] = list(normalized["lease_ids"])
             replica_key = ReplicaKey(
                 normalized["borrower_task_id"],
                 normalized["borrower_replica_id"],
@@ -483,10 +474,8 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 "state": "CREATING",
                 "result": None,
                 "error": None,
-                # Manager-local replay fence and resolved placement; neither is
-                # serialized to GS. Keeping them separate lets replica_rank=None
-                # retries recover the first allocated rank without false conflict.
-                "request_spec": request_spec,
+                # Manager-local replay fence and resolved placement. Retries
+                # normalize replica_rank=None to this already allocated rank.
                 "resolved_spec": resolved_spec,
             }
             self.borrowed_operations[lease_id] = record
