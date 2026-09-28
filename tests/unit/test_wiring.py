@@ -1735,27 +1735,188 @@ def test_rollouter_idle_detection_treats_unknown_capacity_as_zero():
     assert rollouter.collect_idle_candidates() == ()
 
 
-def test_standalone_replica_rejects_unverified_sleep_and_wake():
-    path = SOURCE / "rollout/replica.py"
-    tree = ast.parse(path.read_text())
-    replica = next(
-        node for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "MultiTaskvLLMReplica"
+def http_server_class():
+    return isolated(
+        "rollout/http_server.py",
+        "MultiTaskvLLMHttpServer",
+        object,
+        asyncio=asyncio,
+        ray=FakeRay,
     )
-    methods = {
-        node.name: node
-        for node in replica.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    for method_name in ("sleep", "wake_up"):
-        method = methods[method_name]
-        assert any(
-            isinstance(node, ast.Raise)
-            and isinstance(node.exc, ast.Call)
-            and isinstance(node.exc.func, ast.Name)
-            and node.exc.func.id == "NotImplementedError"
-            for node in ast.walk(method)
-        ), f"{method_name} must fail explicitly before a verified backend exists"
+
+
+def replica_class():
+    return isolated(
+        "rollout/replica.py",
+        "MultiTaskvLLMReplica",
+        object,
+        asyncio=asyncio,
+        ReplicaKind=ReplicaKind,
+        FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
+    )
+
+
+def native_manager_class():
+    return isolated(
+        f"{INTEGRATION}/llm_server_manager.py",
+        "MultiTaskLLMServerManager",
+        object,
+        ReplicaKey=ReplicaKey,
+        ReplicaKind=ReplicaKind,
+        ReplicaState=ReplicaState,
+        EvidenceType=EvidenceType,
+        OperationEvidence=OperationEvidence,
+        asyncio=asyncio,
+    )
+
+
+def test_standalone_server_level2_sleep_and_two_phase_wake_keep_admission_fenced():
+    calls = []
+
+    class Event:
+        def __init__(self):
+            self.is_set = True
+
+        def clear(self):
+            self.is_set = False
+            calls.append(("gate", "clear"))
+
+        def set(self):
+            self.is_set = True
+            calls.append(("gate", "set"))
+
+    class Engine:
+        def __init__(self):
+            self.sleeping = False
+
+        async def wait_for_requests_to_drain(self):
+            calls.append(("drain",))
+
+        async def sleep(self, *, level, mode):
+            calls.append(("sleep", level, mode))
+            self.sleeping = True
+
+        async def is_sleeping(self):
+            calls.append(("is_sleeping", self.sleeping))
+            return self.sleeping
+
+        async def wake_up(self, *, tags=None):
+            calls.append(("wake_up", tuple(tags) if tags is not None else None))
+            if tags == ["weights"]:
+                self.sleeping = True
+            else:
+                self.sleeping = False
+
+        async def reset_prefix_cache(self, *, reset_connector):
+            calls.append(("reset_prefix_cache", reset_connector))
+
+        async def check_health(self):
+            calls.append(("health",))
+
+    server = http_server_class()()
+    server.nnodes = 1
+    server.node_rank = 0
+    server.replica_rank = 3
+    server.global_steps = 7
+    server.config = type(
+        "Config",
+        (),
+        {"enable_sleep_mode": True, "free_cache_engine": True},
+    )()
+    server.engine = Engine()
+    server._submission_paused = False
+    server._resume_event = Event()
+
+    sleep_receipt = asyncio.run(server.sleep())
+    assert sleep_receipt["sleep_level"] == 2
+    assert sleep_receipt["sleeping"] is True
+    assert server._submission_paused is True
+    assert server._resume_event.is_set is False
+
+    weights_receipt = asyncio.run(server.wake_weights())
+    assert weights_receipt["fully_awake"] is False
+    assert weights_receipt["sleeping"] is True
+    assert server._submission_paused is True
+    assert server._resume_event.is_set is False
+
+    wake_receipt = asyncio.run(server.wake_up())
+    assert wake_receipt["fully_awake"] is True
+    assert wake_receipt["sleeping"] is False
+    assert server._submission_paused is False
+    assert server._resume_event.is_set is True
+    assert ("sleep", 2, "wait") in calls
+    assert ("wake_up", ("weights",)) in calls
+    assert ("reset_prefix_cache", True) in calls
+    assert calls[-2:] == [("health",), ("gate", "set")]
+
+
+def test_native_replica_requires_verified_server_receipts_for_sleep_and_wake():
+    class Server:
+        sleep = AsyncRemoteMethod(
+            lambda: {
+                "sleep_level": 2,
+                "sleeping": True,
+            }
+        )
+        wake_up = AsyncRemoteMethod(
+            lambda *args, **kwargs: {
+                "sleeping": False,
+                "fully_awake": True,
+            }
+        )
+
+    replica = replica_class().__new__(replica_class())
+    replica.replica_kind = ReplicaKind.NATIVE
+    replica.servers = [Server()]
+
+    assert asyncio.run(replica.sleep())[0]["sleep_level"] == 2
+    assert asyncio.run(replica.wake_up())[0]["fully_awake"] is True
+
+
+def test_manager_native_sleep_binds_released_evidence_to_runtime_gpu_uuids():
+    key = ReplicaKey("task-a", "native-0")
+
+    class Worker:
+        def __init__(self, gpu_uuid):
+            self.runtime_placement = AsyncRemoteMethod(
+                lambda: {"node_id": "n0", "gpu_uuid": gpu_uuid}
+            )
+
+    class Runtime:
+        workers = [Worker("u0"), Worker("u1")]
+
+        async def sleep(self):
+            return (
+                {"sleep_level": 2, "sleeping": True},
+            )
+
+    manager = native_manager_class().__new__(native_manager_class())
+    manager.replica_kind = {key: ReplicaKind.NATIVE}
+    manager.replica_state = {key: ReplicaState.DRAINING}
+    manager._runtime_inventory = {key: Runtime()}
+
+    evidence = asyncio.run(manager.sleep(key, operation_id="op-donate"))
+    assert evidence.type is EvidenceType.RELEASED
+    assert evidence.operation_id == "op-donate"
+    assert evidence.released_gpu_uuids == ("u0", "u1")
+
+
+def test_manager_native_wake_weights_keeps_dormant_runtime_fenced():
+    key = ReplicaKey("task-a", "native-0")
+
+    class Server:
+        wake_weights = AsyncRemoteMethod(
+            lambda: {"sleeping": True, "fully_awake": False}
+        )
+
+    runtime = type("Runtime", (), {"servers": [Server()]})()
+    manager = native_manager_class().__new__(native_manager_class())
+    manager.replica_kind = {key: ReplicaKind.NATIVE}
+    manager.replica_state = {key: ReplicaState.DORMANT}
+    manager._runtime_inventory = {key: runtime}
+
+    receipts = asyncio.run(manager.wake_weights(key))
+    assert receipts == ({"sleeping": True, "fully_awake": False},)
 
 
 def test_group_scheduler_binds_donate_to_lease_donor_rank():
@@ -1923,7 +2084,7 @@ def test_rollouter_release_failure_quarantines_drained_replica():
         def transition_replica(self, target, state):
             self.replica_state[target] = state
 
-        def sleep(self, *args, **kwargs):
+        async def sleep(self, *args, **kwargs):
             raise NotImplementedError("verified sleep backend unavailable")
 
     rollouter.llm_server_manager = Manager()
@@ -1954,7 +2115,7 @@ def test_rollouter_verified_native_release_commits_dormant():
         def transition_replica(self, target, state):
             self.replica_state[target] = state
 
-        def sleep(self, target, *, operation_id):
+        async def sleep(self, target, *, operation_id):
             return OperationEvidence(
                 operation_id,
                 EvidenceType.RELEASED,
