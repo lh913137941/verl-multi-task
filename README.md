@@ -123,10 +123,10 @@ Lease(lease_id, claims, expires_at)
 显式抛出 `NotImplementedError`，不会用假 handle 或合成证据伪造成功：
 
 - borrowed hidden runtime 的创建/销毁 primitive 已实现并有 placement/actor 清理校验，但端到端 ADD 的 target-only 参数 bootstrap / Vpub 提交尚未完成真实验收；
-- native DONATE 的真实 STANDALONE sleep/release；
-- RESTORE 的真实 wake、当前参数恢复与版本确认；
+- native STANDALONE 的 level-2 sleep / GPU UUID RELEASED 证据链已实现为待验收 primitive，但真实 GPU 让渡闭环尚未验收，TaskRunner 仍拒绝 DONATE；
+- RESTORE 的 weights-only/full wake primitive 已实现，但 level-2 后必须重新装入完整当前 Vpub 并确认版本；该装参/发布闭环尚未验收，TaskRunner 仍拒绝 RESTORE；
 - FORCE_VERIFIED 的 targeted abort + continuation 真实闭环；当前只保留 continuation-aware Client/LB 控制面 wiring，TaskRunner/Rollouter 都在任何 drain/abort 副作用前 fail-closed；
-- native sleep 后基于真实进程/设备事实生成 RELEASED。
+- native sleep 后还需用真实 GPU 实验确认显存让渡足以让 borrower 在同一物理 GPU 启动；控制面 receipt/mock 不作为验收。
 
 因此 `multitask.enabled=true` 目前表示“启用 092203 控制面与 native subclass
 绑定”，不表示 GPU 借还闭环已经通过验收。
