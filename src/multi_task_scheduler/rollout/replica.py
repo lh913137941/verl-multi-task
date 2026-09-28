@@ -106,8 +106,8 @@ class MultiTaskvLLMReplica(vLLMReplica):
             tuple(spec.get("claims") or ()),
             spec.get("expires_at", 0),
         ).claims
-        if spec.get("world_size") != 1 or self.world_size != 1 or len(claims) != 1:
-            raise ValueError("current borrowed runtime requires world_size=1")
+        if self.world_size != 1 or len(claims) != 1:
+            raise ValueError("current borrowed runtime requires one TP=1 claim")
         claim = claims[0]
         if (
             claim.get("rank") != 0
