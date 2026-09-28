@@ -2326,6 +2326,118 @@ def test_standalone_server_level2_sleep_and_two_phase_wake_keep_admission_fenced
     assert calls[-2:] == [("health",), ("gate", "set")]
 
 
+def test_standalone_server_resume_kv_keeps_restore_admission_fenced():
+    calls = []
+
+    class Event:
+        def __init__(self):
+            self.is_set = False
+
+        def clear(self):
+            self.is_set = False
+            calls.append(("gate", "clear"))
+
+        def set(self):
+            self.is_set = True
+            calls.append(("gate", "set"))
+
+    class Engine:
+        def __init__(self):
+            self.sleeping = True
+
+        async def is_sleeping(self):
+            return self.sleeping
+
+        async def wake_up(self, *, tags=None):
+            calls.append(("wake_up", tuple(tags) if tags is not None else None))
+            if tags == ["kv_cache"]:
+                self.sleeping = False
+
+        async def reset_prefix_cache(self, *, reset_connector):
+            calls.append(("reset_prefix_cache", reset_connector))
+
+    server = http_server_class()()
+    server.nnodes = 1
+    server.node_rank = 0
+    server.replica_rank = 0
+    server.global_steps = 5
+    server.config = type(
+        "Config",
+        (),
+        {"enable_sleep_mode": True, "free_cache_engine": True},
+    )()
+    server.engine = Engine()
+    server._multitask_sleep_stage_value = "weights"
+    server._submission_paused = True
+    server._resume_event = Event()
+
+    receipt = asyncio.run(server.resume_kv_cache())
+    assert receipt["kv_cache_resumed"] is True
+    assert receipt["admission_paused"] is True
+    assert server._submission_paused is True
+    assert server._resume_event.is_set is False
+    assert server._multitask_sleep_stage() == "weights"
+    assert calls == [
+        ("gate", "clear"),
+        ("wake_up", ("kv_cache",)),
+        ("reset_prefix_cache", True),
+    ]
+
+
+def test_standalone_server_weights_stage_rollback_returns_to_level2_sleep():
+    calls = []
+
+    class Event:
+        def clear(self):
+            calls.append(("gate", "clear"))
+
+        def set(self):
+            calls.append(("gate", "set"))
+
+    class Engine:
+        def __init__(self):
+            self.sleeping = True
+
+        async def is_sleeping(self):
+            return self.sleeping
+
+        async def wake_up(self, *, tags=None):
+            calls.append(("wake_up", tuple(tags) if tags is not None else None))
+            if tags == ["kv_cache"]:
+                self.sleeping = False
+
+        async def wait_for_requests_to_drain(self):
+            calls.append(("drain",))
+
+        async def sleep(self, *, level, mode):
+            calls.append(("sleep", level, mode))
+            self.sleeping = True
+
+    server = http_server_class()()
+    server.nnodes = 1
+    server.node_rank = 0
+    server.replica_rank = 0
+    server.global_steps = 5
+    server.config = type(
+        "Config",
+        (),
+        {"enable_sleep_mode": True, "free_cache_engine": True},
+    )()
+    server.engine = Engine()
+    server._resolve_sleep_level = lambda: 2
+    server._multitask_sleep_stage_value = "weights"
+    server._submission_paused = True
+    server._resume_event = Event()
+    server._admitting = 0
+
+    receipt = asyncio.run(server.sleep())
+    assert receipt["sleep_level"] == 2
+    assert receipt["sleeping"] is True
+    assert server._multitask_sleep_stage() == "level2"
+    assert ("wake_up", ("kv_cache",)) in calls
+    assert ("sleep", 2, "abort") in calls
+
+
 def test_standalone_server_rejects_configs_that_cannot_use_level2_sleep():
     class Engine:
         async def wait_for_requests_to_drain(self):
