@@ -186,9 +186,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         if pending_operation != operation_id:
             raise ValueError("pending target belongs to another operation")
 
-        workers = []
-        for replica in replicas:
-            workers.extend(replica.workers)
+        workers = [worker for replica in replicas for worker in replica.workers]
         if not workers:
             raise ValueError("pending target has no checkpoint-engine workers")
 
@@ -251,11 +249,10 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             health = await asyncio.gather(
                 *[replica.validate_server_runtime() for replica in replicas]
             )
-            for item in health:
-                if item.get("global_steps") != loaded_version:
-                    raise RuntimeError(
-                        "target server did not confirm the published parameter version"
-                    )
+            if any(item.get("global_steps") != loaded_version for item in health):
+                raise RuntimeError(
+                    "target server did not confirm the published parameter version"
+                )
 
             evidence = OperationEvidence.now(
                 operation_id,
