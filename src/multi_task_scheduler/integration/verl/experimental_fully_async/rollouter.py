@@ -24,15 +24,8 @@ from multi_task_scheduler.orchestration.contracts import (
     ReplicaState,
 )
 
+from ._support import require_evidence as _require_evidence
 from .llm_server_manager import MultiTaskLLMServerManager
-
-
-def _require_evidence(value, operation_id: str, expected: EvidenceType, label: str):
-    if not isinstance(value, OperationEvidence):
-        raise TypeError(f"{label} did not return OperationEvidence")
-    if value.operation_id != operation_id or value.type is not expected:
-        raise ValueError(f"{label} evidence does not match {operation_id}/{expected.value}")
-    return value
 
 
 def _continuation_prefix_digest(prompt_ids, token_ids) -> str:
@@ -597,6 +590,66 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             raise TypeError("query_release_operation requires ReplicaKey")
         return self.llm_server_manager.query_release_evidence(target, operation_id)
 
+    def _service_identity(self, target: ReplicaKey, label: str):
+        runtime = self.llm_server_manager.inspect_runtime(target)
+        if runtime is None:
+            raise RuntimeError(f"{label} runtime is unavailable")
+        server_id = getattr(runtime, "_server_address", None)
+        server_handle = getattr(runtime, "_server_handle", None)
+        if not isinstance(server_id, str) or not server_id or server_handle is None:
+            raise RuntimeError(f"{label} runtime lacks routable server identity")
+        return runtime, server_id, server_handle
+
+    def _activate_service_target(self, target: ReplicaKey) -> None:
+        manager = self.llm_server_manager
+        manager.activate_service(target)
+        self._update_max_concurrent_samples()
+        manager.transition_replica(target, ReplicaState.ACTIVE)
+
+    def _retract_service_target(self, target: ReplicaKey) -> None:
+        manager = self.llm_server_manager
+        manager.transition_replica(target, ReplicaState.DRAINING)
+        manager.deactivate_service(target)
+        self._update_max_concurrent_samples()
+
+    async def _commit_ready_or_reconcile(
+        self,
+        target: ReplicaKey,
+        server_id: str,
+        server_handle,
+        operation_id: str,
+        label: str,
+    ) -> OperationEvidence | None:
+        lb = self.llm_server_manager.global_load_balancer
+        try:
+            evidence = await lb.commit_ready.remote(
+                target,
+                server_id,
+                server_handle,
+                operation_id,
+            )
+            return _require_evidence(
+                evidence,
+                operation_id,
+                EvidenceType.SERVICE_COMMITTED,
+                f"{label} routing commit",
+            )
+        except BaseException:
+            try:
+                reconciled = await lb.query_ready_operation.remote(operation_id)
+            except BaseException as exc:
+                raise RuntimeError(
+                    f"{label} routing commit outcome is unknown"
+                ) from exc
+            if reconciled is None:
+                return None
+            return _require_evidence(
+                reconciled,
+                operation_id,
+                EvidenceType.SERVICE_COMMITTED,
+                f"{label} routing ledger",
+            )
+
     async def commit_service_change(
         self, operation: OperationRecord
     ) -> OperationEvidence | None:
@@ -641,164 +694,63 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         if state is ReplicaState.CREATING:
             if kind is not ReplicaKind.BORROWED:
                 raise ValueError("only BORROWED replicas may publish from CREATING")
-            runtime = manager.inspect_runtime(target)
-            if runtime is None:
-                raise RuntimeError("borrowed runtime is unavailable for ADD commit")
-            server_id = getattr(runtime, "_server_address", None)
-            server_handle = getattr(runtime, "_server_handle", None)
-            if not isinstance(server_id, str) or not server_id or server_handle is None:
-                raise RuntimeError("borrowed ADD runtime lacks routable server identity")
-
-            activated = False
+            _runtime, server_id, server_handle = self._service_identity(
+                target, "borrowed ADD"
+            )
             try:
-                manager.activate_service(target)
-                activated = True
-                self._update_max_concurrent_samples()
-                manager.transition_replica(target, ReplicaState.ACTIVE)
-                try:
-                    evidence = await lb.commit_ready.remote(
-                        target,
-                        server_id,
-                        server_handle,
-                        operation.operation_id,
-                    )
-                    _require_evidence(
-                        evidence,
-                        operation.operation_id,
-                        EvidenceType.SERVICE_COMMITTED,
-                        "ADD routing commit",
-                    )
-                except BaseException as commit_exc:
-                    try:
-                        reconciled = await lb.query_ready_operation.remote(
-                            operation.operation_id
-                        )
-                    except BaseException as reconcile_exc:
-                        raise RuntimeError(
-                            "ADD routing commit outcome is unknown"
-                        ) from reconcile_exc
-                    if reconciled is not None:
-                        evidence = _require_evidence(
-                            reconciled,
-                            operation.operation_id,
-                            EvidenceType.SERVICE_COMMITTED,
-                            "ADD routing ledger",
-                        )
-                    else:
-                        # R authoritatively reports no publish. Retract C/M but
-                        # do not destroy while E still says the runtime is an
-                        # effective receiver. Trainer owns G and will remove E
-                        # before calling finalize_release().
-                        manager.transition_replica(target, ReplicaState.DRAINING)
-                        if activated:
-                            manager.deactivate_service(target)
-                            activated = False
-                            self._update_max_concurrent_samples()
-                        return None
-
+                self._activate_service_target(target)
+                evidence = await self._commit_ready_or_reconcile(
+                    target,
+                    server_id,
+                    server_handle,
+                    operation.operation_id,
+                    "ADD",
+                )
+                if evidence is None:
+                    # R authoritatively reports no publish. Trainer still owns G
+                    # and removes E before the hidden runtime is destroyed.
+                    self._retract_service_target(target)
+                    return None
                 self._pending_operation_targets.pop(operation.operation_id, None)
                 return evidence
             except BaseException:
                 if manager.replica_state.get(target) is ReplicaState.CREATING:
-                    if activated:
-                        try:
-                            manager.deactivate_service(target)
-                            self._update_max_concurrent_samples()
-                        except BaseException:
-                            pass
                     manager.transition_replica(target, ReplicaState.QUARANTINED)
                 raise
 
-        # RESTORE reuses the same service-commit boundary after Trainer has
-        # proved current Vpub under G.  The vLLM engine may already be fully
-        # resident because CE resumed KV cache; runtime.wake_up() then acts as
-        # the final local-admission + health commit before R/C/M are published.
+        # RESTORE uses the same routing commit helper after Trainer proves Vpub.
         if state is ReplicaState.DORMANT:
             if kind is not ReplicaKind.NATIVE:
                 raise ValueError("only NATIVE replicas may restore from DORMANT")
-            runtime = None
-            activated = False
             try:
-                runtime = manager.inspect_runtime(target)
-                if runtime is None:
-                    raise RuntimeError("native runtime is unavailable for RESTORE commit")
+                runtime, server_id, server_handle = self._service_identity(
+                    target, "native RESTORE"
+                )
                 await runtime.wake_up()
-
-                server_id = getattr(runtime, "_server_address", None)
-                server_handle = getattr(runtime, "_server_handle", None)
-                if not isinstance(server_id, str) or not server_id or server_handle is None:
-                    raise RuntimeError("native RESTORE runtime lacks routable server identity")
-
-                # Trainer has already committed current-Vpub membership into E.
-                # Prepare owner-local service state before the externally visible
-                # R commit, but never re-sleep from this point without also
-                # rolling E back under G.
-                manager.activate_service(target)
-                activated = True
-                self._update_max_concurrent_samples()
-                manager.transition_replica(target, ReplicaState.ACTIVE)
-
+                self._activate_service_target(target)
                 try:
-                    evidence = await lb.commit_ready.remote(
+                    evidence = await self._commit_ready_or_reconcile(
                         target,
                         server_id,
                         server_handle,
                         operation.operation_id,
+                        "RESTORE",
                     )
-                    _require_evidence(
-                        evidence,
-                        operation.operation_id,
-                        EvidenceType.SERVICE_COMMITTED,
-                        "RESTORE routing commit",
-                    )
-                except BaseException as commit_exc:
-                    try:
-                        reconciled = await lb.query_ready_operation.remote(
-                            operation.operation_id
-                        )
-                    except BaseException as reconcile_exc:
-                        # R may already be open. Keep the current-Vpub runtime
-                        # awake and M/C ACTIVE; Trainer fences G on this error.
-                        raise RuntimeError(
-                            "RESTORE routing commit outcome is unknown"
-                        ) from reconcile_exc
-
-                    if reconciled is not None:
-                        try:
-                            evidence = _require_evidence(
-                                reconciled,
-                                operation.operation_id,
-                                EvidenceType.SERVICE_COMMITTED,
-                                "RESTORE routing ledger",
-                            )
-                        except (TypeError, ValueError) as exc:
-                            raise RuntimeError(
-                                "RESTORE routing ledger conflicts with the operation"
-                            ) from exc
-                    else:
-                        # R is definitely absent. Retract C/M while Trainer still
-                        # owns G, then return a definite no-publish marker. Trainer
-                        # removes E before finalize_release() re-enters level-2 sleep.
-                        manager.transition_replica(target, ReplicaState.DRAINING)
-                        if activated:
-                            manager.deactivate_service(target)
-                            activated = False
-                            self._update_max_concurrent_samples()
-                        return None
-
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "RESTORE routing ledger conflicts with the operation"
+                    ) from exc
+                if evidence is None:
+                    # R is definitely absent. Trainer removes E before
+                    # finalize_release() re-enters level-2 sleep.
+                    self._retract_service_target(target)
+                    return None
                 self._pending_operation_targets.pop(operation.operation_id, None)
                 return evidence
             except BaseException:
-                # Failures before ACTIVE/R publication still happen after E was
-                # committed. Do not manufacture DORMANT by sleeping behind E's
-                # back; quarantine the local runtime projection instead.
+                # Before ACTIVE publication, a mutated DORMANT projection cannot
+                # safely be advertised as sleeping.
                 if manager.replica_state.get(target) is ReplicaState.DORMANT:
-                    if activated:
-                        try:
-                            manager.deactivate_service(target)
-                            self._update_max_concurrent_samples()
-                        except BaseException:
-                            pass
                     manager.transition_replica(target, ReplicaState.QUARANTINED)
                 raise
 

@@ -20,15 +20,7 @@ from multi_task_scheduler.orchestration.contracts import (
 )
 from multi_task_scheduler.orchestration.replica_sync_gate import GateKind, ReplicaSyncGate
 
-
-def _require_evidence(value, operation_id: str, expected: EvidenceType, label: str):
-    if not isinstance(value, OperationEvidence):
-        raise TypeError(f"{label} did not return OperationEvidence")
-    if value.operation_id != operation_id:
-        raise ValueError(f"{label} evidence belongs to another operation")
-    if value.type is not expected:
-        raise ValueError(f"expected {expected.value}, got {value.type.value}")
-    return value
+from ._support import require_evidence as _require_evidence
 
 
 @ray.remote(num_cpus=10)
