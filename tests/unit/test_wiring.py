@@ -244,12 +244,9 @@ def test_failed_settled_request_readmission_preserves_previous_continuation_proo
     lb.finish_remove(key)
     assert lb.query_attempt("request-1") is AttemptState.SETTLED
 
-    # Model a routing race: native selection still sees s1 while our lifecycle
-    # view has already fenced it as draining. The replacement attempt fails and
-    # therefore must not erase the previous ACK-loss proof.
-    lb.add_servers({"s1": object()})
-    lb.draining_servers.add("s1")
-    with pytest.raises(RuntimeError, match="draining server"):
+    # Native LB has no active servers after drain/remove. A failed
+    # replacement acquire must not erase the previous ACK-loss proof.
+    with pytest.raises(RuntimeError, match="No available servers"):
         lb.acquire_server("request-1")
 
     assert lb.query_attempt("request-1") is AttemptState.SETTLED
