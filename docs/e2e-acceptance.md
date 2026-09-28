@@ -56,9 +56,9 @@ bash scripts/e2e/validate_exactly_once.sh
 cp examples/e2e/lease.example.json /tmp/lease.json
 ```
 
-然后把 `pg_id`、`node_id`、`gpu_uuid`、`bundle_index` 和 donor rank 改成真实环境值。
+然后把 `pg_id`、`node_id`、`gpu_uuid`、`bundle_index` 和 donor rank 改成真实环境值。这里的 `pg_id` 是 Ray placement group 的十六进制 ID（`pg.id.hex()`），不是 placement group name。
 `donor_task_id` 可以保留 `__TASK_SESSION__`，driver 会替换为本次附着的 TaskRunner session。
-Lease 必须覆盖**完整 donor replica**，不能只填写其中一张卡来绕过设计约束。
+当前融合分支的 borrowed runtime 明确限制 `TP=DP=PP=1` 且 `len(claims)=1`，因此真实生命周期 fixture 只能选择**单 GPU donor replica**；不能拿多 GPU donor 的其中一张卡冒充完整 donor。后续若放开多 TP，需要先扩展生产实现和设计合同，再扩展本 fixture。
 
 ### 方式 A：脚本启动一个有限时长的测试训练
 
