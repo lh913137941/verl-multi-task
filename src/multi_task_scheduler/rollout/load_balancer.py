@@ -25,6 +25,12 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         self.draining_servers: set[str] = set()
         self.draining_operations: dict[str, str] = {}
         self.ready_operations: dict[str, tuple[ReplicaKey, str, OperationEvidence]] = {}
+        # request_id -> (client_id, prefix_digest, operation_id, evidence).
+        # This remains LB-internal request truth: exact retries are idempotent,
+        # while a different client/prefix cannot overwrite an accepted handoff.
+        self.continuation_proofs: dict[
+            str, tuple[str, str, str, OperationEvidence]
+        ] = {}
         for key, server_id in dict(initial_routes or {}).items():
             if not isinstance(key, ReplicaKey):
                 raise TypeError("initial route key must be ReplicaKey")
@@ -70,14 +76,30 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
                              prefix_digest: str) -> OperationEvidence:
         if not request_id or not client_id or not prefix_digest:
             raise ValueError("continuation fields must be nonempty")
+
+        previous = self.continuation_proofs.get(request_id)
+        if previous is not None:
+            previous_client, previous_digest, _operation_id, evidence = previous
+            if previous_client != client_id or previous_digest != prefix_digest:
+                raise ValueError("conflicting continuation proof replay")
+            return evidence
+
         if self.attempt_state.get(request_id) is not AttemptState.ADMITTED:
             raise ValueError("request is not eligible for continuation")
         server_id = self.active_request_server.get(request_id)
         operation_id = self.draining_operations.get(server_id)
         if operation_id is None:
             raise ValueError("request is not part of an active drain operation")
+
+        evidence = OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
+        self.continuation_proofs[request_id] = (
+            client_id,
+            prefix_digest,
+            operation_id,
+            evidence,
+        )
         self.attempt_state[request_id] = AttemptState.TERMINATED
-        return OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
+        return evidence
 
     def requests_for_server(self, server_id: str) -> tuple[str, ...]:
         return tuple(r for r, s in self.active_request_server.items() if s == server_id)
@@ -194,3 +216,4 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             if self.attempt_state.get(request_id) is AttemptState.SETTLED:
                 self.attempt_state.pop(request_id, None)
                 self.active_request_server.pop(request_id, None)
+                self.continuation_proofs.pop(request_id, None)
