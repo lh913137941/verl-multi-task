@@ -255,34 +255,3 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
             "fully_awake": True,
             "global_steps": self.global_steps,
         }
-
-    async def release_kv_cache(self):
-        """Preserve VERL sync semantics, but make RESTORE's partial wake idempotent."""
-        if self.node_rank != 0 or not getattr(self.config, "free_cache_engine", False):
-            return None
-        engine = self._require_sleep_engine()
-        if await engine.is_sleeping():
-            if self._multitask_sleep_stage() != "weights":
-                raise RuntimeError(
-                    "CE bootstrap requires weights-only wake before KV release"
-                )
-            # After level-2 -> weights-only wake, KV memory is already absent.  CE
-            # bootstrap should transfer current weights directly rather than
-            # issuing another sleep/wake cycle.
-            return {"kv_cache_released": True, "already_sleeping": True}
-        return await super().release_kv_cache()
-
-    async def resume_kv_cache(self):
-        """Reuse VERL KV restore while keeping RESTORE admission fenced."""
-        if self._multitask_sleep_stage() != "weights":
-            return await super().resume_kv_cache()
-        self._submission_paused = True
-        self._resume_event.clear()
-        await super().resume_kv_cache()
-        if await self._require_sleep_engine().is_sleeping():
-            raise RuntimeError("KV resume did not make RESTORE runtime resident")
-        return {
-            "kv_cache_resumed": True,
-            "admission_paused": True,
-            "global_steps": self.global_steps,
-        }
