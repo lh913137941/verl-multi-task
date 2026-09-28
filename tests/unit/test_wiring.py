@@ -1297,7 +1297,6 @@ def test_http_server_health_and_shutdown_use_real_engine_boundaries():
 
         health = await server.runtime_health()
         assert health["node_id"] == "node-a"
-        assert health["engine_ready"] is True
         assert server.engine.healthy is True
 
         engine = server.engine
@@ -1682,9 +1681,9 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
         ],
     }
 
-    group = asyncio.run(replica._create_workers_from_claims(spec, {"pg": "PG"}))
+    assert asyncio.run(replica._create_workers_from_claims(spec, {"pg": "PG"})) is None
 
-    assert group.workers == created
+    assert replica.workers == created
     assert len(created) == 1
     record = created[0].record
     assert record["placement"]["placement_group"] == "PG"
@@ -1750,11 +1749,8 @@ def test_init_from_lease_reaches_runtime_ready_only_after_server_health():
             health = {
                 "node_id": "node",
                 "replica_rank": self.replica_rank,
-                "node_rank": 0,
-                "nnodes": 1,
                 "server_address": "127.0.0.1",
                 "server_port": 8000,
-                "engine_ready": True,
                 "global_steps": None,
             }
             server = type(
@@ -1858,7 +1854,7 @@ def test_init_from_lease_reaches_runtime_ready_only_after_server_health():
 
     assert receipt["state"] == "RUNTIME_READY"
     assert receipt["server_address"] == "127.0.0.1:8000"
-    assert receipt["health"]["engine_ready"] is True
+    assert receipt["health"]["server_port"] == 8000
 
 
 def checkpoint_manager_class(**extra_scope):
@@ -2831,11 +2827,8 @@ def test_native_runtime_health_probe_confirms_server_and_ce_worker_node():
     health = {
         "node_id": "node-0",
         "replica_rank": 2,
-        "node_rank": 0,
-        "nnodes": 1,
         "server_address": "127.0.0.1",
         "server_port": 8000,
-        "engine_ready": True,
         "global_steps": 12,
     }
 
