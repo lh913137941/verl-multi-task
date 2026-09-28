@@ -280,6 +280,24 @@ def test_lb_commit_ready_is_atomic_and_idempotent():
         )
 
 
+    with pytest.raises(ValueError, match="requires server_handle"):
+        lb.commit_ready(
+            ReplicaKey("task-a", "none"),
+            "s-none",
+            None,
+            "op-none",
+        )
+
+    lb.add_servers({"s-existing": handle})
+    with pytest.raises(ValueError, match="another handle"):
+        lb.commit_ready(
+            ReplicaKey("task-a", "other-server"),
+            "s-existing",
+            object(),
+            "op-other-server",
+        )
+
+
 def test_lb_finish_remove_clears_ready_operation_ledger():
     key = ReplicaKey("task-a", "borrowed-0")
     lb = load_balancer_class()({})
@@ -594,6 +612,32 @@ def test_taskrunner_add_requires_matching_lease_snapshot_before_launch():
     )
     with pytest.raises(ValueError, match="command.lease_id"):
         runner.submit_operation(command, lease=wrong)
+
+
+def test_taskrunner_launch_failure_cleans_temp_thread_and_lease_state():
+    runner = taskrunner_class()()
+    runner.task_session = "task-a"
+    runner._control_ready = True
+    command = OperationCommand(
+        "op-remove-launch-fail",
+        OperationKind.REMOVE,
+        ReplicaKey("task-a", "borrowed-0"),
+        "l1",
+    )
+
+    def fail_launch(operation_id):
+        runner._operation_threads[operation_id] = object()
+        runner._operation_leases[operation_id] = taskrunner_lease()
+        raise RuntimeError("thread start failed")
+
+    runner._launch_operation = fail_launch
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        runner.submit_operation(command)
+
+    assert "op-remove-launch-fail" not in runner._operation_threads
+    assert "op-remove-launch-fail" not in runner._operation_leases
+    record = runner.query_operation("op-remove-launch-fail")
+    assert record.status is OperationStatus.FAILED
 
 
 def test_taskrunner_unverified_native_donate_fails_before_drain_or_journal():
@@ -992,6 +1036,15 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     assert manager.rollout_replicas == []
     assert manager.server_addresses == []
     assert manager.server_handles == []
+
+    manager.replica_state[key] = ReplicaState.ACTIVE
+    manager.rollout_replicas = []
+    manager.server_addresses = ["s0"]
+    manager.server_handles = ["wrong-handle"]
+    with pytest.raises(RuntimeError, match="address/handle inventory"):
+        manager.activate_service(key)
+    manager.server_addresses = []
+    manager.server_handles = []
 
     manager.task_session = "task-a"
     valid_spec = {
