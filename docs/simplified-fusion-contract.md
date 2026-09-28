@@ -34,7 +34,7 @@ Idle detection is Rollouter-local: production window + C + read-only Manager M. 
 
 The sample path remains Rollouter -> Queue -> Trainer. Exactly-once is a thin logical-key/digest layer over native `RolloutSample`.
 
-Remaining design gaps are outside the main lifecycle happy paths: natural drain still has no independent timeout budget/GS takeover protocol (FORCE is an explicit separate operation); the detailed design's reconciliation name `query_runtime` maps today to owner-local `replica_meta()/inspect_runtime()` rather than a public Manager query API; automatic HA/client-crash recovery remains outside the first-release commitment. These must not be confused with missing ADD/DONATE/REMOVE/FORCE/RESTORE orchestration.
+Remaining design gaps are outside the main lifecycle happy paths: natural drain now has a bounded local timeout, but there is still no separate GS takeover/HA protocol after an owner becomes unreachable (FORCE remains an explicit separate operation); the detailed design's reconciliation name `query_runtime` maps today to owner-local `replica_meta()/inspect_runtime()` rather than a public Manager query API; automatic HA/client-crash recovery remains outside the first-release commitment. Queue completion evidence also remains lifetime-retained because deleting it without a consumer/checkpoint watermark would weaken exactly-once replay protection; a safe GC boundary and payload-digest hot-path optimization still require an explicit durable-consumption fact. These must not be confused with missing ADD/DONATE/REMOVE/FORCE/RESTORE orchestration.
 
 ## Target-only parameter synchronization (092303 section 8.6)
 
