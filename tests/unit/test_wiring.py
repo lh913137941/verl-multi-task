@@ -1080,6 +1080,16 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         manager.destroy(borrowed_key, operation_id="op-remove")
     ) == release
 
+    duplicate_identity = dict(
+        valid_spec,
+        operation_id="op-add-duplicate-key",
+        lease_id="borrower-lease-duplicate-key",
+    )
+    next_rank_before = manager.next_replica_rank
+    with pytest.raises(ValueError, match="new runtime_epoch"):
+        asyncio.run(manager.create_borrowed_replica(duplicate_identity))
+    assert manager.next_replica_rank == next_rank_before
+
     wrong_rank = dict(valid_spec, replica_rank=7)
     with pytest.raises(ValueError, match="conflicting borrowed create replay"):
         asyncio.run(manager.create_borrowed_replica(wrong_rank))
