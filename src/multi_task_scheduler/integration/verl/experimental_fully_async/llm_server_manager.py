@@ -54,7 +54,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         self.replica_kind: dict[ReplicaKey, ReplicaKind] = {}
         self._runtime_inventory: dict[ReplicaKey, object] = {}
         self.next_replica_rank = 0
-        self.retired_replica_ranks: set[int] = set()
         self._allocated_replica_ranks: set[int] = set()
         self.borrowed_operations: dict[str, dict] = {}
         self._native_release_evidence: dict[
@@ -304,15 +303,13 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
     def _allocate_replica_rank_locked(self, requested_rank: int | None) -> int:
         """Allocate a task-local rank exactly once while replica_operation_lock is held."""
         if requested_rank is not None:
-            if requested_rank in self.retired_replica_ranks:
-                raise ValueError("retired replica_rank cannot be reused")
             if requested_rank in self._allocated_replica_ranks:
                 raise ValueError("replica_rank is already allocated")
             rank = requested_rank
             self.next_replica_rank = max(self.next_replica_rank, rank + 1)
         else:
             rank = self.next_replica_rank
-            while rank in self._allocated_replica_ranks or rank in self.retired_replica_ranks:
+            while rank in self._allocated_replica_ranks:
                 rank += 1
             self.next_replica_rank = rank + 1
         self._allocated_replica_ranks.add(rank)
@@ -545,8 +542,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                             else ReplicaState.QUARANTINED
                         ),
                     )
-                if cleanup_verified:
-                    self.retired_replica_ranks.add(current["replica_rank"])
                 # Runtime cleanup success is a resource fact, not create
                 # success. Keep the operation FAILED so exact replay raises the
                 # original failure instead of synthesizing RUNTIME_READY.
@@ -661,5 +656,4 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         record["destroy_evidence"] = evidence
         record["state"] = "RELEASED"
         record["released"] = True
-        self.retired_replica_ranks.add(record["replica_rank"])
         return evidence
