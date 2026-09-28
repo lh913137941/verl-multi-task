@@ -186,20 +186,23 @@ class GroupScheduler:
                 "no TaskRunner is attached under target.task_session; "
                 "first release uses the attached task id as task_session"
             )
-        result = ray.get(
-            task_runner.submit_operation.remote(command, lease=lease),
-            timeout=30,
-        )
-        if not isinstance(result, OperationRecord):
-            raise TypeError("TaskRunner returned a non-OperationRecord")
-        if previous is None:
+
+        # Stage GS intent before dispatch. TaskRunner launches lifecycle work
+        # before submit_operation() returns, and that worker may call
+        # advance_lease() immediately. Recording after the RPC creates a race
+        # where valid RELEASED/SERVICE_COMMITTED evidence appears "unknown".
+        staged_command = previous is None
+        staged_borrower = False
+        staged_restore_reservation = False
+        if staged_command:
             self.operation_commands[command.operation_id] = command
             if command.kind is OperationKind.ADD:
-                self.borrower_targets[command.lease_id] = command.target
+                if self.borrower_targets.get(command.lease_id) is None:
+                    self.borrower_targets[command.lease_id] = command.target
+                    staged_borrower = True
             elif command.kind is OperationKind.RESTORE:
                 # Reservation is temporary: it prevents another lease from
                 # claiming the donor slot while the native runtime is waking.
-                # RESTORE SERVICE_COMMITTED later releases it via advance_lease.
                 for bundle_key in lease.bundle_keys:
                     if self.active_bundle_owner.get(bundle_key) is not None:
                         raise RuntimeError(
@@ -212,7 +215,33 @@ class GroupScheduler:
                             "RESTORE GPU ownership changed during submission"
                         )
                     self.active_gpu_owner[gpu_uuid] = command.lease_id
-        return result
+                staged_restore_reservation = True
+
+        try:
+            result = ray.get(
+                task_runner.submit_operation.remote(command, lease=lease),
+                timeout=30,
+            )
+            if not isinstance(result, OperationRecord):
+                raise TypeError("TaskRunner returned a non-OperationRecord")
+            return result
+        except BaseException:
+            # A rejected/unaccepted command must leave no GS intent behind.
+            # Roll back only state staged by this invocation; replays preserve
+            # the already-accepted ledger.
+            if staged_command:
+                self.operation_commands.pop(command.operation_id, None)
+                if staged_borrower:
+                    if self.borrower_targets.get(command.lease_id) == command.target:
+                        self.borrower_targets.pop(command.lease_id, None)
+                if staged_restore_reservation:
+                    for bundle_key in lease.bundle_keys:
+                        if self.active_bundle_owner.get(bundle_key) == command.lease_id:
+                            self.active_bundle_owner.pop(bundle_key, None)
+                    for gpu_uuid in lease.gpu_uuids:
+                        if self.active_gpu_owner.get(gpu_uuid) == command.lease_id:
+                            self.active_gpu_owner.pop(gpu_uuid, None)
+            raise
 
     @staticmethod
     def _target_matches_donor(target: ReplicaKey, lease: Lease) -> bool:
