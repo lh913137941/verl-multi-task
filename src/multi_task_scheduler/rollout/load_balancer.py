@@ -94,7 +94,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         server_id = self.active_request_server.get(request_id)
         operation_id = self.draining_operations.get(server_id)
         if operation_id is None:
-            raise ValueError("request is not part of an active drain operation")
+            raise KeyError("request is not part of an active drain operation")
 
         evidence = OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
         self.continuation_proofs[request_id] = (
