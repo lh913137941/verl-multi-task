@@ -189,6 +189,7 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         self._submission_paused = True
         self._resume_event.clear()
         sleeping_before = bool(await engine.is_sleeping())
+        kv_already_reset = tags is None and stage == "weights" and not sleeping_before
         if tags == ["weights"] and stage == "weights":
             if not sleeping_before:
                 raise RuntimeError("weights-wake ledger disagrees with vLLM engine")
@@ -237,9 +238,12 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
                 "global_steps": self.global_steps,
             }
 
-        # No request can cross the local gate while stale cache state is cleared
-        # and the fully resident engine is health-checked.
-        await engine.reset_prefix_cache(reset_connector=True)
+        # No request can cross the local gate while stale cache state is
+        # cleared and the fully resident engine is health-checked. CE's staged
+        # KV resume already reset the prefix cache, so do not repeat that work
+        # at the final admission commit.
+        if not kv_already_reset:
+            await engine.reset_prefix_cache(reset_connector=True)
         await engine.check_health()
         self._set_multitask_sleep_stage("awake")
         self._submission_paused = False
