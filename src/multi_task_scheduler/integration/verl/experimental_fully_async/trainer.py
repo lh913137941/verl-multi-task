@@ -3,6 +3,8 @@
 
 """Native Fully Async Trainer plus the single task-local synchronization gate G."""
 
+import json
+
 import ray
 from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
 from verl.utils.config import omega_conf_to_dataclass
@@ -81,6 +83,30 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
                     self.checkpoint_manager.mark_all_loaded_version,
                     self.current_param_version,
                 )
+                if self.checkpoint_manager.parameter_validation_enabled:
+                    effective = [
+                        replica
+                        for replicas, _loaded_version
+                        in self.checkpoint_manager.effective_replicas.values()
+                        for replica in replicas
+                    ]
+                    source_manifest = (
+                        await lease.guard(
+                            self.checkpoint_manager._get_source_manifest
+                        )
+                        if self.checkpoint_manager.source_validation_enabled
+                        else None
+                    )
+                    validation = await lease.guard(
+                        self.checkpoint_manager.validate_parameter_sync,
+                        effective,
+                        self.current_param_version,
+                        source_manifest,
+                    )
+                    print(
+                        "CE_PARAMETER_VALIDATION "
+                        + json.dumps(validation, sort_keys=True)
+                    )
             return result
         except BaseException as exc:
             gate.block(

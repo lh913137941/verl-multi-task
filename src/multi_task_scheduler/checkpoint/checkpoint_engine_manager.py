@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import os
 
 import ray
 from verl.checkpoint_engine.base import CheckpointEngineManager
@@ -24,6 +27,15 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         self._effective_replica_map = {}
         self._pending_bootstrap_map = {}
         self._bootstrap_ready_map = {}
+        # Imported from verl_expansion main as an opt-in acceptance check.
+        # The default path remains byte-for-byte native CE transfer semantics.
+        self.parameter_validation_enabled = (
+            os.environ.get("MULTITASK_PARAMETER_VALIDATION", "0") == "1"
+            or os.environ.get("MULTITASK_SOURCE_VALIDATION", "0") == "1"
+        )
+        self.source_validation_enabled = (
+            os.environ.get("MULTITASK_SOURCE_VALIDATION", "0") == "1"
+        )
 
     @property
     def effective_replicas(self) -> dict:
@@ -153,6 +165,165 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         for key, (replicas, _old_version) in tuple(self._effective_replica_map.items()):
             self._effective_replica_map[key] = (replicas, loaded_version)
 
+    @staticmethod
+    def _manifest_digest(manifest: dict) -> str:
+        entries = manifest.get("parameters", [])
+        canonical = [
+            {
+                "name": item.get("name"),
+                "shape": list(item.get("shape", [])),
+                "dtype": item.get("dtype"),
+                "numel": int(item.get("numel", 0)),
+                "sha256": item.get("sha256"),
+            }
+            for item in entries
+        ]
+        canonical.sort(key=lambda item: item["name"] or "")
+        encoded = json.dumps(
+            canonical, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    async def _get_source_manifest(self) -> dict:
+        """Read an opt-in actor-source manifest when the backend exposes it."""
+        refs = self.actor_wg.execute_checkpoint_engine(
+            ["get_source_manifest"] * self.actor_wg.world_size
+        )
+        manifests = ray.get(refs)
+        for manifest in manifests:
+            if isinstance(manifest, dict) and manifest.get("complete", False):
+                return manifest
+        raise RuntimeError(
+            f"actor source manifest is unavailable or incomplete: {manifests}"
+        )
+
+    @staticmethod
+    def _manifest_mismatches(
+        expected: dict,
+        actual: dict,
+        limit: int = 8,
+    ) -> list[dict]:
+        expected_entries = {
+            item.get("name"): item for item in expected.get("parameters", [])
+        }
+        actual_entries = {
+            item.get("name"): item for item in actual.get("parameters", [])
+        }
+        mismatches = []
+        for name in sorted(set(expected_entries) | set(actual_entries)):
+            source = expected_entries.get(name)
+            received = actual_entries.get(name)
+            if source is None or received is None:
+                mismatches.append(
+                    {"name": name, "source": source, "received": received}
+                )
+            else:
+                differences = {
+                    field: {
+                        "source": source.get(field),
+                        "received": received.get(field),
+                    }
+                    for field in ("shape", "dtype", "numel", "sha256")
+                    if source.get(field) != received.get(field)
+                }
+                if differences:
+                    mismatches.append(
+                        {"name": name, "differences": differences}
+                    )
+            if len(mismatches) >= limit:
+                break
+        return mismatches
+
+    async def validate_parameter_sync(
+        self,
+        replicas,
+        expected_version: int | None = None,
+        source_manifest: dict | None = None,
+    ) -> dict:
+        """Validate receiver manifests without moving tensor payloads to Trainer."""
+        workers = [
+            worker
+            for replica in replicas
+            for worker in getattr(replica, "workers", [])
+        ]
+        if not workers:
+            raise RuntimeError(
+                "parameter validation requires at least one CE Worker"
+            )
+        manifests = ray.get(
+            [worker.get_parameter_manifest.remote() for worker in workers]
+        )
+        if not manifests or any(
+            not isinstance(manifest, dict)
+            or not manifest.get("complete", False)
+            for manifest in manifests
+        ):
+            raise RuntimeError(
+                f"CE parameter manifest is incomplete: {manifests}"
+            )
+        if expected_version is not None:
+            mismatched_versions = [
+                manifest.get("global_steps")
+                for manifest in manifests
+                if manifest.get("global_steps") != expected_version
+            ]
+            if mismatched_versions:
+                raise RuntimeError(
+                    "CE parameter version mismatch: "
+                    f"expected={expected_version}, "
+                    f"received={mismatched_versions}"
+                )
+
+        if source_manifest is not None:
+            if not source_manifest.get("complete", False):
+                raise RuntimeError(
+                    f"actor source manifest is incomplete: {source_manifest}"
+                )
+            if (
+                expected_version is not None
+                and source_manifest.get("global_steps") != expected_version
+            ):
+                raise RuntimeError(
+                    "actor source parameter version mismatch: "
+                    f"expected={expected_version}, "
+                    f"received={source_manifest.get('global_steps')}"
+                )
+            for worker_index, manifest in enumerate(manifests):
+                mismatches = self._manifest_mismatches(
+                    source_manifest, manifest
+                )
+                if mismatches:
+                    raise RuntimeError(
+                        f"CE worker {worker_index} differs from actor "
+                        f"source manifest: {mismatches}"
+                    )
+
+        digests = [self._manifest_digest(manifest) for manifest in manifests]
+        if len(set(digests)) != 1:
+            raise RuntimeError(
+                f"CE workers received different parameter manifests: {digests}"
+            )
+
+        first = manifests[0]
+        result = {
+            "state": "PARAMETERS_VALIDATED",
+            "version": first.get("global_steps"),
+            "worker_count": len(manifests),
+            "parameter_count": first.get("parameter_count", 0),
+            "total_numel": first.get("total_numel", 0),
+            "manifest_digest": digests[0],
+        }
+        if source_manifest is not None:
+            result.update(
+                {
+                    "source_state": "SOURCE_TO_RECEIVER_VALIDATED",
+                    "source_manifest_digest": self._manifest_digest(
+                        source_manifest
+                    ),
+                }
+            )
+        return result
+
     async def bootstrap_target(
         self,
         key: ReplicaKey,
@@ -277,6 +448,22 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             if any(item.get("global_steps") != loaded_version for item in health):
                 raise RuntimeError(
                     "target server did not confirm the published parameter version"
+                )
+
+            if self.parameter_validation_enabled:
+                source_manifest = (
+                    await self._get_source_manifest()
+                    if self.source_validation_enabled
+                    else None
+                )
+                validation = await self.validate_parameter_sync(
+                    replicas,
+                    expected_version=loaded_version,
+                    source_manifest=source_manifest,
+                )
+                print(
+                    "CE_PARAMETER_VALIDATION "
+                    + json.dumps(validation, sort_keys=True)
                 )
 
             evidence = OperationEvidence.now(
