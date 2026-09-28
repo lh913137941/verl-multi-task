@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 
 import ray
 from verl.experimental.fully_async_policy.fully_async_rollouter import (
@@ -496,6 +497,20 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                     else:
                         handoff_complete = confirmed >= aborted_count
                     if not unsettled and handoff_complete:
+                        print(
+                            "MULTITASK_FORCE_HANDOFF "
+                            + json.dumps(
+                                {
+                                    "operation_id": operation_id,
+                                    "admitted_count": len(admitted),
+                                    "abort_ack_known": aborted_count is not None,
+                                    "aborted_count": aborted_count,
+                                    "confirmed_count": confirmed,
+                                },
+                                sort_keys=True,
+                            ),
+                            flush=True,
+                        )
                         break
                     if loop.time() >= deadline:
                         raise TimeoutError(
