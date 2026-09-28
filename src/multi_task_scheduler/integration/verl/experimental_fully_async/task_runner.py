@@ -41,17 +41,12 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
         super().__init__()
         self.group_scheduler = None
         self.task_session = None
-        self._actor_handle = None
         self._control_ready = False
         self._attached_to_gs = False
         self._journal_lock = threading.RLock()
         self._operation_threads: dict[str, threading.Thread] = {}
         self._operation_leases: dict[str, Lease] = {}
-
-    def _ensure_journal(self) -> OperationJournal:
-        if not hasattr(self, "_operation_journal"):
-            self._operation_journal = OperationJournal()
-        return self._operation_journal
+        self._operation_journal = OperationJournal()
 
     @staticmethod
     def _snapshot_record(record: OperationRecord) -> OperationRecord:
@@ -104,12 +99,6 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                 f"expected {expected.value} evidence, got {value.type.value}"
             )
         return value
-
-    @staticmethod
-    def _failure_status(exc: BaseException) -> OperationStatus:
-        # Once a lifecycle worker starts, an exception does not prove which
-        # owner-side effects completed. Keep the task fenced for reconciliation.
-        return OperationStatus.UNKNOWN
 
     def _launch_operation(self, operation_id: str) -> None:
         worker = threading.Thread(
@@ -170,7 +159,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                     "FORCE REMOVE requires verified targeted abort/continuation backend"
                 )
 
-            journal = self._ensure_journal()
+            journal = self._operation_journal
             existing = journal.query(command.operation_id)
             record = journal.begin(command)
 
@@ -190,7 +179,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                 with self._journal_lock:
                     self._operation_threads.pop(command.operation_id, None)
                     self._operation_leases.pop(command.operation_id, None)
-                    self._ensure_journal().finish(
+                    self._operation_journal.finish(
                         command.operation_id,
                         OperationStatus.FAILED,
                         f"failed to launch lifecycle worker: {type(exc).__name__}: {exc}",
@@ -202,7 +191,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
         if not isinstance(operation_id, str) or not operation_id:
             raise ValueError("operation_id must be a nonempty string")
         with self._journal_lock:
-            record = self._ensure_journal().query(operation_id)
+            record = self._operation_journal.query(operation_id)
             if record is not None:
                 return self._snapshot_record(record)
         return OperationRecord(
@@ -213,7 +202,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
 
     def _execute_operation(self, operation_id: str) -> None:
         with self._journal_lock:
-            journal = self._ensure_journal()
+            journal = self._operation_journal
             command = journal.command(operation_id)
             record = journal.mark_running(operation_id)
             operation = self._snapshot_record(record)
@@ -302,22 +291,22 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                 raise ValueError(f"unsupported operation kind: {command.kind!r}")
 
             with self._journal_lock:
-                self._ensure_journal().finish(
+                self._operation_journal.finish(
                     operation_id,
                     OperationStatus.SUCCEEDED,
                     final_evidence.type.value,
                 )
 
         except BaseException as exc:
-            status = self._failure_status(exc)
+            status = OperationStatus.UNKNOWN
             with self._journal_lock:
-                current = self._ensure_journal().query(operation_id)
+                current = self._operation_journal.query(operation_id)
                 if current is not None and current.status not in {
                     OperationStatus.SUCCEEDED,
                     OperationStatus.FAILED,
                     OperationStatus.UNKNOWN,
                 }:
-                    self._ensure_journal().finish(
+                    self._operation_journal.finish(
                         operation_id,
                         status,
                         f"{type(exc).__name__}: {exc}",
@@ -336,7 +325,6 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
         self.group_scheduler = get_or_create_group_scheduler()
         context = ray.get_runtime_context()
         self.task_session = str(context.get_actor_id())
-        self._actor_handle = context.current_actor
         try:
             return super().run(config)
         finally:
@@ -394,7 +382,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
         ray.get(
             self.group_scheduler.attach_task.remote(
                 self.task_session,
-                self._actor_handle,
+                ray.get_runtime_context().current_actor,
             ),
             timeout=30,
         )
