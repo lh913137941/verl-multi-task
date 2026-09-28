@@ -39,7 +39,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main
 - 单节点；
 - 整卡借还（物理独占由 GS 的 `pg_id/bundle_index + gpu_uuid` owner 保证；Ray actor 资源记账不是物理份额）；
 - DP=1、PP=1；
-- TP 必须能放入单节点并经过实际组合验证；
+- 当前已记录的真实 GPU 验收只覆盖 TP=1；TP>1 在补齐同卡借还/RESTORE 实测前由 runtime profile fail-closed；
 - `async_training.use_trainer_do_validate=false`；
 - `async_training.use_dynamic_resource_scheduling=false`。
 
