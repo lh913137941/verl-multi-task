@@ -1413,15 +1413,15 @@ def test_borrowed_worker_plan_is_deterministic_and_side_effect_free():
     second = replica.build_borrowed_worker_plan(spec)
 
     assert first == second
-    assert first[0]["actor_name"].startswith("borrowed_ce_7_")
-    assert first[0]["pg_id"] == "pg"
-    assert first[0]["bundle_index"] == 4
-    assert first[0]["num_gpus"] == FIRST_RELEASE_RAY_GPU_FRACTION
-    assert first[0]["env_vars"] == {
+    assert first["actor_name"].startswith("borrowed_ce_7_")
+    assert first["pg_id"] == "pg"
+    assert first["bundle_index"] == 4
+    assert first["num_gpus"] == FIRST_RELEASE_RAY_GPU_FRACTION
+    assert first["env_vars"] == {
         "WORLD_SIZE": "1",
         "RANK": "0",
         "RAY_LOCAL_WORLD_SIZE": "1",
-        "WG_PREFIX": first[0]["env_vars"]["WG_PREFIX"],
+        "WG_PREFIX": first["env_vars"]["WG_PREFIX"],
         "WG_BACKEND": "ray",
     }
     assert replica.placement_claims[0]["claim_id"] == "claim-0"
