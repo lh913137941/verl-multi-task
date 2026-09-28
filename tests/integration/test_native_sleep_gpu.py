@@ -352,6 +352,194 @@ def test_real_standalone_level2_sleep_releases_device_memory_and_weights_wake_st
 
 
 
+def test_real_force_remove_aborts_target_and_continues_on_another_replica():
+    """Two-GPU acceptance for FORCE targeted abort + native partial retry.
+
+    The logical request is first admitted only to the target borrowed replica.
+    After a second replica becomes routable, FORCE drains/aborts the target.
+    VERL's FullyAsync client must observe the aborted prefix, retry the same
+    logical request on the alternate replica, and finish within the original
+    token budget.
+    """
+
+    model_path = _require_model_path()
+
+    pytest.importorskip("ray")
+    pytest.importorskip("vllm")
+    pytest.importorskip("torch")
+
+    import ray
+    import torch
+    from omegaconf import OmegaConf, open_dict
+    from transformers import AutoTokenizer
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("FORCE continuation acceptance requires at least 2 CUDA GPUs")
+
+    from multi_task_scheduler.integration.verl.experimental_fully_async.rollouter import (
+        MultiTaskFullyAsyncRollouter,
+        _MultiTaskFullyAsyncLLMServerClient,
+    )
+    from multi_task_scheduler.orchestration.contracts import (
+        AttemptState,
+        EvidenceType,
+        ReplicaKey,
+        ReplicaKind,
+        ReplicaState,
+    )
+    from multi_task_scheduler.rollout.load_balancer import (
+        MultiTaskGlobalRequestLoadBalancer,
+    )
+    from multi_task_scheduler.rollout.replica import MultiTaskvLLMReplica
+    from verl.single_controller.ray.base import _unwrap_ray_remote
+    from verl.utils.tokenizer import normalize_token_ids
+
+    config = _config(model_path)
+    with open_dict(config):
+        config.async_training = OmegaConf.create({"partial_rollout": True})
+
+    rollout_config = config.actor_rollout_ref.rollout
+    model_config = config.actor_rollout_ref.model
+
+    ray.shutdown()
+    ray.init(
+        num_cpus=8,
+        num_gpus=2,
+        runtime_env={
+            "env_vars": {
+                "TOKENIZERS_PARALLELISM": "true",
+                "NCCL_DEBUG": "WARN",
+                "VLLM_LOGGING_LEVEL": "INFO",
+                "VLLM_USE_V1": "1",
+            }
+        },
+        ignore_reinit_error=True,
+    )
+
+    try:
+        target = MultiTaskvLLMReplica(
+            replica_rank=0,
+            config=rollout_config,
+            model_config=model_config,
+            gpus_per_node=1,
+            replica_kind=ReplicaKind.BORROWED,
+        )
+        alternate = MultiTaskvLLMReplica(
+            replica_rank=1,
+            config=rollout_config,
+            model_config=model_config,
+            gpus_per_node=1,
+            replica_kind=ReplicaKind.NATIVE,
+        )
+        asyncio.run(asyncio.gather(target.init_standalone(), alternate.init_standalone()))
+
+        target_key = ReplicaKey("gpu-force", "borrowed-0")
+        lb = ray.remote(MultiTaskGlobalRequestLoadBalancer).remote(
+            {target._server_address: target._server_handle},
+            full_determinism=False,
+            initial_routes={target_key: target._server_address},
+        )
+        client = _MultiTaskFullyAsyncLLMServerClient(
+            config=config,
+            load_balancer_handle=lb,
+            client_id="gpu-force-client",
+        )
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+        )
+        prompt_ids = normalize_token_ids(
+            tokenizer.encode(
+                "Continue this response long enough to validate FORCE handoff.",
+                add_special_tokens=True,
+            )
+        )
+        logical_request_id = f"gpu-force-{uuid4().hex}"
+
+        class Manager:
+            global_load_balancer = lb
+
+            def __init__(self):
+                self.replica_state = {target_key: ReplicaState.ACTIVE}
+                self.replica_kind = {target_key: ReplicaKind.BORROWED}
+
+            def replica_meta(self, key):
+                return self.replica_kind[key], self.replica_state[key]
+
+            def inspect_runtime(self, key):
+                assert key == target_key
+                return target
+
+            def transition_replica(self, key, state):
+                self.replica_state[key] = state
+
+        async def scenario():
+            generation = asyncio.create_task(
+                client.generate(
+                    request_id=logical_request_id,
+                    prompt_ids=prompt_ids,
+                    sampling_params={
+                        "temperature": 0.0,
+                        "max_tokens": 128,
+                        "min_tokens": 128,
+                    },
+                )
+            )
+
+            deadline = asyncio.get_running_loop().time() + 30.0
+            while True:
+                owned = await lb.requests_for_server.remote(target._server_address)
+                state = await lb.query_attempt.remote(logical_request_id)
+                if logical_request_id in owned and state is AttemptState.ADMITTED:
+                    break
+                if generation.done():
+                    raise AssertionError(
+                        "generation completed before FORCE could observe an admitted request"
+                    )
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise AssertionError("request was not admitted to FORCE target in time")
+                await asyncio.sleep(0.01)
+
+            await lb.add_servers.remote(
+                {alternate._server_address: alternate._server_handle}
+            )
+
+            rollouter_cls = _unwrap_ray_remote(MultiTaskFullyAsyncRollouter)
+            rollouter = rollouter_cls.__new__(rollouter_cls)
+            rollouter.config = config
+            rollouter.llm_server_manager = Manager()
+            rollouter._pending_operation_targets = {}
+
+            exit_ready = await rollouter.prepare_exit(
+                target_key,
+                operation_id="gpu-force-remove",
+                force=True,
+            )
+            assert exit_ready.type is EvidenceType.EXIT_READY
+            assert (
+                await lb.continuation_handoff_requests.remote("gpu-force-remove")
+            ) == (logical_request_id,)
+            assert not await lb.has_unsettled_requests.remote(
+                target._server_address
+            )
+
+            output = await asyncio.wait_for(generation, timeout=120.0)
+            assert output.stop_reason not in {"abort", "aborted"}
+            assert len(output.token_ids) == 128
+
+            await lb.finish_remove.remote(target_key)
+            assert (
+                await lb.continuation_handoff_requests.remote("gpu-force-remove")
+            ) == ()
+            return output
+
+        output = asyncio.run(scenario())
+        assert getattr(output, "token_ids", None)
+    finally:
+        ray.shutdown()
+
+
 def _training_sender_class():
     import torch
 
