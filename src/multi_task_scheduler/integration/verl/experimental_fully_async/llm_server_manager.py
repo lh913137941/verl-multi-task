@@ -468,8 +468,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 state=ReplicaState.CREATING,
             )
             record = {
-                "result": None,
-                "error": None,
                 # Manager-local replay fence and resolved placement. Retries
                 # normalize replica_rank=None to this already allocated rank.
                 "resolved_spec": resolved_spec,
@@ -499,7 +497,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
 
             async with self.replica_operation_lock:
                 current = self.borrowed_operations[lease_id]
-                current["error"] = None
                 current["result"] = {
                     "operation_id": current["resolved_spec"]["operation_id"],
                     "lease_id": lease_id,
