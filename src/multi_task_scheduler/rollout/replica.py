@@ -20,6 +20,7 @@ from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
 from multi_task_scheduler.orchestration.contracts import (
     FIRST_RELEASE_MAX_COLOCATE_COUNT,
+    Lease,
     ReplicaKind,
 )
 from .http_server import MultiTaskvLLMHttpServer
@@ -102,7 +103,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
         }
 
     def validate_placement(self, spec: dict) -> None:
-        """Validate the borrower-local topology without creating Ray actors."""
+        """Validate runtime identity/topology on a normalized Lease spec."""
         if self.replica_kind is not ReplicaKind.BORROWED:
             raise ValueError("lease placement is valid only for BORROWED replicas")
         if not isinstance(spec, dict):
@@ -114,49 +115,26 @@ class MultiTaskvLLMReplica(vLLMReplica):
         if spec.get("max_colocate_count") != FIRST_RELEASE_MAX_COLOCATE_COUNT:
             raise ValueError("placement max_colocate_count does not match first release")
 
-        claims = spec.get("claims")
-        if not isinstance(claims, (list, tuple)) or not claims:
-            raise ValueError("borrowed placement requires normalized claims")
-        if spec.get("world_size") != len(claims):
-            raise ValueError("placement world_size must equal claim count")
-        if len(claims) != self.world_size:
+        claims = tuple(spec.get("claims") or ())
+        if spec.get("world_size") != len(claims) or len(claims) != self.world_size:
             raise ValueError("placement world_size does not match borrower model topology")
 
-        node_ids = set()
-        bundle_keys = set()
-        gpu_uuids = set()
-        claim_ids = set()
+        # Reuse the shared Lease contract for claim identity, donor, PG/GPU,
+        # accounting-share, CPU and uniqueness checks.
+        claims = Lease(
+            spec["lease_id"],
+            claims,
+            spec.get("expires_at", 0),
+        ).claims
+
         for rank, claim in enumerate(claims):
             if claim.get("rank") != rank:
                 raise ValueError("borrower ranks must be ordered 0..world_size-1")
             if claim.get("node_rank") != 0 or claim.get("local_rank") != rank:
                 raise ValueError("first release requires one-node borrower rank layout")
-            if claim.get("gpu_fraction") != 1.0 / self.max_colocate_count:
-                raise ValueError("claim GPU accounting share does not match runtime M")
-            if claim.get("cpu_request") != 1.0:
-                raise ValueError("first release requires one CPU per borrower CE actor")
-
-            claim_id = claim.get("claim_id")
-            gpu_uuid = claim.get("gpu_uuid")
-            bundle_key = (claim.get("pg_id"), claim.get("bundle_index"))
-            node_id = claim.get("node_id")
-            if not isinstance(claim_id, str) or not claim_id:
-                raise ValueError("claim_id must be nonempty")
-            if not isinstance(gpu_uuid, str) or not gpu_uuid:
-                raise ValueError("gpu_uuid must be nonempty")
-            if not isinstance(node_id, str) or not node_id:
-                raise ValueError("node_id must be nonempty")
-            if bundle_key[0] is None or bundle_key[1] is None:
-                raise ValueError("claim requires PG id and bundle index")
-            if claim_id in claim_ids or gpu_uuid in gpu_uuids or bundle_key in bundle_keys:
-                raise ValueError("first release claims must be unique per physical GPU")
-            claim_ids.add(claim_id)
-            gpu_uuids.add(gpu_uuid)
-            bundle_keys.add(bundle_key)
-            node_ids.add(node_id)
-
-        if len(node_ids) != 1:
+        if len({claim["node_id"] for claim in claims}) != 1:
             raise ValueError("first release borrowed placement must be single-node")
+
 
     def build_borrowed_worker_plan(self, spec: dict) -> tuple[dict, ...]:
         """Build deterministic CE actor placement metadata with no Ray side effects."""
