@@ -3330,6 +3330,7 @@ def http_server_class():
         "MultiTaskvLLMHttpServer",
         Parent,
         asyncio=asyncio,
+        json=__import__("json"),
         ray=FakeRay,
     )
 
