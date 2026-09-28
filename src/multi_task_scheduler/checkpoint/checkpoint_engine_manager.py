@@ -287,19 +287,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             # held; server admission never opens on this path.
             if native_restore:
                 try:
-                    receipts = await asyncio.gather(
-                        *[replica.sleep() for replica in replicas]
-                    )
-                    for replica_receipts in receipts:
-                        if not isinstance(replica_receipts, (tuple, list)) or not replica_receipts:
-                            raise RuntimeError("native RESTORE rollback returned no sleep receipts")
-                        if any(
-                            not isinstance(receipt, dict)
-                            or receipt.get("sleep_level") != 2
-                            or receipt.get("sleeping") is not True
-                            for receipt in replica_receipts
-                        ):
-                            raise RuntimeError("native RESTORE rollback did not confirm level-2 sleep")
+                    await asyncio.gather(*[replica.sleep() for replica in replicas])
                 except BaseException as rollback_exc:
                     cleanup_error = rollback_exc
 
