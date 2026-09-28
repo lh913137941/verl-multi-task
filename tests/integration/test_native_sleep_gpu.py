@@ -431,7 +431,13 @@ def test_real_force_remove_aborts_target_and_continues_on_another_replica():
             gpus_per_node=1,
             replica_kind=ReplicaKind.NATIVE,
         )
-        asyncio.run(asyncio.gather(target.init_standalone(), alternate.init_standalone()))
+        async def init_replicas():
+            await asyncio.gather(
+                target.init_standalone(),
+                alternate.init_standalone(),
+            )
+
+        asyncio.run(init_replicas())
 
         target_key = ReplicaKey("gpu-force", "borrowed-0")
         lb = ray.remote(MultiTaskGlobalRequestLoadBalancer).remote(
