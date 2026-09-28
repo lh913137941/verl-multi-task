@@ -1089,6 +1089,30 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         asyncio.run(manager.create_borrowed_replica(conflicting))
     assert manager.next_replica_rank == 1
 
+    class InvalidReceiptRuntime(FakeBorrowedRuntime):
+        async def init_from_lease(self, spec, pg_by_id):
+            return {
+                "state": "BROKEN",
+                "replica_rank": self.replica_rank,
+            }
+
+    manager.rollout_replica_class = InvalidReceiptRuntime
+    invalid_receipt = dict(
+        valid_spec,
+        operation_id="op-add-invalid-receipt",
+        lease_id="borrower-lease-invalid-receipt",
+        borrower_replica_id="borrowed-invalid-receipt",
+        replica_rank=None,
+    )
+    with pytest.raises(RuntimeError, match="RUNTIME_READY"):
+        asyncio.run(manager.create_borrowed_replica(invalid_receipt))
+    invalid_key = ReplicaKey("task-a", "borrowed-invalid-receipt", 0)
+    invalid_record = manager.borrowed_operations["borrower-lease-invalid-receipt"]
+    assert manager.replica_state[invalid_key] is ReplicaState.RELEASED
+    assert invalid_record["state"] == "FAILED"
+    assert invalid_record["released"] is True
+    assert invalid_record["replica"] is None
+
     class CleanedFailureRuntime(FakeBorrowedRuntime):
         async def init_from_lease(self, spec, pg_by_id):
             self.borrowed_cleanup_verified = True
