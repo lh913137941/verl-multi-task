@@ -465,7 +465,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             )
             record = {
                 "operation_id": normalized["operation_id"],
-                "lease_id": lease_id,
                 "replica_key": replica_key,
                 "replica_rank": rank,
                 "result": None,
@@ -503,7 +502,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 current["error"] = None
                 current["result"] = {
                     "operation_id": current["operation_id"],
-                    "lease_id": current["lease_id"],
+                    "lease_id": lease_id,
                     "replica_rank": current["replica_rank"],
                     "state": "RUNTIME_READY",
                     "released": False,
