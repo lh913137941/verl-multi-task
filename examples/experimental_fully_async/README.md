@@ -43,9 +43,11 @@ DP=1、PP=1、non-PD vLLM；TP 必须能在单节点放下并经实际组合验�
    python -m pytest -q -s -m gpu_integration \
      tests/integration/test_native_sleep_gpu.py
    ```
-   同一文件包含两层验收：1 GPU 用例要求真实生成成功、CE worker 报告物理 GPU UUID、
-   Manager 生成精确 `RELEASED`、level-2 sleep 后 `nvidia-smi` 显存显著下降，并确认
-   weights-only wake 仍处于 partial sleeping；若至少有 2 张 GPU，还会运行 current-Vpub
+   同一文件包含两层验收：1 GPU 用例要求 native 真实生成成功、CE worker 报告物理
+   GPU UUID、Manager 生成精确 `RELEASED`、level-2 sleep 后 `nvidia-smi` 显存显著
+   下降，并继续在 donor 的同一 PG bundle/同一 GPU UUID 创建 borrower runtime、完成真实
+   生成和 verified destroy，最后确认 donor weights-only wake 仍处于 partial sleeping；
+   若至少有 2 张 GPU，还会运行 current-Vpub
    RESTORE 用例，用真实 FSDP TrainingWorker + NCCL sender 在 level-2 后重新装入完整参数，
    验证 `global_steps == 17`，并证明生成请求在 final wake 前保持 parked、final wake 后
    才继续且生成结果与 sleep 前一致。只有第二个用例成功才可作为 RESTORE 数据路径的
