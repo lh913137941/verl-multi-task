@@ -7,7 +7,7 @@ usage() {
     cat <<'EOF'
 Usage:
   bash scripts/e2e/verify_cluster.sh --launcher /path/to/launcher.sh --lease /path/to/lease.json [--quick|--full] [-- <launcher overrides...>]
-  bash scripts/e2e/verify_cluster.sh --attach --lease /path/to/lease.json [--quick|--full]
+  bash scripts/e2e/verify_cluster.sh --attach --lease /path/to/lease.json --donor-session <id> --borrower-session <id> [--quick|--full]
 
 Modes:
   --quick   control-plane + exactly-once + deterministic recovery only
@@ -24,6 +24,8 @@ mode="full"
 attach=0
 launcher=""
 lease=""
+donor_session=""
+borrower_session=""
 require_complete=1
 launcher_args=()
 
@@ -42,6 +44,16 @@ while [ "$#" -gt 0 ]; do
         --attach)
             attach=1
             shift
+            ;;
+        --donor-session)
+            [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+            donor_session="$2"
+            shift 2
+            ;;
+        --borrower-session)
+            [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+            borrower_session="$2"
+            shift 2
             ;;
         --quick)
             mode="quick"
@@ -92,6 +104,16 @@ else
 fi
 
 if [ "${attach}" -eq 1 ]; then
+    [ -n "${donor_session}" ] && [ -n "${borrower_session}" ] || {
+        echo "--attach full lifecycle requires --donor-session and --borrower-session" >&2
+        exit 2
+    }
+    [ "${donor_session}" != "${borrower_session}" ] || {
+        echo "donor and borrower sessions must differ" >&2
+        exit 2
+    }
+    export MT_E2E_DONOR_SESSION="${donor_session}"
+    export MT_E2E_BORROWER_SESSION="${borrower_session}"
     export MT_E2E_ATTACH_ONLY=1
     export RAY_ADDRESS="${RAY_ADDRESS:-auto}"
 else
