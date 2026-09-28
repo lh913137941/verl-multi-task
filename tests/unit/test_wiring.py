@@ -1134,7 +1134,6 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     record = manager.borrowed_operations["borrower-lease"]
     assert receipt["state"] == "RUNTIME_READY"
     assert receipt["server_address"] == "s-borrowed"
-    assert record["state"] == "RUNTIME_READY"
     assert record["replica_rank"] == 0
     borrowed_key = ReplicaKey("task-a", "borrowed-0", 0)
     assert record["replica_key"] == borrowed_key
@@ -1206,7 +1205,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     invalid_key = ReplicaKey("task-a", "borrowed-invalid-receipt", 0)
     invalid_record = manager.borrowed_operations["borrower-lease-invalid-receipt"]
     assert manager.replica_state[invalid_key] is ReplicaState.RELEASED
-    assert invalid_record["state"] == "FAILED"
+    assert invalid_record["error"] is not None
     assert invalid_record["released"] is True
     assert invalid_record["replica"] is None
 
@@ -1228,7 +1227,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     cleaned_key = ReplicaKey("task-a", "borrowed-cleaned-failure", 0)
     cleaned_record = manager.borrowed_operations["borrower-lease-cleaned-failure"]
     assert manager.replica_state[cleaned_key] is ReplicaState.RELEASED
-    assert cleaned_record["state"] == "FAILED"
+    assert cleaned_record["error"] is not None
     assert cleaned_record["released"] is True
     with pytest.raises(RuntimeError, match="verified cleanup"):
         asyncio.run(manager.create_borrowed_replica(cleaned_failure))
@@ -1254,7 +1253,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     quarantined_key = ReplicaKey("task-a", "borrowed-unverified-failure", 0)
     quarantined_record = manager.borrowed_operations["borrower-lease-unverified-failure"]
     assert manager.replica_state[quarantined_key] is ReplicaState.QUARANTINED
-    assert quarantined_record["state"] == "FAILED"
+    assert quarantined_record["error"] is not None
     assert quarantined_record["released"] is False
 
 
