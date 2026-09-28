@@ -147,11 +147,14 @@ python -m pytest -q -m ray_integration tests/integration
 # 指向兼容的真实 VERL checkout 后
 MT_VERL_SOURCE_ROOT=/absolute/path/to/verl \
 python -m pytest -q -m native tests/native_unit
+
+# 真实 CUDA/vLLM；1 GPU 验 DONATE level-2/RELEASED，>=2 GPU 继续验 current-Vpub RESTORE
+VERL_MULTITASK_GPU_MODEL_PATH=/path/to/local/model \
+python -m pytest -q -s -m gpu_integration tests/integration/test_native_sleep_gpu.py
 ```
 
-本次 092203 迁移在会话环境中已实际执行依赖轻量的合同/operation journal/
-exactly-once/G gate 核验；真实 Ray、完整仓库 unit、native VERL 和 GPU 测试仍需在
-具备对应依赖的环境运行。当前 GitHub 分支没有可用的 Actions 运行结果，因此不在
-README 中声明未执行的测试通过。
+当前会话环境无法拉取并执行当前分支的完整 pytest，也没有可用的 GitHub Actions
+结果；历史轻量测试记录不能替代本轮修改后的验证。因此 README 只记录已落库的测试
+入口，不声明当前 HEAD 的 unit/native/GPU 已通过。
 
 详细设计以当前 092203 设计文档和 `docs/simplified-fusion-contract.md` 为准。
