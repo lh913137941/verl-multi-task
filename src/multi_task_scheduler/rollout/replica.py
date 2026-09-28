@@ -152,15 +152,14 @@ class MultiTaskvLLMReplica(vLLMReplica):
         ).remote()
 
     async def worker_placements(self) -> tuple[dict, ...]:
-        placements = await asyncio.gather(
-            *[
-                worker.__ray_call__.remote(self._runtime_placement_probe)
-                for worker in self.workers
-            ]
+        if len(self.workers) != 1:
+            raise RuntimeError("current verified runtime requires one CE worker")
+        placement = await self.workers[0].__ray_call__.remote(
+            self._runtime_placement_probe
         )
-        if any(not isinstance(item, dict) for item in placements):
+        if not isinstance(placement, dict):
             raise TypeError("runtime placement probe returned a non-dict result")
-        return tuple(dict(item) for item in placements)
+        return (dict(placement),)
 
     async def validate_worker_placement(self) -> tuple[dict, ...]:
         """Verify each borrower CE actor landed on the claimed node/GPU UUID."""
@@ -418,41 +417,32 @@ class MultiTaskvLLMReplica(vLLMReplica):
             raise exc
 
     async def sleep(self):
-        """Deep-sleep the retained native runtime through verified server receipts."""
+        """Deep-sleep the retained native TP=1 runtime."""
         if self.replica_kind is not ReplicaKind.NATIVE:
             raise ValueError("sleep is valid only for retained NATIVE replicas")
-        servers = tuple(getattr(self, "servers", ()) or ())
-        if not servers:
-            raise RuntimeError("native replica has no rollout servers to sleep")
-        receipts = await asyncio.gather(
-            *[server.sleep.remote() for server in servers]
-        )
-        for receipt in receipts:
-            if not isinstance(receipt, dict):
-                raise TypeError("native server sleep returned a non-dict receipt")
-            if receipt.get("sleep_level") != 2 or receipt.get("sleeping") is not True:
-                raise RuntimeError("native server did not confirm level-2 sleep")
-        return tuple(receipts)
+        if len(self.servers) != 1:
+            raise RuntimeError("current verified native runtime requires one server")
+        receipt = await self.servers[0].sleep.remote()
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("sleep_level") != 2
+            or receipt.get("sleeping") is not True
+        ):
+            raise RuntimeError("native server did not confirm level-2 sleep")
+        return (receipt,)
 
     async def wake_up(self, tags: list[str] | None = None):
-        """Wake native servers and verify partial/full residency receipts."""
+        """Wake the retained native TP=1 server and verify its residency."""
         if self.replica_kind is not ReplicaKind.NATIVE:
             raise ValueError("wake_up is valid only for retained NATIVE replicas")
-        servers = tuple(getattr(self, "servers", ()) or ())
-        if not servers:
-            raise RuntimeError("native replica has no rollout servers to wake")
-        receipts = await asyncio.gather(
-            *[server.wake_up.remote(tags=tags) for server in servers]
-        )
-        weights_only = tags == ["weights"]
-        for receipt in receipts:
-            if not isinstance(receipt, dict):
-                raise TypeError("native server wake returned a non-dict receipt")
-            if weights_only:
-                if receipt.get("fully_awake") is not False or receipt.get("sleeping") is not True:
-                    raise RuntimeError("native server did not confirm weights-only wake")
-            elif receipt.get("fully_awake") is not True or receipt.get("sleeping") is not False:
-                raise RuntimeError("native server did not confirm full wake")
-        return tuple(receipts)
+        if len(self.servers) != 1:
+            raise RuntimeError("current verified native runtime requires one server")
+        receipt = await self.servers[0].wake_up.remote(tags=tags)
+        if not isinstance(receipt, dict):
+            raise TypeError("native server wake returned a non-dict receipt")
+        expected = (True, False) if tags == ["weights"] else (False, True)
+        if (receipt.get("sleeping"), receipt.get("fully_awake")) != expected:
+            raise RuntimeError("native server wake residency is inconsistent")
+        return (receipt,)
 
 
