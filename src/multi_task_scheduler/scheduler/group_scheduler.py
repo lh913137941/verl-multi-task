@@ -156,8 +156,10 @@ class GroupScheduler:
                         f"{command.kind.value} requires donor RELEASED handoff"
                     )
                 existing_target = self.borrower_targets.get(command.lease_id)
-                if existing_target is not None and existing_target != command.target:
-                    raise ValueError("lease already has another borrower target")
+                if existing_target is not None:
+                    raise ValueError(
+                        "lease already has a borrower ADD; replay the original operation_id"
+                    )
             elif command.kind is OperationKind.REMOVE:
                 if command.lease_id not in self.handoff_ready_leases:
                     raise ValueError("REMOVE requires donor RELEASED handoff")
