@@ -7,7 +7,7 @@ import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from ray.util.state import list_actors
 
-from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
+from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.single_controller.ray.base import get_master_addr_port
 from verl.utils.device import get_device_name
 from verl.workers.rollout.replica import RolloutMode
@@ -44,50 +44,6 @@ class MultiTaskvLLMReplica(vLLMReplica):
         self.max_colocate_count = max_colocate_count
         super().__init__(*args, **kwargs)
         self.server_class = ray.remote(MultiTaskvLLMHttpServer)
-
-    async def init_standalone(self):
-        """Create native PGs with the same Ray accounting M used by leases."""
-        self.rollout_mode = RolloutMode.STANDALONE
-        if self.is_reward_model:
-            resource_pool_name = f"rollout_pool_reward_{self.replica_rank}{self.name_suffix}"
-        elif self.is_teacher_model:
-            resource_pool_name = f"rollout_pool_teacher_{self.replica_rank}{self.name_suffix}"
-        else:
-            resource_pool_name = f"rollout_pool_{self.replica_rank}{self.name_suffix}"
-
-        resource_pool_manager = ResourcePoolManager(
-            resource_pool_spec={
-                resource_pool_name: [self.gpus_per_replica_node] * self.nnodes,
-            },
-            mapping=None,
-            max_colocate_count=self.max_colocate_count,
-        )
-        resource_pool_manager.create_resource_pool()
-        self.resource_pool = resource_pool_manager.resource_pool_dict[
-            resource_pool_name
-        ]
-
-        if self.is_reward_model:
-            name_prefix = (
-                f"rollout_reward_standalone_{self.replica_rank}{self.name_suffix}"
-            )
-        elif self.is_teacher_model:
-            name_prefix = (
-                f"rollout_teacher_standalone_{self.replica_rank}{self.name_suffix}"
-            )
-        else:
-            name_prefix = f"rollout_standalone_{self.replica_rank}{self.name_suffix}"
-
-        worker_group = RayWorkerGroup(
-            resource_pool=self.resource_pool,
-            ray_cls_with_init=self.get_ray_class_with_init_args(),
-            bin_pack=False,
-            name_prefix=name_prefix,
-            use_gpu=True,
-            device_name=get_device_name(),
-        )
-        self.workers = worker_group.workers
-        await self.launch_servers()
 
     @staticmethod
     def _short_identity(value: str) -> str:
