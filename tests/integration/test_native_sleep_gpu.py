@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -43,6 +44,26 @@ def _gpu_memory_used_mib(gpu_uuid: str) -> int:
         timeout=10,
     ).strip()
     return int(output.splitlines()[0].strip())
+
+
+def _wait_for_gpu_memory_drop(
+    gpu_uuid: str,
+    before_mib: int,
+    min_release_mib: int,
+    *,
+    timeout_s: float = 15.0,
+) -> int:
+    deadline = time.monotonic() + timeout_s
+    last_mib = _gpu_memory_used_mib(gpu_uuid)
+    while before_mib - last_mib < min_release_mib:
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"level-2 sleep released only {before_mib - last_mib} MiB "
+                f"on {gpu_uuid}; expected at least {min_release_mib} MiB"
+            )
+        time.sleep(0.25)
+        last_mib = _gpu_memory_used_mib(gpu_uuid)
+    return last_mib
 
 
 def _config(model_path: str):
@@ -182,13 +203,13 @@ def test_real_standalone_level2_sleep_releases_device_memory_and_weights_wake_st
         )
         assert release.type is EvidenceType.RELEASED
         assert release.released_gpu_uuids == (gpu_uuid,)
-        after_mib = _gpu_memory_used_mib(gpu_uuid)
-
         min_release_mib = int(os.environ.get(MIN_RELEASE_ENV, "128"))
-        assert before_mib - after_mib >= min_release_mib, (
-            f"level-2 sleep released only {before_mib - after_mib} MiB "
-            f"on {gpu_uuid}; expected at least {min_release_mib} MiB"
+        after_mib = _wait_for_gpu_memory_drop(
+            gpu_uuid,
+            before_mib,
+            min_release_mib,
         )
+        assert after_mib < before_mib
 
         # Exact replay must return byte-for-byte equivalent evidence without
         # invoking a second vLLM sleep.
