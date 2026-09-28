@@ -704,9 +704,63 @@ def test_trainer_internal_restore_rebinds_parked_native_and_publishes_current_vp
         ("discard_pending", key),
         ("register_pending", key, "op-restore"),
         ("bootstrap_target", key, "op-restore", 11),
-        ("commit_pending", key, 11),
         ("commit_service", "op-restore"),
+        ("commit_pending", key, 11),
     ]
+
+
+def test_trainer_restore_service_failure_leaves_ce_pending_not_effective():
+    key = ReplicaKey("task-a", "native-0")
+    runtime = type("Runtime", (), {"replica_kind": ReplicaKind.NATIVE})()
+    calls = []
+
+    class CE:
+        def __init__(self):
+            self.pending_bootstrap = {key: ((runtime,), "op-donate")}
+            self.effective_replicas = {}
+
+        def discard_pending(self, target):
+            calls.append(("discard_pending", target))
+            self.pending_bootstrap.pop(target, None)
+
+        def register_pending(self, target, replicas, *, operation_id):
+            calls.append(("register_pending", target, operation_id))
+            self.pending_bootstrap[target] = (tuple(replicas), operation_id)
+
+        async def bootstrap_target(self, target, *, operation_id, loaded_version):
+            calls.append(("bootstrap_target", target, loaded_version))
+            return OperationEvidence(
+                operation_id,
+                EvidenceType.WEIGHT_READY,
+                2,
+            )
+
+        def commit_pending(self, *args, **kwargs):
+            raise AssertionError("failed service publish must not promote E")
+
+    class Rollouter:
+        get_pending_target = AsyncRemoteMethod(lambda operation_id: key)
+        commit_service_change = AsyncRemoteMethod(
+            lambda operation: (_ for _ in ()).throw(
+                RuntimeError("service publish failed")
+            )
+        )
+
+    trainer = trainer_class()()
+    trainer.rollouter = Rollouter()
+    trainer.checkpoint_manager = CE()
+    trainer.current_param_version = 13
+
+    with pytest.raises(RuntimeError, match="service publish failed"):
+        asyncio.run(
+            trainer.restore_and_publish(
+                OperationRecord("op-restore", OperationStatus.RUNNING)
+            )
+        )
+
+    assert key in trainer.checkpoint_manager.pending_bootstrap
+    assert trainer.checkpoint_manager.effective_replicas == {}
+    assert trainer.replica_sync_gate.health == "BLOCKED"
 
 
 def test_manager_owns_state_kind_and_runtime_inventory_separately():
@@ -2692,7 +2746,10 @@ def test_rollouter_restore_unverified_rollback_quarantines_native():
     rollouter._pending_operation_targets["op-restore"] = key
     rollouter._update_max_concurrent_samples = lambda: None
 
-    with pytest.raises(RuntimeError, match="routing commit failed"):
+    with pytest.raises(
+        RuntimeError,
+        match="publish failed and rollback is unverified",
+    ):
         asyncio.run(
             rollouter.commit_service_change(
                 OperationRecord("op-restore", OperationStatus.RUNNING)
