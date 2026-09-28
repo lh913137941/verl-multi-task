@@ -344,6 +344,8 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         if state is ReplicaState.DORMANT:
             if kind is not ReplicaKind.NATIVE:
                 raise ValueError("only NATIVE replicas may restore from DORMANT")
+            runtime = None
+            activated = False
             try:
                 runtime = manager.inspect_runtime(target)
                 if runtime is None:
@@ -361,6 +363,15 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                 server_handle = getattr(runtime, "_server_handle", None)
                 if not isinstance(server_id, str) or not server_id or server_handle is None:
                     raise RuntimeError("native RESTORE runtime lacks routable server identity")
+
+                # Prepare owner-local service/capacity before opening R.  No
+                # request can reach this replica through the global LB yet.
+                manager.activate_service(target)
+                activated = True
+                self._update_max_concurrent_samples()
+
+                # R is the final externally visible commit. commit_ready() is
+                # owner-atomic and replayable for this operation.
                 evidence = await lb.commit_ready.remote(
                     target,
                     server_id,
@@ -374,14 +385,35 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                 if evidence.type is not EvidenceType.SERVICE_COMMITTED:
                     raise ValueError("RESTORE routing commit did not produce SERVICE_COMMITTED")
 
-                manager.activate_service(target)
                 manager.transition_replica(target, ReplicaState.ACTIVE)
-                self._update_max_concurrent_samples()
                 self._pending_operation_targets.pop(operation.operation_id, None)
                 return evidence
             except BaseException:
+                # Before R is committed we can still return to a proven DORMANT
+                # state: remove local service bookkeeping and deep-sleep again.
+                # If that compensation itself cannot be proved, quarantine.
                 if manager.replica_state.get(target) is ReplicaState.DORMANT:
-                    manager.transition_replica(target, ReplicaState.QUARANTINED)
+                    compensated = False
+                    try:
+                        if activated:
+                            manager.deactivate_service(target)
+                            self._update_max_concurrent_samples()
+                        if runtime is not None:
+                            sleep_receipts = await runtime.sleep()
+                            if not isinstance(sleep_receipts, (tuple, list)) or not sleep_receipts:
+                                raise RuntimeError("RESTORE rollback returned no sleep receipts")
+                            if any(
+                                not isinstance(receipt, dict)
+                                or receipt.get("sleep_level") != 2
+                                or receipt.get("sleeping") is not True
+                                for receipt in sleep_receipts
+                            ):
+                                raise RuntimeError("RESTORE rollback did not confirm level-2 sleep")
+                            compensated = True
+                    except BaseException:
+                        compensated = False
+                    if not compensated:
+                        manager.transition_replica(target, ReplicaState.QUARANTINED)
                 raise
 
         if state is not ReplicaState.DRAINING:
