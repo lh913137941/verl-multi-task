@@ -2384,10 +2384,15 @@ def test_rollouter_idle_detection_treats_unknown_capacity_as_zero():
 
 
 def http_server_class():
+    class Parent:
+        async def resume_kv_cache(self):
+            await self.engine.wake_up(tags=["kv_cache"])
+            await self.engine.reset_prefix_cache(reset_connector=True)
+
     return isolated(
         "rollout/http_server.py",
         "MultiTaskvLLMHttpServer",
-        object,
+        Parent,
         asyncio=asyncio,
         ray=FakeRay,
     )
