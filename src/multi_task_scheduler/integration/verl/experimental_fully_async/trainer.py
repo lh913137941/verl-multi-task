@@ -150,6 +150,22 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                 self.rollouter.commit_service_change.remote,
                 operation,
             )
+            if (
+                isinstance(service_evidence, OperationEvidence)
+                and service_evidence.type is EvidenceType.RELEASED
+            ):
+                _require_evidence(
+                    service_evidence,
+                    operation.operation_id,
+                    EvidenceType.RELEASED,
+                    "ADD service rollback",
+                )
+                await lease.guard(
+                    self.checkpoint_manager.remove_effective,
+                    target,
+                )
+                e_committed = False
+                return service_evidence
             return _require_evidence(
                 service_evidence,
                 operation.operation_id,
