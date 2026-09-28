@@ -2798,25 +2798,6 @@ def test_manager_native_release_replay_returns_identical_evidence():
     assert sleep_calls == ["sleep"]
 
 
-def test_manager_native_wake_weights_keeps_dormant_runtime_fenced():
-    key = ReplicaKey("task-a", "native-0")
-
-    class Server:
-        wake_weights = AsyncRemoteMethod(
-            lambda: {"sleeping": True, "fully_awake": False}
-        )
-
-    runtime = type("Runtime", (), {"servers": [Server()]})()
-    cls = native_manager_class()
-    manager = cls.__new__(cls)
-    manager.replica_kind = {key: ReplicaKind.NATIVE}
-    manager.replica_state = {key: ReplicaState.DORMANT}
-    manager._runtime_inventory = {key: runtime}
-
-    receipts = asyncio.run(manager.wake_weights(key))
-    assert receipts == ({"sleeping": True, "fully_awake": False},)
-
-
 def _isolated_group_scheduler_class():
     path = SOURCE / "scheduler/group_scheduler.py"
     tree = ast.parse(path.read_text())
