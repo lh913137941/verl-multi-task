@@ -454,12 +454,45 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                             "ADD routing ledger",
                         )
                     else:
+                        # R authoritatively reports no publish.  Roll back the
+                        # hidden borrower while Trainer still owns G; returning
+                        # RELEASED lets Trainer remove E and TaskRunner close the
+                        # ADD as a verified failure without consuming the donor
+                        # handoff reservation.
                         manager.transition_replica(target, ReplicaState.DRAINING)
                         if activated:
                             manager.deactivate_service(target)
+                            activated = False
                             self._update_max_concurrent_samples()
-                        manager.transition_replica(target, ReplicaState.QUARANTINED)
-                        raise commit_exc
+                        try:
+                            release_evidence = await manager.destroy(
+                                target,
+                                operation_id=operation.operation_id,
+                            )
+                            _require_evidence(
+                                release_evidence,
+                                operation.operation_id,
+                                EvidenceType.RELEASED,
+                                "ADD rollback release",
+                            )
+                            manager.transition_replica(
+                                target,
+                                ReplicaState.RELEASED,
+                            )
+                        except BaseException as rollback_exc:
+                            if manager.replica_state.get(target) is ReplicaState.DRAINING:
+                                manager.transition_replica(
+                                    target,
+                                    ReplicaState.QUARANTINED,
+                                )
+                            raise RuntimeError(
+                                "ADD routing was not published and rollback release is unverified"
+                            ) from rollback_exc
+                        self._pending_operation_targets.pop(
+                            operation.operation_id,
+                            None,
+                        )
+                        return release_evidence
 
                 self._pending_operation_targets.pop(operation.operation_id, None)
                 return evidence
