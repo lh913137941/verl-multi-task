@@ -152,16 +152,17 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         runtime = self._runtime_inventory.get(key)
         if runtime is None:
             raise KeyError(key)
-
-        if runtime in self.rollout_replicas:
-            self.rollout_replicas.remove(runtime)
-
         address = getattr(runtime, "_server_address", None)
         handle = getattr(runtime, "_server_handle", None)
+        index = None
         if address in self.server_addresses:
             index = self.server_addresses.index(address)
             if index >= len(self.server_handles) or self.server_handles[index] != handle:
                 raise RuntimeError("native service address/handle inventory is inconsistent")
+
+        if runtime in self.rollout_replicas:
+            self.rollout_replicas.remove(runtime)
+        if index is not None:
             self.server_addresses.pop(index)
             self.server_handles.pop(index)
         return runtime
@@ -171,17 +172,22 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         runtime = self._runtime_inventory.get(key)
         if runtime is None:
             raise KeyError(key)
-        if runtime not in self.rollout_replicas:
-            self.rollout_replicas.append(runtime)
         address = getattr(runtime, "_server_address", None)
         handle = getattr(runtime, "_server_handle", None)
         if not isinstance(address, str) or not address or handle is None:
             raise RuntimeError("native runtime lacks a routable server identity")
+        existing_index = None
         if address in self.server_addresses:
-            index = self.server_addresses.index(address)
-            if index >= len(self.server_handles) or self.server_handles[index] != handle:
+            existing_index = self.server_addresses.index(address)
+            if (
+                existing_index >= len(self.server_handles)
+                or self.server_handles[existing_index] != handle
+            ):
                 raise RuntimeError("native service address/handle inventory is inconsistent")
-        else:
+
+        if runtime not in self.rollout_replicas:
+            self.rollout_replicas.append(runtime)
+        if existing_index is None:
             self.server_addresses.append(address)
             self.server_handles.append(handle)
         return runtime
