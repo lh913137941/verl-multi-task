@@ -122,6 +122,35 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                 last_error = exc
         raise last_error
 
+    def _finish(
+        self,
+        operation_id: str,
+        status: OperationStatus,
+        result: str | None,
+    ) -> None:
+        with self._journal_lock:
+            self._operation_journal.finish(operation_id, status, result)
+
+    def _finish_failed_release(
+        self,
+        command: OperationCommand,
+        evidence,
+        message: str,
+    ) -> bool:
+        if not (
+            isinstance(evidence, OperationEvidence)
+            and evidence.type is EvidenceType.RELEASED
+        ):
+            return False
+        released = self._require_evidence(
+            evidence,
+            operation_id=command.operation_id,
+            expected=EvidenceType.RELEASED,
+        )
+        self._advance_lease(command, released)
+        self._finish(command.operation_id, OperationStatus.FAILED, message)
+        return True
+
     def _launch_operation(self, operation_id: str) -> None:
         worker = threading.Thread(
             target=self._execute_operation,
@@ -255,40 +284,18 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                         spec=placement_spec,
                     )
                 )
-                if (
-                    isinstance(prepare_result, OperationEvidence)
-                    and prepare_result.type is EvidenceType.RELEASED
+                if self._finish_failed_release(
+                    command,
+                    prepare_result,
+                    "ADD prepare failed; no borrower runtime remains",
                 ):
-                    rollback_evidence = self._require_evidence(
-                        prepare_result,
-                        operation_id=operation_id,
-                        expected=EvidenceType.RELEASED,
-                    )
-                    self._advance_lease(command, rollback_evidence)
-                    with self._journal_lock:
-                        self._operation_journal.finish(
-                            operation_id,
-                            OperationStatus.FAILED,
-                            "ADD prepare failed; no borrower runtime remains",
-                        )
                     return
                 evidence = ray.get(trainer.bootstrap_and_publish.remote(operation))
-                if (
-                    isinstance(evidence, OperationEvidence)
-                    and evidence.type is EvidenceType.RELEASED
+                if self._finish_failed_release(
+                    command,
+                    evidence,
+                    "ADD bootstrap failed; hidden runtime was verified RELEASED",
                 ):
-                    rollback_evidence = self._require_evidence(
-                        evidence,
-                        operation_id=operation_id,
-                        expected=EvidenceType.RELEASED,
-                    )
-                    self._advance_lease(command, rollback_evidence)
-                    with self._journal_lock:
-                        self._operation_journal.finish(
-                            operation_id,
-                            OperationStatus.FAILED,
-                            "ADD bootstrap failed; hidden runtime was verified RELEASED",
-                        )
                     return
                 final_evidence = self._require_evidence(
                     evidence,
@@ -315,12 +322,11 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                             expected=EvidenceType.RELEASED,
                         )
                         self._advance_lease(command, final_evidence)
-                        with self._journal_lock:
-                            self._operation_journal.finish(
-                                operation_id,
-                                OperationStatus.SUCCEEDED,
-                                final_evidence.type.value,
-                            )
+                        self._finish(
+                            operation_id,
+                            OperationStatus.SUCCEEDED,
+                            final_evidence.type.value,
+                        )
                         return
 
                     # If E removal happened and G was fenced around an uncertain
@@ -351,13 +357,12 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                                 rollouter.get_pending_target.remote(operation_id)
                             )
                         except BaseException:
-                            with self._journal_lock:
-                                self._operation_journal.finish(
-                                    operation_id,
-                                    OperationStatus.FAILED,
-                                    "exit preflight rejected before owner mutation: "
-                                    f"{type(exc).__name__}: {exc}",
-                                )
+                            self._finish(
+                                operation_id,
+                                OperationStatus.FAILED,
+                                "exit preflight rejected before owner mutation: "
+                                f"{type(exc).__name__}: {exc}",
+                            )
                             return
                         raise
                     self._require_evidence(
@@ -392,22 +397,11 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                     )
                 )
                 evidence = ray.get(trainer.restore_and_publish.remote(operation))
-                if (
-                    isinstance(evidence, OperationEvidence)
-                    and evidence.type is EvidenceType.RELEASED
+                if self._finish_failed_release(
+                    command,
+                    evidence,
+                    "RESTORE bootstrap failed; native runtime was verified re-slept",
                 ):
-                    rollback_evidence = self._require_evidence(
-                        evidence,
-                        operation_id=operation_id,
-                        expected=EvidenceType.RELEASED,
-                    )
-                    self._advance_lease(command, rollback_evidence)
-                    with self._journal_lock:
-                        self._operation_journal.finish(
-                            operation_id,
-                            OperationStatus.FAILED,
-                            "RESTORE bootstrap failed; native runtime was verified re-slept",
-                        )
                     return
                 final_evidence = self._require_evidence(
                     evidence,
@@ -419,12 +413,11 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             else:  # pragma: no cover - OperationKind construction already fences this.
                 raise ValueError(f"unsupported operation kind: {command.kind!r}")
 
-            with self._journal_lock:
-                self._operation_journal.finish(
-                    operation_id,
-                    OperationStatus.SUCCEEDED,
-                    final_evidence.type.value,
-                )
+            self._finish(
+                operation_id,
+                OperationStatus.SUCCEEDED,
+                final_evidence.type.value,
+            )
 
         except BaseException as exc:
             status = OperationStatus.UNKNOWN

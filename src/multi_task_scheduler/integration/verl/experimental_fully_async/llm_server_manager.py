@@ -180,19 +180,29 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             return evidence
         return None
 
-    def deactivate_service(self, key: ReplicaKey):
-        """Remove one runtime from native active-service lists without destroying it."""
+    def _service_slot(self, key: ReplicaKey, *, require_route: bool):
         runtime = self._runtime_inventory.get(key)
         if runtime is None:
             raise KeyError(key)
         address = getattr(runtime, "_server_address", None)
         handle = getattr(runtime, "_server_handle", None)
-        index = None
-        if address in self.server_addresses:
-            index = self.server_addresses.index(address)
-            if index >= len(self.server_handles) or self.server_handles[index] != handle:
-                raise RuntimeError("native service address/handle inventory is inconsistent")
+        if require_route and (
+            not isinstance(address, str) or not address or handle is None
+        ):
+            raise RuntimeError("native runtime lacks a routable server identity")
+        index = self.server_addresses.index(address) if address in self.server_addresses else None
+        if (
+            index is not None
+            and (index >= len(self.server_handles) or self.server_handles[index] != handle)
+        ):
+            raise RuntimeError("native service address/handle inventory is inconsistent")
+        return runtime, address, handle, index
 
+    def deactivate_service(self, key: ReplicaKey):
+        """Remove one runtime from native active-service lists without destroying it."""
+        runtime, _address, _handle, index = self._service_slot(
+            key, require_route=False
+        )
         if runtime in self.rollout_replicas:
             self.rollout_replicas.remove(runtime)
         if index is not None:
@@ -202,25 +212,12 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
 
     def activate_service(self, key: ReplicaKey):
         """Restore one retained runtime to native active-service lists."""
-        runtime = self._runtime_inventory.get(key)
-        if runtime is None:
-            raise KeyError(key)
-        address = getattr(runtime, "_server_address", None)
-        handle = getattr(runtime, "_server_handle", None)
-        if not isinstance(address, str) or not address or handle is None:
-            raise RuntimeError("native runtime lacks a routable server identity")
-        existing_index = None
-        if address in self.server_addresses:
-            existing_index = self.server_addresses.index(address)
-            if (
-                existing_index >= len(self.server_handles)
-                or self.server_handles[existing_index] != handle
-            ):
-                raise RuntimeError("native service address/handle inventory is inconsistent")
-
+        runtime, address, handle, index = self._service_slot(
+            key, require_route=True
+        )
         if runtime not in self.rollout_replicas:
             self.rollout_replicas.append(runtime)
-        if existing_index is None:
+        if index is None:
             self.server_addresses.append(address)
             self.server_handles.append(handle)
         return runtime
