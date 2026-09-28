@@ -307,13 +307,13 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                 "FORCE REMOVE requires verified targeted abort/continuation backend"
             )
 
-        self._pending_operation_targets[operation_id] = replica_key
-        if state is ReplicaState.ACTIVE:
-            manager.transition_replica(replica_key, ReplicaState.DRAINING)
-        elif state is not ReplicaState.DRAINING:
+        if state not in {ReplicaState.ACTIVE, ReplicaState.DRAINING}:
             raise ValueError(
                 f"prepare_exit requires ACTIVE/DRAINING replica, got {state.value}"
             )
+        if state is ReplicaState.ACTIVE:
+            manager.transition_replica(replica_key, ReplicaState.DRAINING)
+        self._pending_operation_targets[operation_id] = replica_key
 
         server_id = await lb.begin_drain.remote(replica_key, operation_id)
 
@@ -321,6 +321,18 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             await asyncio.sleep(0.1)
 
         return OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
+
+    @staticmethod
+    def _require_level2_sleep_receipts(receipts, *, context: str) -> None:
+        if not isinstance(receipts, (tuple, list)) or not receipts:
+            raise RuntimeError(f"{context} returned no sleep receipts")
+        if any(
+            not isinstance(receipt, dict)
+            or receipt.get("sleep_level") != 2
+            or receipt.get("sleeping") is not True
+            for receipt in receipts
+        ):
+            raise RuntimeError(f"{context} did not confirm level-2 sleep")
 
     def get_pending_target(self, operation_id: str) -> ReplicaKey:
         if not isinstance(operation_id, str) or not operation_id:
@@ -429,19 +441,10 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                             activated = False
                             self._update_max_concurrent_samples()
                             sleep_receipts = await runtime.sleep()
-                            if not isinstance(sleep_receipts, (tuple, list)) or not sleep_receipts:
-                                raise RuntimeError(
-                                    "RESTORE rollback returned no sleep receipts"
-                                )
-                            if any(
-                                not isinstance(receipt, dict)
-                                or receipt.get("sleep_level") != 2
-                                or receipt.get("sleeping") is not True
-                                for receipt in sleep_receipts
-                            ):
-                                raise RuntimeError(
-                                    "RESTORE rollback did not confirm level-2 sleep"
-                                )
+                            self._require_level2_sleep_receipts(
+                                sleep_receipts,
+                                context="RESTORE rollback",
+                            )
                             manager.transition_replica(
                                 target,
                                 ReplicaState.DORMANT,
@@ -475,15 +478,10 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                             self._update_max_concurrent_samples()
                         if runtime is not None:
                             sleep_receipts = await runtime.sleep()
-                            if not isinstance(sleep_receipts, (tuple, list)) or not sleep_receipts:
-                                raise RuntimeError("RESTORE rollback returned no sleep receipts")
-                            if any(
-                                not isinstance(receipt, dict)
-                                or receipt.get("sleep_level") != 2
-                                or receipt.get("sleeping") is not True
-                                for receipt in sleep_receipts
-                            ):
-                                raise RuntimeError("RESTORE rollback did not confirm level-2 sleep")
+                            self._require_level2_sleep_receipts(
+                                sleep_receipts,
+                                context="RESTORE rollback",
+                            )
                             compensated = True
                     except BaseException:
                         compensated = False
