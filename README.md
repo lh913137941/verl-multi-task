@@ -178,3 +178,15 @@ python -m pytest -q -s -m gpu_integration tests/integration/test_native_sleep_gp
 源仓 D2 设计资料保存在 `docs/verl-expansion-reference/`，用于后续能力扩展参考；
 若其中内容与 `docs/simplified-fusion-contract.md` 冲突，以当前合同和源码为准。
 
+## 关键流程 E2E 与异常恢复验收
+
+当前分支提供 `scripts/e2e/` 分层验收入口，不再复用 verl_expansion 的旧 D3/D4 controller
+测试钩子。真实 runtime 场景覆盖 `DONATE -> ADD -> REMOVE/FORCE -> RESTORE`；真实 Ray
+控制面场景覆盖 GS fail-closed/ACK-loss staging；确定性 fault suite 覆盖 G BLOCKED、
+natural drain timeout、FORCE abort ACK loss、RESTORE compensation；另有真实 Ray
+MessageQueue exactly-once 验证。
+
+完整运行方式、证据强度和 PASS/FAIL/BLOCKED 规则见
+`docs/e2e-acceptance.md`。真实生命周期场景需要从
+`examples/e2e/lease.example.json` 生成当前环境的物理 Lease fixture。
+
