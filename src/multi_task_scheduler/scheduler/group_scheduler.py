@@ -337,6 +337,8 @@ class GroupScheduler:
             }
             if command.kind is OperationKind.RESTORE:
                 result["restored"] = True
+            elif command.kind is OperationKind.ADD:
+                result["add_rolled_back"] = True
             else:
                 result["released"] = True
             return result
@@ -373,9 +375,34 @@ class GroupScheduler:
                 "restored": True,
             }
 
+        if command.kind is OperationKind.ADD:
+            if evidence.type is not EvidenceType.RELEASED:
+                raise ValueError("ADD rollback requires RELEASED evidence")
+            if set(evidence.released_gpu_uuids) != set(lease.gpu_uuids):
+                raise ValueError(
+                    "ADD rollback RELEASED evidence must exactly cover lease GPU claims"
+                )
+            if command.lease_id not in self.handoff_ready_leases:
+                raise ValueError("ADD rollback requires the donor handoff reservation")
+            if self.borrower_targets.get(command.lease_id) != command.target:
+                raise ValueError("ADD rollback target does not match staged borrower")
+
+            self.release_evidence[evidence_key] = evidence
+            self.release_history.setdefault(lease_id, []).append(
+                evidence.operation_id
+            )
+            # The hidden borrower is gone, but the donor handoff remains
+            # reserved to this lease so a fresh ADD operation may retry safely.
+            self.borrower_targets.pop(lease_id, None)
+            return {
+                "lease_id": lease_id,
+                "operation_id": evidence.operation_id,
+                "add_rolled_back": True,
+            }
+
         if command.kind not in _RELEASE_KINDS:
             raise ValueError(
-                "only DONATE/REMOVE RELEASED or RESTORE SERVICE_COMMITTED may advance a lease"
+                "only ADD rollback/DONATE/REMOVE RELEASED or RESTORE SERVICE_COMMITTED may advance a lease"
             )
         if evidence.type is not EvidenceType.RELEASED:
             raise ValueError("lease handoff requires RELEASED evidence")
