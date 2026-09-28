@@ -44,7 +44,6 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
         self._control_ready = False
         self._attached_to_gs = False
         self._journal_lock = threading.RLock()
-        self._operation_threads: dict[str, threading.Thread] = {}
         self._operation_leases: dict[str, Lease] = {}
         self._operation_journal = OperationJournal()
 
@@ -107,12 +106,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             name=f"multitask-operation-{operation_id}",
             daemon=True,
         )
-        self._operation_threads[operation_id] = worker
-        try:
-            worker.start()
-        except BaseException:
-            self._operation_threads.pop(operation_id, None)
-            raise
+        worker.start()
 
     def submit_operation(
         self,
@@ -177,7 +171,6 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                 self._launch_operation(command.operation_id)
             except BaseException as exc:
                 with self._journal_lock:
-                    self._operation_threads.pop(command.operation_id, None)
                     self._operation_leases.pop(command.operation_id, None)
                     self._operation_journal.finish(
                         command.operation_id,
@@ -318,7 +311,6 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             )
         finally:
             with self._journal_lock:
-                self._operation_threads.pop(operation_id, None)
                 self._operation_leases.pop(operation_id, None)
 
     def run(self, config):
