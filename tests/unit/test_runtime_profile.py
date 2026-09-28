@@ -233,7 +233,7 @@ def test_unknown_profile_and_extra_runtime_selector_are_rejected():
     [
         None,
         {"multitask": "x"},
-        {"multitask": {"runtime": "x"}},
+        {"multitask": {"enabled": True, "runtime": "x"}},
     ],
 )
 def test_malformed_parent_sections_fail_explicitly(malformed):

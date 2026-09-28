@@ -70,6 +70,16 @@ class AsyncRemoteMethod:
         return self.fn(*args, **kwargs)
 
 
+def _test_require_evidence(value, operation_id, expected, label):
+    if not isinstance(value, OperationEvidence):
+        raise TypeError(f"{label} did not return OperationEvidence")
+    if value.operation_id != operation_id:
+        raise ValueError(f"{label} evidence belongs to another operation")
+    if value.type is not expected:
+        raise ValueError(f"expected {expected.value}, got {value.type.value}")
+    return value
+
+
 class FakeRay:
     class exceptions:
         class GetTimeoutError(Exception):
@@ -125,6 +135,7 @@ def trainer_class():
         ReplicaKind=ReplicaKind,
         GateKind=GateKind,
         ReplicaSyncGate=ReplicaSyncGate,
+        _require_evidence=_test_require_evidence,
     )
 
 
@@ -135,6 +146,8 @@ def load_balancer_class():
             self._inflight_requests = {server_id: 0 for server_id in servers}
 
         def acquire_server(self, request_id, **extra):
+            if not self._servers:
+                raise RuntimeError("No available servers")
             server_id = next(iter(self._servers))
             self._inflight_requests[server_id] += 1
             return server_id, self._servers[server_id]
@@ -1841,7 +1854,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         "placement_epoch": 0,
     }
     normalized = manager.validate_borrowed_spec(valid_spec)
-    assert normalized["max_colocate_count"] == FIRST_RELEASE_MAX_COLOCATE_COUNT
+    assert "max_colocate_count" not in normalized
     assert normalized["claims"][0]["rank"] == 0
 
     wrong_task = dict(valid_spec, borrower_task_id="task-b")
@@ -2344,6 +2357,14 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
 
         def _get_server_name_prefix(self):
             return "vllm_"
+
+        def get_ray_class_with_init_args(self):
+            return FakeCIA(
+                object,
+                rollout_config=self.config,
+                model_config=self.model_config,
+                replica_rank=self.replica_rank,
+            )
 
     created = []
     killed = []
@@ -2885,6 +2906,9 @@ def test_ce_native_restore_wakes_weights_under_bootstrap_and_restores_kv_before_
         replica_kind = ReplicaKind.NATIVE
         workers = ["worker-0"]
 
+        def get_ray_class_with_init_args(self):
+            return object()
+
         async def wake_up(self, *, tags=None):
             calls.append(("wake", tuple(tags) if tags is not None else None))
             return ({"sleeping": True, "fully_awake": False},)
@@ -2972,6 +2996,9 @@ def test_ce_native_restore_failure_resleeps_before_escaping():
         replica_kind = ReplicaKind.NATIVE
         workers = ["worker-0"]
 
+        def get_ray_class_with_init_args(self):
+            return object()
+
         async def wake_up(self, *, tags=None):
             calls.append(("wake", tuple(tags) if tags is not None else None))
             return ({"sleeping": True, "fully_awake": False},)
@@ -3050,6 +3077,9 @@ def test_ce_target_bootstrap_requires_server_version_confirmation():
     class Replica:
         replica_kind = ReplicaKind.BORROWED
         workers = ["worker-0"]
+
+        def get_ray_class_with_init_args(self):
+            return object()
 
         async def release_kv_cache(self):
             return None
@@ -3179,7 +3209,7 @@ def http_server_class():
     )
 
 
-def replica_class():
+def runtime_replica_class():
     return isolated(
         "rollout/replica.py",
         "MultiTaskvLLMReplica",
@@ -3312,7 +3342,7 @@ def test_standalone_server_level2_sleep_and_two_phase_wake_keep_admission_fenced
     assert server._resume_event.is_set is True
     assert ("sleep", 2, "abort") in calls
     assert ("wake_up", ("weights",)) in calls
-    assert ("reset_prefix_cache", True) in calls
+    assert ("reset_prefix_cache", True) not in calls
     assert calls[-2:] == [("health",), ("gate", "set")]
 
 
@@ -3337,6 +3367,9 @@ def test_standalone_server_weights_stage_rollback_returns_to_level2_sleep():
             calls.append(("wake_up", tuple(tags) if tags is not None else None))
             if tags == ["kv_cache"]:
                 self.sleeping = False
+
+        async def reset_prefix_cache(self, *, reset_connector):
+            calls.append(("reset_prefix_cache", reset_connector))
 
         async def wait_for_requests_to_drain(self):
             calls.append(("drain",))
@@ -3633,7 +3666,7 @@ def test_native_runtime_health_probe_confirms_server_and_ce_worker_node():
     class Server:
         runtime_health = AsyncRemoteMethod(lambda: dict(health))
 
-    cls = replica_class()
+    cls = runtime_replica_class()
     replica = cls.__new__(cls)
     replica.replica_kind = ReplicaKind.NATIVE
     replica.replica_rank = 2
@@ -3668,7 +3701,7 @@ def test_native_replica_requires_verified_server_receipts_for_sleep_and_wake():
             }
         )
 
-    cls = replica_class()
+    cls = runtime_replica_class()
     replica = cls.__new__(cls)
     replica.replica_kind = ReplicaKind.NATIVE
     replica.servers = [Server()]
@@ -4230,6 +4263,7 @@ def rollouter_class():
         OperationRecord=OperationRecord,
         OperationEvidence=OperationEvidence,
         EvidenceType=EvidenceType,
+        _require_evidence=_test_require_evidence,
         asyncio=asyncio,
         ray=FakeRay,
     )

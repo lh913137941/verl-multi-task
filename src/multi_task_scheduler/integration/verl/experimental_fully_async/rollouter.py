@@ -408,12 +408,14 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                 if drained_server != server_id:
                     raise RuntimeError("FORCE drain bound a different server")
 
-                admitted = tuple(
-                    request_id
-                    for request_id in await lb.requests_for_server.remote(server_id)
-                    if await lb.query_attempt.remote(request_id)
-                    is AttemptState.ADMITTED
-                )
+                admitted_list = []
+                for request_id in await lb.requests_for_server.remote(server_id):
+                    if (
+                        await lb.query_attempt.remote(request_id)
+                        is AttemptState.ADMITTED
+                    ):
+                        admitted_list.append(request_id)
+                admitted = tuple(admitted_list)
                 abort_result = await runtime.abort_all_requests()
                 if not isinstance(abort_result, dict):
                     raise TypeError("FORCE abort returned a non-dict result")
