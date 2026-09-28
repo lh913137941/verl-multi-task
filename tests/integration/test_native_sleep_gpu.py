@@ -573,13 +573,6 @@ def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
         # Create a genuinely different sender Vpub before the native runtime
         # sleeps.  This prevents global_steps=17 from acting as a mere label:
         # successful RESTORE must carry changed tensor data from the sender.
-        mutation = ray.get(
-            actor_wg.execute_checkpoint_engine(
-                ["prepare"] * actor_wg.world_size
-            )
-        )
-        # prepare() above is only a topology-compatible no-op preflight here;
-        # mutate through the test worker's registered business method.
         mutation_receipts = ray.get(
             actor_wg.zero_output_weights_for_restore_acceptance()
         )
