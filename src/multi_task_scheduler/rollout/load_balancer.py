@@ -22,7 +22,6 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         self.routes: dict[ReplicaKey, str] = {}
         self.active_request_server: dict[str, str] = {}
         self.attempt_state: dict[str, AttemptState] = {}
-        self.draining_servers: set[str] = set()
         self.draining_operations: dict[str, str] = {}
         self.ready_operations: dict[str, tuple[ReplicaKey, str, OperationEvidence]] = {}
         # request_id -> (client_id, prefix_digest, operation_id, evidence).
@@ -41,19 +40,12 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
     def require_release_fields(self) -> list[str]:
         return ["request_id"]
 
-    def _is_draining_server(self, server_id: str) -> bool:
-        return server_id in self.draining_servers
-
     def acquire_server(self, request_id: str, **extra):
         state = self.attempt_state.get(request_id)
         if state in {AttemptState.ADMITTED, AttemptState.TERMINATED}:
             raise RuntimeError("request already has an unsettled generation")
 
         server_id, handle = super().acquire_server(request_id, **extra)
-        if self._is_draining_server(server_id):
-            super().release_server(server_id, request_id=request_id)
-            raise RuntimeError("draining server cannot accept new requests")
-
         if state is AttemptState.SETTLED:
             # Only a successfully admitted replacement attempt invalidates the
             # previous ACK-loss continuation proof. A failed acquire must leave
@@ -192,10 +184,8 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         existing = self.draining_operations.get(server_id)
         if existing is not None and existing != operation_id:
             raise ValueError("server is already draining under another operation")
-        self.draining_servers.add(server_id)
         self.draining_operations[server_id] = operation_id
-        if server_id in self._servers:
-            self.remove_servers([server_id])
+        self.remove_servers([server_id])
         return server_id
 
     def finish_remove(self, key: ReplicaKey):
@@ -214,7 +204,6 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
 
         if server_id in self._servers:
             self.remove_servers([server_id])
-        self.draining_servers.discard(server_id)
         self.draining_operations.pop(server_id, None)
         self.routes.pop(key, None)
         for operation_id, (ready_key, _server_id, _evidence) in tuple(
