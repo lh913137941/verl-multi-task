@@ -124,7 +124,7 @@ Lease(lease_id, claims, expires_at)
 
 - borrowed hidden runtime 的创建/销毁 primitive 已实现并有 placement/actor 清理校验，但端到端 ADD 的 target-only 参数 bootstrap / Vpub 提交尚未完成真实验收；
 - native STANDALONE 的 level-2 sleep / GPU UUID RELEASED 证据链已实现为待验收 primitive，但真实 GPU 让渡闭环尚未验收，TaskRunner 仍拒绝 DONATE；
-- RESTORE 已在内部复用现有 `pending_bootstrap / bootstrap_target / commit_ready` 串起流程；weights-only wake 已移入 Trainer G 内的 CE bootstrap，随后完成当前 Vpub 全量装参、KV 恢复/版本确认并先提交 E，再 full wake、本地 C/M 就绪，最后由 R 对外发布；LB 回包丢失先按 `query_ready_operation()` 对账，只有确认未发布才 verified re-sleep 回 DORMANT。opt-in GPU 验收还会先真实修改 sender output weights，避免只靠 `global_steps` 标签过关；当前环境尚未跑通该 GPU 闭环，因此 TaskRunner 仍拒绝 RESTORE；
+- RESTORE 已在内部复用现有 `pending_bootstrap / bootstrap_target / commit_ready` 串起流程；weights-only wake 已移入 Trainer G 内的 CE bootstrap，随后完成当前 Vpub 全量装参、KV 恢复/版本确认并先提交 E，再 full wake、本地 C/M 就绪，最后由 R 对外发布；LB 回包丢失先按 `query_ready_operation()` 对账；E 提交前的 CE/bootstrap 失败可在 G 内 verified re-sleep 回 DORMANT，但 E 一旦 effective，后续 R 明确发布失败会撤销本地 C 并将 M 收口到 QUARANTINED，R 结果未知则保持 runtime awake/ACTIVE 并由 Trainer BLOCK G，禁止在 E 背后单方面 re-sleep。opt-in GPU 验收还会先真实修改 sender output weights，避免只靠 `global_steps` 标签过关；当前环境尚未跑通该 GPU 闭环，因此 TaskRunner 仍拒绝 RESTORE；
 - FORCE_VERIFIED 的 targeted abort + continuation 真实闭环；当前只保留 continuation-aware Client/LB 控制面 wiring，TaskRunner/Rollouter 都在任何 drain/abort 副作用前 fail-closed；
 - native sleep 后还需用真实 GPU 实验确认显存让渡足以让 borrower 在同一物理 GPU 启动；控制面 receipt/mock 不作为验收。
 
