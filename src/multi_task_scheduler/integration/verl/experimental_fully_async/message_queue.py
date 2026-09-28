@@ -8,7 +8,7 @@ import logging
 import ray
 from verl.experimental.fully_async_policy.message_queue import MessageQueue
 
-from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
+from verl.single_controller.ray.base import _unwrap_ray_remote
 from multi_task_scheduler.orchestration.exactly_once import (
     CompletionEvidence,
     DuplicateCompletionError,
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 @ray.remote(num_cpus=2, max_concurrency=20)
-class MultiTaskMessageQueue(unwrap_native_actor_class(MessageQueue)):
+class MultiTaskMessageQueue(_unwrap_ray_remote(MessageQueue)):
     """Reuse native queue behavior and add one internal completion ledger."""
 
     def __init__(self, config, max_queue_size: int = 1000, *, task_session: str):
