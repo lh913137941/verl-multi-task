@@ -319,7 +319,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
     def _same_borrowed_create_request(record: dict, incoming: dict) -> bool:
         current = dict(incoming)
         if current.get("replica_rank") is None:
-            current["replica_rank"] = record["replica_rank"]
+            current["replica_rank"] = record["resolved_spec"]["replica_rank"]
         return record["resolved_spec"] == current
 
     def _resolve_placement_groups(self, claims) -> dict[str, object]:
@@ -466,7 +466,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             record = {
                 "operation_id": normalized["operation_id"],
                 "replica_key": replica_key,
-                "replica_rank": rank,
                 "result": None,
                 "error": None,
                 # Manager-local replay fence and resolved placement. Retries
@@ -503,7 +502,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 current["result"] = {
                     "operation_id": current["operation_id"],
                     "lease_id": lease_id,
-                    "replica_rank": current["replica_rank"],
+                    "replica_rank": current["resolved_spec"]["replica_rank"],
                     "state": "RUNTIME_READY",
                     "released": False,
                     "server_address": runtime_receipt.get("server_address"),
