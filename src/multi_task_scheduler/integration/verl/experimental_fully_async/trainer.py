@@ -117,6 +117,7 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
             replica_kind = next(iter(replica_kinds))
 
             await lease.guard(self.checkpoint_manager.remove_effective, target)
+            mutated = True
             # Reuse CE's existing pending set as the parked receiver reference
             # for retained native DONATE. Borrowed REMOVE is destroyed later and
             # therefore must not leave a stale pending runtime behind.
@@ -127,7 +128,6 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
                     replicas,
                     operation_id=operation.operation_id,
                 )
-            mutated = True
             evidence = await lease.guard(
                 self.rollouter.commit_service_change.remote,
                 operation,
@@ -185,13 +185,13 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
             # Rebind the already-retained receiver to this RESTORE operation
             # using CE's existing pending API; no new lifecycle state is added.
             await lease.guard(self.checkpoint_manager.discard_pending, target)
+            mutated = True
             await lease.guard(
                 self.checkpoint_manager.register_pending,
                 target,
                 replicas,
                 operation_id=operation.operation_id,
             )
-            mutated = True
 
             weight_evidence = await lease.guard(
                 self.checkpoint_manager.bootstrap_target,
