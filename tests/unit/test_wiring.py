@@ -3690,7 +3690,7 @@ def test_rollouter_restore_unknown_route_outcome_keeps_runtime_active_and_awake(
     ]
 
 
-def test_rollouter_restore_routing_failure_rolls_back_to_verified_dormant():
+def test_rollouter_restore_definite_routing_failure_quarantines_after_e_commit():
     cls = rollouter_class()
     rollouter = cls(object(), object())
     key = ReplicaKey("task-a", "native-0")
@@ -3705,8 +3705,9 @@ def test_rollouter_restore_routing_failure_rolls_back_to_verified_dormant():
             return ({"sleeping": False, "fully_awake": True},)
 
         async def sleep(self):
-            calls.append(("sleep",))
-            return ({"sleep_level": 2, "sleeping": True},)
+            raise AssertionError(
+                "service publish failure after E commit must not re-sleep behind E"
+            )
 
     class LB:
         commit_ready = AsyncRemoteMethod(
@@ -3750,7 +3751,8 @@ def test_rollouter_restore_routing_failure_rolls_back_to_verified_dormant():
                 OperationRecord("op-restore", OperationStatus.RUNNING)
             )
         )
-    assert manager.replica_state[key] is ReplicaState.DORMANT
+
+    assert manager.replica_state[key] is ReplicaState.QUARANTINED
     assert calls == [
         ("wake_up",),
         ("activate_service", key),
@@ -3759,71 +3761,8 @@ def test_rollouter_restore_routing_failure_rolls_back_to_verified_dormant():
         ("state", ReplicaState.DRAINING),
         ("deactivate_service", key),
         ("capacity",),
-        ("sleep",),
-        ("state", ReplicaState.DORMANT),
+        ("state", ReplicaState.QUARANTINED),
     ]
-
-
-def test_rollouter_restore_unverified_rollback_quarantines_native():
-    cls = rollouter_class()
-    rollouter = cls(object(), object())
-    key = ReplicaKey("task-a", "native-0")
-
-    class Runtime:
-        _server_address = "s0"
-        _server_handle = "h0"
-
-        async def wake_up(self):
-            return ({"sleeping": False, "fully_awake": True},)
-
-        async def sleep(self):
-            raise RuntimeError("cannot prove re-sleep")
-
-    class LB:
-        commit_ready = AsyncRemoteMethod(
-            lambda *args, **kwargs: (_ for _ in ()).throw(
-                RuntimeError("routing commit failed")
-            )
-        )
-        query_ready_operation = AsyncRemoteMethod(lambda operation_id: None)
-
-    class Manager:
-        global_load_balancer = LB()
-
-        def __init__(self):
-            self.replica_state = {key: ReplicaState.DORMANT}
-            self.replica_kind = {key: ReplicaKind.NATIVE}
-
-        def replica_meta(self, target):
-            return self.replica_kind[target], self.replica_state[target]
-
-        def inspect_runtime(self, target):
-            return Runtime()
-
-        def activate_service(self, target):
-            return None
-
-        def deactivate_service(self, target):
-            return None
-
-        def transition_replica(self, target, state):
-            self.replica_state[target] = state
-
-    manager = Manager()
-    rollouter.llm_server_manager = manager
-    rollouter._pending_operation_targets["op-restore"] = key
-    rollouter._update_max_concurrent_samples = lambda: None
-
-    with pytest.raises(
-        RuntimeError,
-        match="publish failed and rollback is unverified",
-    ):
-        asyncio.run(
-            rollouter.commit_service_change(
-                OperationRecord("op-restore", OperationStatus.RUNNING)
-            )
-        )
-    assert manager.replica_state[key] is ReplicaState.QUARANTINED
 
 
 def test_rollouter_invalid_exit_state_does_not_bind_pending_operation():
