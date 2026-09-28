@@ -5235,7 +5235,7 @@ def test_rollouter_natural_exit_retries_idempotent_begin_drain_after_lost_reply(
     ]
 
 
-def test_rollouter_natural_exit_quarantines_when_drain_start_remains_unknown():
+def test_rollouter_natural_exit_keeps_draining_when_drain_start_remains_unknown():
     cls = rollouter_class()
     rollouter = cls(object(), object())
     key = ReplicaKey("task-a", "r0")
@@ -5269,10 +5269,10 @@ def test_rollouter_natural_exit_quarantines_when_drain_start_remains_unknown():
         asyncio.run(
             rollouter.prepare_exit(key, operation_id="op-fail")
         )
-    assert manager.replica_state[key] is ReplicaState.QUARANTINED
+    assert manager.replica_state[key] is ReplicaState.DRAINING
+    assert rollouter.get_pending_target("op-fail") == key
     assert calls == [
         ("state", ReplicaState.DRAINING),
-        ("state", ReplicaState.QUARANTINED),
     ]
 
 
