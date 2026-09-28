@@ -115,6 +115,8 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
             if len(replica_kinds) != 1:
                 raise ValueError("CE member contains inconsistent replica kinds")
             replica_kind = next(iter(replica_kinds))
+            if replica_kind not in {ReplicaKind.NATIVE, ReplicaKind.BORROWED}:
+                raise ValueError("CE member has unsupported replica kind")
 
             await lease.guard(self.checkpoint_manager.remove_effective, target)
             mutated = True
