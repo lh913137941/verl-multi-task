@@ -1075,6 +1075,10 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     assert asyncio.run(
         manager.destroy(borrowed_key, operation_id="op-remove")
     ) == release
+    manager.transition_replica(borrowed_key, ReplicaState.RELEASED)
+    assert asyncio.run(
+        manager.destroy(borrowed_key, operation_id="op-remove")
+    ) == release
 
     wrong_rank = dict(valid_spec, replica_rank=7)
     with pytest.raises(ValueError, match="conflicting borrowed create replay"):
@@ -2816,6 +2820,7 @@ def _isolated_group_scheduler_class():
         "OperationEvidence": OperationEvidence,
         "OperationKind": OperationKind,
         "OperationRecord": OperationRecord,
+        "OperationStatus": OperationStatus,
         "RUNTIME_KIND": "test",
         "EvidenceType": EvidenceType,
         "_RELEASE_KINDS": {OperationKind.DONATE, OperationKind.REMOVE},
@@ -2890,6 +2895,13 @@ def test_group_scheduler_rolls_back_staged_add_state_when_taskrunner_rejects():
                 NotImplementedError("backend unavailable")
             )
         )
+        query_operation = RemoteMethod(
+            lambda operation_id: OperationRecord(
+                operation_id,
+                OperationStatus.UNKNOWN,
+                "operation not found in TaskRunner journal",
+            )
+        )
 
     gs.task_runners["task-a"] = Runner()
     with pytest.raises(NotImplementedError, match="backend unavailable"):
@@ -2918,6 +2930,13 @@ def test_group_scheduler_rolls_back_restore_reservation_when_taskrunner_rejects(
                 NotImplementedError("restore unavailable")
             )
         )
+        query_operation = RemoteMethod(
+            lambda operation_id: OperationRecord(
+                operation_id,
+                OperationStatus.UNKNOWN,
+                "operation not found in TaskRunner journal",
+            )
+        )
 
     gs.task_runners["task-a"] = Runner()
     with pytest.raises(NotImplementedError, match="restore unavailable"):
@@ -2925,6 +2944,37 @@ def test_group_scheduler_rolls_back_restore_reservation_when_taskrunner_rejects(
     assert command.operation_id not in gs.operation_commands
     assert lease.lease_id not in gs.active_gpu_owner.values()
     assert lease.lease_id not in gs.active_bundle_owner.values()
+
+
+def test_group_scheduler_preserves_staging_when_submission_outcome_is_ambiguous():
+    cls = _isolated_group_scheduler_class()
+    gs = cls()
+    lease = _scheduler_test_lease()
+    gs.open_lease(lease)
+    command = OperationCommand(
+        "op-donate-timeout",
+        OperationKind.DONATE,
+        ReplicaKey("task-a", "native-0"),
+        lease.lease_id,
+    )
+
+    class Runner:
+        submit_operation = RemoteMethod(
+            lambda received, lease=None: (_ for _ in ()).throw(
+                TimeoutError("reply lost")
+            )
+        )
+        query_operation = RemoteMethod(
+            lambda operation_id: OperationRecord(
+                operation_id,
+                OperationStatus.RUNNING,
+            )
+        )
+
+    gs.task_runners["task-a"] = Runner()
+    with pytest.raises(TimeoutError, match="reply lost"):
+        gs.submit_operation(command)
+    assert gs.operation_commands[command.operation_id] == command
 
 
 def test_group_scheduler_binds_donate_to_lease_donor_rank():
@@ -3561,6 +3611,32 @@ def test_rollouter_restore_unverified_rollback_quarantines_native():
             )
         )
     assert manager.replica_state[key] is ReplicaState.QUARANTINED
+
+
+def test_rollouter_invalid_exit_state_does_not_bind_pending_operation():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "native-0")
+
+    class Manager:
+        global_load_balancer = object()
+
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.DORMANT}
+            self.replica_kind = {key: ReplicaKind.NATIVE}
+
+        def replica_meta(self, target):
+            return self.replica_kind[target], self.replica_state[target]
+
+    rollouter.llm_server_manager = Manager()
+    with pytest.raises(ValueError, match="ACTIVE/DRAINING"):
+        asyncio.run(
+            rollouter.prepare_exit(
+                key,
+                operation_id="op-invalid-exit",
+            )
+        )
+    assert "op-invalid-exit" not in rollouter._pending_operation_targets
 
 
 def test_rollouter_natural_exit_separates_drain_from_service_commit():
