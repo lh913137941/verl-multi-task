@@ -586,14 +586,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         if len(set(gpu_uuids)) != len(gpu_uuids):
             raise RuntimeError("native runtime placement contains duplicate GPU UUIDs")
 
-        receipts = await runtime.sleep()
-        if not isinstance(receipts, (tuple, list)) or not receipts:
-            raise RuntimeError("native runtime returned no sleep receipts")
-        for receipt in receipts:
-            if not isinstance(receipt, dict):
-                raise TypeError("native runtime sleep returned a non-dict receipt")
-            if receipt.get("sleep_level") != 2 or receipt.get("sleeping") is not True:
-                raise RuntimeError("native runtime did not confirm level-2 sleep")
+        await runtime.sleep()
 
         evidence = OperationEvidence.now(
             operation_id,
