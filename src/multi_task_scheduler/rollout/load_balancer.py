@@ -202,8 +202,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
                 self.attempt_state[request_id] = AttemptState.SETTLED
                 self.active_request_server.pop(request_id, None)
 
-        if server_id in self._servers:
-            self.remove_servers([server_id])
+        self.remove_servers([server_id])
         self.draining_operations.pop(server_id, None)
         self.routes.pop(key, None)
         for operation_id, (ready_key, _server_id, _evidence) in tuple(
@@ -212,9 +211,3 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             if ready_key == key:
                 self.ready_operations.pop(operation_id, None)
 
-    def gc_settled_requests(self, request_ids):
-        for request_id in request_ids:
-            if self.attempt_state.get(request_id) is AttemptState.SETTLED:
-                self.attempt_state.pop(request_id, None)
-                self.active_request_server.pop(request_id, None)
-                self.continuation_proofs.pop(request_id, None)
