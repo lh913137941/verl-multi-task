@@ -2,6 +2,8 @@
 
 import asyncio
 import hashlib
+import os
+import subprocess
 
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -9,13 +11,14 @@ from ray.util.state import list_actors
 
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.single_controller.ray.base import get_master_addr_port
-from verl.utils.device import get_device_name
+from verl.utils.device import (
+    get_device_name,
+    get_resource_name,
+    get_visible_devices_keyword,
+)
 from verl.workers.rollout.replica import RolloutMode
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
-from multi_task_scheduler.checkpoint.checkpoint_engine_worker import (
-    MultiTaskCheckpointEngineWorker,
-)
 from multi_task_scheduler.orchestration.contracts import (
     FIRST_RELEASE_MAX_COLOCATE_COUNT,
     ReplicaKind,
@@ -50,6 +53,60 @@ class MultiTaskvLLMReplica(vLLMReplica):
         if not isinstance(value, str) or not value:
             raise ValueError("identity value must be a nonempty string")
         return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+    @staticmethod
+    def _runtime_placement_probe(_worker) -> dict:
+        """Run inside VERL's native CheckpointEngineWorker via __ray_call__."""
+        resource_name = get_resource_name()
+        if resource_name != "GPU":
+            raise NotImplementedError(
+                f"first release placement probe supports GPU only, got {resource_name!r}"
+            )
+        context = ray.get_runtime_context()
+        ids = context.get_accelerator_ids().get(resource_name, [])
+        if len(ids) != 1:
+            raise RuntimeError(
+                f"expected exactly one Ray GPU id for CE actor, got {ids!r}"
+            )
+        accelerator_id = str(ids[0])
+        if accelerator_id.startswith("GPU-"):
+            gpu_uuid = accelerator_id
+        elif accelerator_id.startswith("MIG-"):
+            raise NotImplementedError("first release does not support MIG placement")
+        elif accelerator_id.isdigit():
+            output = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,uuid",
+                    "--format=csv,noheader,nounits",
+                ],
+                text=True,
+                timeout=10,
+            )
+            mapping = {}
+            for line in output.splitlines():
+                if line.strip():
+                    index, uuid = [part.strip() for part in line.split(",", 1)]
+                    mapping[index] = uuid
+            try:
+                gpu_uuid = mapping[accelerator_id]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"nvidia-smi did not report Ray GPU id {accelerator_id!r}"
+                ) from exc
+        else:
+            raise RuntimeError(
+                f"cannot map Ray GPU accelerator id {accelerator_id!r} to a UUID"
+            )
+        return {
+            "node_id": context.get_node_id(),
+            "accelerator_id": accelerator_id,
+            "gpu_uuid": gpu_uuid,
+            "visible_devices": os.environ.get(
+                get_visible_devices_keyword().upper(),
+                "",
+            ),
+        }
 
     def validate_placement(self, spec: dict) -> None:
         """Validate the borrower-local topology without creating Ray actors."""
@@ -173,6 +230,17 @@ class MultiTaskvLLMReplica(vLLMReplica):
             )
         ).remote()
 
+    async def worker_placements(self) -> tuple[dict, ...]:
+        placements = await asyncio.gather(
+            *[
+                worker.__ray_call__.remote(self._runtime_placement_probe)
+                for worker in self.workers
+            ]
+        )
+        if any(not isinstance(item, dict) for item in placements):
+            raise TypeError("runtime placement probe returned a non-dict result")
+        return tuple(dict(item) for item in placements)
+
     async def validate_worker_placement(self) -> tuple[dict, ...]:
         """Verify each borrower CE actor landed on the claimed node/GPU UUID."""
         claims = tuple(self.placement_claims or ())
@@ -180,9 +248,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
             raise RuntimeError(
                 "borrower worker count does not match normalized placement claims"
             )
-        placements = await asyncio.gather(
-            *[worker.runtime_placement.remote() for worker in self.workers]
-        )
+        placements = await self.worker_placements()
         for claim, actual in zip(claims, placements, strict=True):
             if not isinstance(actual, dict):
                 raise TypeError("runtime placement probe returned a non-dict result")
@@ -369,11 +435,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
         workers = tuple(getattr(self, "workers", ()) or ())
         if not workers:
             raise RuntimeError("native runtime has no CE workers for health validation")
-        placements = await asyncio.gather(
-            *[worker.runtime_placement.remote() for worker in workers]
-        )
-        if any(not isinstance(placement, dict) for placement in placements):
-            raise TypeError("native runtime placement probe returned a non-dict result")
+        placements = await self.worker_placements()
         worker_nodes = {placement.get("node_id") for placement in placements}
         if len(worker_nodes) != 1 or health.get("node_id") not in worker_nodes:
             raise RuntimeError("native server/worker node placement mismatch")
@@ -465,14 +527,6 @@ class MultiTaskvLLMReplica(vLLMReplica):
                 ) from cleanup_exc
             self.borrowed_runtime_state = "FAILED"
             raise exc
-
-    def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
-        return RayClassWithInitArgs(
-            cls=ray.remote(MultiTaskCheckpointEngineWorker),
-            rollout_config=self.config,
-            model_config=self.model_config,
-            replica_rank=self.replica_rank,
-        )
 
     async def sleep(self):
         """Deep-sleep the retained native runtime through verified server receipts."""
