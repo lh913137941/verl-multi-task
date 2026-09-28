@@ -18,9 +18,9 @@ _RESOLVED = {
     OperationStatus.SUCCEEDED,
     OperationStatus.FAILED,
 }
-# UNKNOWN means owner-side effects are not reconciled yet. It is terminal for
-# replay of the same operation, but it must keep the task's lifecycle slot
-# fenced until a real reconciliation path proves a resolved outcome.
+# UNKNOWN means owner-side effects are not reconciled yet. Ordinary replay
+# remains fenced, but the same operation may be explicitly reopened for
+# owner-fact reconciliation; conflicting/new operations stay blocked.
 
 
 class OperationJournal:
@@ -71,6 +71,15 @@ class OperationJournal:
         record.status = OperationStatus.RUNNING
         if result is not None:
             record.result = result
+        return record
+
+    def reopen_unknown(self, operation_id: str) -> OperationRecord:
+        """Re-enter RUNNING only for explicit reconciliation of the same operation."""
+        record = self._records[operation_id]
+        if record.status is not OperationStatus.UNKNOWN:
+            raise OperationIdentityError("only UNKNOWN operation may be reconciled")
+        record.status = OperationStatus.RUNNING
+        record.result = None
         return record
 
     def finish(

@@ -172,7 +172,11 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                 self._operation_leases.setdefault(command.operation_id, lease)
 
             snapshot = self._snapshot_record(record)
-            launch = existing is None
+            launch = existing is None or (
+                existing.status is OperationStatus.UNKNOWN
+                and command.kind in {OperationKind.ADD, OperationKind.RESTORE}
+                and command.operation_id not in self._operation_threads
+            )
 
         if launch:
             try:
@@ -207,7 +211,11 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             with self._journal_lock:
                 journal = self._operation_journal
                 command = journal.command(operation_id)
-                record = journal.mark_running(operation_id)
+                current = journal.query(operation_id)
+                if current is not None and current.status is OperationStatus.UNKNOWN:
+                    record = journal.reopen_unknown(operation_id)
+                else:
+                    record = journal.mark_running(operation_id)
                 operation = self._snapshot_record(record)
 
             trainer = self.components["trainer"]
@@ -369,7 +377,9 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
         finally:
             with self._journal_lock:
                 self._operation_threads.pop(operation_id, None)
-                self._operation_leases.pop(operation_id, None)
+                current = self._operation_journal.query(operation_id)
+                if current is None or current.status is not OperationStatus.UNKNOWN:
+                    self._operation_leases.pop(operation_id, None)
 
     def run(self, config):
         self.group_scheduler = get_or_create_group_scheduler()

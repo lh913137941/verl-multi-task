@@ -126,7 +126,7 @@ Lease(lease_id, claims, expires_at)
 
 - ADD：hidden borrowed create → current-Vpub target bootstrap → E → R/C/M 已端到端接线；纯 placement 校验失败、runtime 创建前失败、或已证明 borrowed cleanup 的失败会以 FAILED+RELEASED 补偿收口，不再误记 UNKNOWN；真实 GPU/NCCL 验收仍需实际执行；
 - DONATE：自然 drain → E/R/C 退出 → native level-2 sleep → GPU UUID `RELEASED` → GS handoff-ready 已端到端接线；自然 drain 由 `multitask.drain_timeout_s`（默认 300s）设上限并周期输出等待日志，超时进入隔离而不是无限轮询；真实同卡让渡闭环仍需实际执行；
-- RESTORE 已在内部复用现有 `pending_bootstrap / bootstrap_target / commit_ready` 串起流程；weights-only wake 已移入 Trainer G 内的 CE bootstrap，随后完成当前 Vpub 全量装参、KV 恢复/版本确认并先提交 E，再 full wake、本地 C/M 就绪，最后由 R 对外发布；LB 回包丢失先按 `query_ready_operation()` 对账；E 提交前的 CE/bootstrap 失败可在 G 内 verified re-sleep 回 DORMANT，但 E 一旦 effective，后续 R 明确发布失败会撤销本地 C 并将 M 收口到 QUARANTINED，R 结果未知则保持 runtime awake/ACTIVE 并由 Trainer BLOCK G，禁止在 E 背后单方面 re-sleep。opt-in GPU 验收还会先真实修改 sender output weights，避免只靠 `global_steps` 标签过关；当前环境尚未跑通该 GPU 闭环，但 TaskRunner 已受理 RESTORE，运行时按证据失败/隔离；
+- RESTORE 已在内部复用现有 `pending_bootstrap / bootstrap_target / commit_ready` 串起流程；weights-only wake 已移入 Trainer G 内的 CE bootstrap，随后完成当前 Vpub 全量装参、KV 恢复/版本确认并先提交 E，再 full wake、本地 C/M 就绪，最后由 R 对外发布；LB 回包丢失先按 `query_ready_operation()` 对账；E 提交前的 CE/bootstrap 失败可在 G 内 verified re-sleep 回 DORMANT；E 已 effective 后若 R 明确未发布，则先撤 C/M、再由 Trainer 在 G 内撤 E，最后真实 re-sleep 并以 RELEASED 补偿；R 仍未知则保持 runtime awake/ACTIVE 并 BLOCK G，同 operation 重放会重新查询 R，只有向前补齐或验证回滚成功才解围栏。opt-in GPU 验收还会先真实修改 sender output weights，避免只靠 `global_steps` 标签过关；当前环境尚未跑通该 GPU 闭环，但 TaskRunner 已受理 RESTORE，运行时按证据失败/隔离；
 - FORCE_VERIFIED：borrowed-only targeted abort + continuation proof + partial-rollout retry 已接线，并有 opt-in 两 GPU 验收入口；当前会话未实际运行该 GPU 用例；
 - native sleep 后还需用真实 GPU 实验确认显存让渡足以让 borrower 在同一物理 GPU 启动；控制面 receipt/mock 不作为验收。
 

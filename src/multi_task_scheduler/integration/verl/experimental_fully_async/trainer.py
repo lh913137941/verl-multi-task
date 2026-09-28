@@ -91,6 +91,97 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
         finally:
             await lease.release()
 
+    async def _reconcile_blocked_publish(
+        self,
+        operation: OperationRecord,
+        *,
+        restore_native: bool,
+    ) -> OperationEvidence | None:
+        """Resolve a BLOCKED ADD/RESTORE publication from owner facts under G."""
+        gate = self.replica_sync_gate
+        if (
+            gate.health != "BLOCKED"
+            or gate.blocked_operation_id != operation.operation_id
+        ):
+            return None
+
+        target = await self.rollouter.get_pending_target.remote(operation.operation_id)
+        member = self.checkpoint_manager.effective_replicas.get(target)
+        if member is None:
+            # This was not a post-E publication failure; keep the existing fence.
+            return None
+
+        replicas, loaded_version = member
+        result = {}
+
+        async def reconcile():
+            service_evidence = await self.rollouter.commit_service_change.remote(
+                operation
+            )
+            if service_evidence is None:
+                self.checkpoint_manager.remove_effective(target)
+                if restore_native:
+                    self.checkpoint_manager.register_pending(
+                        target,
+                        replicas,
+                        operation_id=operation.operation_id,
+                    )
+                release_evidence = await self.rollouter.finalize_release.remote(
+                    operation
+                )
+                result["evidence"] = _require_evidence(
+                    release_evidence,
+                    operation.operation_id,
+                    EvidenceType.RELEASED,
+                    "publication rollback release",
+                )
+                return
+
+            if service_evidence is None:
+                await lease.guard(
+                    self.checkpoint_manager.remove_effective,
+                    target,
+                )
+                release_evidence = await lease.guard(
+                    self.rollouter.finalize_release.remote,
+                    operation,
+                )
+                _require_evidence(
+                    release_evidence,
+                    operation.operation_id,
+                    EvidenceType.RELEASED,
+                    "ADD no-route rollback",
+                )
+                e_committed = False
+                return release_evidence
+            if (
+                isinstance(service_evidence, OperationEvidence)
+                and service_evidence.type is EvidenceType.RELEASED
+            ):
+                # Compatibility with a worker that completed rollback before the
+                # Trainer observed the response.
+                self.checkpoint_manager.remove_effective(target)
+                result["evidence"] = _require_evidence(
+                    service_evidence,
+                    operation.operation_id,
+                    EvidenceType.RELEASED,
+                    "publication rollback",
+                )
+                return
+
+            result["evidence"] = _require_evidence(
+                service_evidence,
+                operation.operation_id,
+                EvidenceType.SERVICE_COMMITTED,
+                "publication reconciliation",
+            )
+
+        await gate.reconcile(operation.operation_id, reconcile)
+        evidence = result.get("evidence")
+        if evidence is None:
+            raise RuntimeError("publication reconciliation returned no evidence")
+        return evidence
+
     async def bootstrap_and_publish(self, operation: OperationRecord) -> OperationEvidence:
         """Bootstrap one hidden borrowed target at current Vpub, then publish it."""
         if not isinstance(operation, OperationRecord):
@@ -101,6 +192,12 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
             raise RuntimeError("current parameter version is unavailable for ADD")
 
         gate = self.replica_sync_gate
+        reconciled = await self._reconcile_blocked_publish(
+            operation,
+            restore_native=False,
+        )
+        if reconciled is not None:
+            return reconciled
         lease = await gate.acquire(operation.operation_id, GateKind.ADD)
         pending_registered = False
         e_committed = False
@@ -291,6 +388,12 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
             raise RuntimeError("current parameter version is unavailable for RESTORE")
 
         gate = self.replica_sync_gate
+        reconciled = await self._reconcile_blocked_publish(
+            operation,
+            restore_native=True,
+        )
+        if reconciled is not None:
+            return reconciled
         lease = await gate.acquire(operation.operation_id, GateKind.RESTORE)
         mutated = False
         try:
@@ -355,6 +458,27 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                 self.rollouter.commit_service_change.remote,
                 operation,
             )
+            if service_evidence is None:
+                await lease.guard(
+                    self.checkpoint_manager.remove_effective,
+                    target,
+                )
+                await lease.guard(
+                    self.checkpoint_manager.register_pending,
+                    target,
+                    replicas,
+                    operation_id=operation.operation_id,
+                )
+                release_evidence = await lease.guard(
+                    self.rollouter.finalize_release.remote,
+                    operation,
+                )
+                return _require_evidence(
+                    release_evidence,
+                    operation.operation_id,
+                    EvidenceType.RELEASED,
+                    "RESTORE no-route rollback",
+                )
             return _require_evidence(
                 service_evidence,
                 operation.operation_id,

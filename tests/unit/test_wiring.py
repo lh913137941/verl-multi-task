@@ -443,6 +443,34 @@ def test_taskrunner_minimal_journal_surface_and_replay_does_not_relaunch():
     assert missing.result is None
 
 
+def test_taskrunner_exact_unknown_add_replay_relaunches_same_operation():
+    runner = taskrunner_class()()
+    runner.task_session = "task-a"
+    runner._control_ready = True
+    command = OperationCommand(
+        "op-add-reconcile",
+        OperationKind.ADD,
+        ReplicaKey("task-a", "borrowed-0"),
+        "l1",
+    )
+    lease = taskrunner_lease()
+    runner._operation_journal.begin(command)
+    runner._operation_journal.mark_running(command.operation_id)
+    runner._operation_journal.finish(
+        command.operation_id,
+        OperationStatus.UNKNOWN,
+        "routing outcome unknown",
+    )
+    runner._operation_leases[command.operation_id] = lease
+    launched = []
+    runner._launch_operation = launched.append
+
+    replay = runner.submit_operation(command, lease=lease)
+
+    assert replay.status is OperationStatus.UNKNOWN
+    assert launched == [command.operation_id]
+
+
 def test_taskrunner_add_is_admitted_with_matching_lease_snapshot():
     runner = taskrunner_class()()
     runner.task_session = "task-a"
@@ -1025,8 +1053,10 @@ def test_trainer_add_definite_route_rejection_removes_effective_e_and_returns_re
     class Rollouter:
         get_pending_target = AsyncRemoteMethod(lambda operation_id: key)
         get_pending_replicas = AsyncRemoteMethod(lambda operation_id: (runtime,))
-        commit_service_change = AsyncRemoteMethod(
-            lambda operation: OperationEvidence(
+        commit_service_change = AsyncRemoteMethod(lambda operation: None)
+        finalize_release = AsyncRemoteMethod(
+            lambda operation: calls.append(("finalize_release", operation.operation_id))
+            or OperationEvidence(
                 operation.operation_id,
                 EvidenceType.RELEASED,
                 2,
@@ -1052,6 +1082,7 @@ def test_trainer_add_definite_route_rejection_removes_effective_e_and_returns_re
     assert calls == [
         ("commit_pending", key, 9),
         ("remove_effective", key),
+        ("finalize_release", "op-add"),
     ]
 
 
@@ -1110,6 +1141,41 @@ def test_trainer_add_bootstrap_failure_discards_pending_and_destroys_hidden_runt
         ("discard_pending", key),
         ("finalize_release", "op-add"),
     ]
+
+
+def test_trainer_blocked_add_replay_reconciles_committed_route_and_clears_g():
+    key = ReplicaKey("task-a", "borrowed-0")
+    runtime = type("Runtime", (), {"replica_kind": ReplicaKind.BORROWED})()
+    committed = OperationEvidence(
+        "op-add",
+        EvidenceType.SERVICE_COMMITTED,
+        9,
+    )
+
+    class CE:
+        effective_replicas = {key: ((runtime,), 7)}
+
+    class Rollouter:
+        get_pending_target = AsyncRemoteMethod(lambda operation_id: key)
+        commit_service_change = AsyncRemoteMethod(lambda operation: committed)
+
+    trainer = trainer_class()()
+    trainer.rollouter = Rollouter()
+    trainer.checkpoint_manager = CE()
+    trainer.current_param_version = 7
+
+    async def scenario():
+        lease = await trainer.replica_sync_gate.acquire("op-add", GateKind.ADD)
+        trainer.replica_sync_gate.block(lease.owner, "R outcome unknown")
+        await lease.release()
+        return await trainer.bootstrap_and_publish(
+            OperationRecord("op-add", OperationStatus.RUNNING)
+        )
+
+    evidence = asyncio.run(scenario())
+
+    assert evidence == committed
+    assert trainer.replica_sync_gate.health == "HEALTHY"
 
 
 def test_trainer_donate_parks_native_ce_member_in_existing_pending_set():
@@ -1308,6 +1374,70 @@ def test_trainer_restore_bootstrap_release_returns_compensation_without_blocking
     assert evidence.released_gpu_uuids == ("u0",)
     assert trainer.replica_sync_gate.health == "HEALTHY"
     assert calls == [("bootstrap_target", 11)]
+
+
+def test_trainer_restore_definite_no_route_removes_e_then_resleeps():
+    key = ReplicaKey("task-a", "native-0")
+    runtime = type("Runtime", (), {"replica_kind": ReplicaKind.NATIVE})()
+    calls = []
+
+    class CE:
+        def __init__(self):
+            self.pending_bootstrap = {key: ((runtime,), "op-donate")}
+            self.effective_replicas = {}
+
+        def discard_pending(self, target):
+            self.pending_bootstrap.pop(target, None)
+
+        def register_pending(self, target, replicas, *, operation_id):
+            calls.append(("register_pending", target, operation_id))
+            self.pending_bootstrap[target] = (tuple(replicas), operation_id)
+
+        async def bootstrap_target(self, target, *, operation_id, loaded_version):
+            return OperationEvidence(operation_id, EvidenceType.WEIGHT_READY, 2)
+
+        def commit_pending(self, target, evidence, *, loaded_version):
+            self.pending_bootstrap.pop(target, None)
+            self.effective_replicas[target] = ((runtime,), loaded_version)
+
+        def remove_effective(self, target):
+            calls.append(("remove_effective", target))
+            self.effective_replicas.pop(target, None)
+            self.pending_bootstrap.pop(target, None)
+
+    class Rollouter:
+        get_pending_target = AsyncRemoteMethod(lambda operation_id: key)
+        commit_service_change = AsyncRemoteMethod(lambda operation: None)
+        finalize_release = AsyncRemoteMethod(
+            lambda operation: calls.append(("finalize_release", operation.operation_id))
+            or OperationEvidence(
+                operation.operation_id,
+                EvidenceType.RELEASED,
+                4,
+                ("u0",),
+            )
+        )
+
+    trainer = trainer_class()()
+    trainer.rollouter = Rollouter()
+    trainer.checkpoint_manager = CE()
+    trainer.current_param_version = 13
+
+    evidence = asyncio.run(
+        trainer.restore_and_publish(
+            OperationRecord("op-restore", OperationStatus.RUNNING)
+        )
+    )
+
+    assert evidence.type is EvidenceType.RELEASED
+    assert trainer.replica_sync_gate.health == "HEALTHY"
+    assert key not in trainer.checkpoint_manager.effective_replicas
+    assert key in trainer.checkpoint_manager.pending_bootstrap
+    assert calls == [
+        ("remove_effective", key),
+        ("register_pending", key, "op-restore"),
+        ("finalize_release", "op-restore"),
+    ]
 
 
 def test_trainer_restore_service_failure_keeps_e_effective_and_blocks_g():
@@ -4090,7 +4220,7 @@ def test_rollouter_add_commit_publishes_hidden_borrower_after_e_is_ready():
     ]
 
 
-def test_rollouter_add_definite_route_rejection_returns_verified_release():
+def test_rollouter_add_definite_route_rejection_defers_destroy_until_e_is_removed():
     cls = rollouter_class()
     rollouter = cls(object(), object())
     key = ReplicaKey("task-a", "borrowed-0")
@@ -4151,10 +4281,9 @@ def test_rollouter_add_definite_route_rejection_returns_verified_release():
         )
     )
 
-    assert evidence.type is EvidenceType.RELEASED
-    assert evidence.released_gpu_uuids == ("u0",)
-    assert manager.replica_state[key] is ReplicaState.RELEASED
-    assert "op-add" not in rollouter._pending_operation_targets
+    assert evidence is None
+    assert manager.replica_state[key] is ReplicaState.DRAINING
+    assert "op-add" in rollouter._pending_operation_targets
     assert calls == [
         ("activate_service", key),
         ("capacity",),
@@ -4162,8 +4291,6 @@ def test_rollouter_add_definite_route_rejection_returns_verified_release():
         ("state", ReplicaState.DRAINING),
         ("deactivate_service", key),
         ("capacity",),
-        ("destroy", key, "op-add"),
-        ("state", ReplicaState.RELEASED),
     ]
 
 
@@ -4491,7 +4618,7 @@ def test_rollouter_restore_unknown_route_outcome_keeps_runtime_active_and_awake(
     ]
 
 
-def test_rollouter_restore_definite_routing_failure_quarantines_after_e_commit():
+def test_rollouter_restore_definite_no_route_defers_sleep_until_e_is_removed():
     cls = rollouter_class()
     rollouter = cls(object(), object())
     key = ReplicaKey("task-a", "native-0")
@@ -4546,14 +4673,14 @@ def test_rollouter_restore_definite_routing_failure_quarantines_after_e_commit()
     rollouter._pending_operation_targets["op-restore"] = key
     rollouter._update_max_concurrent_samples = lambda: calls.append(("capacity",))
 
-    with pytest.raises(RuntimeError, match="routing commit failed"):
-        asyncio.run(
-            rollouter.commit_service_change(
-                OperationRecord("op-restore", OperationStatus.RUNNING)
-            )
+    evidence = asyncio.run(
+        rollouter.commit_service_change(
+            OperationRecord("op-restore", OperationStatus.RUNNING)
         )
+    )
 
-    assert manager.replica_state[key] is ReplicaState.QUARANTINED
+    assert evidence is None
+    assert manager.replica_state[key] is ReplicaState.DRAINING
     assert calls == [
         ("wake_up",),
         ("activate_service", key),
@@ -4562,7 +4689,6 @@ def test_rollouter_restore_definite_routing_failure_quarantines_after_e_commit()
         ("state", ReplicaState.DRAINING),
         ("deactivate_service", key),
         ("capacity",),
-        ("state", ReplicaState.QUARANTINED),
     ]
 
 

@@ -288,14 +288,25 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
             raise RuntimeError("LLM server manager is not initialized")
         if spec is None:
             kind, state = manager.replica_meta(replica_key)
-            if kind is not ReplicaKind.NATIVE or state is not ReplicaState.DORMANT:
+            if kind is not ReplicaKind.NATIVE:
                 raise ValueError(
-                    "spec-free prepare_replica is valid only for DORMANT native RESTORE"
+                    "spec-free prepare_replica is valid only for native RESTORE"
                 )
-            self._pending_operation_targets[operation_id] = replica_key
-            # RESTORE GPU/weight mutation must happen under Trainer G.  This
-            # pre-step only binds the operation to its retained DORMANT target.
-            return None
+            if state is ReplicaState.DORMANT:
+                self._pending_operation_targets[operation_id] = replica_key
+                # RESTORE GPU/weight mutation must happen under Trainer G. This
+                # pre-step only binds the operation to its retained DORMANT target.
+                return None
+            if (
+                previous_target == replica_key
+                and state is ReplicaState.ACTIVE
+            ):
+                # Exact UNKNOWN replay: runtime/E may already be active while R
+                # publication is unresolved. Trainer G owns the reconciliation.
+                return None
+            raise ValueError(
+                "spec-free prepare_replica requires DORMANT or same-operation ACTIVE reconciliation"
+            )
 
         if not isinstance(spec, dict):
             raise TypeError("prepare_replica requires placement spec or None for RESTORE")
@@ -504,6 +515,36 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         kind, state = manager.replica_meta(target)
         lb = manager.global_load_balancer
 
+        if state is ReplicaState.ACTIVE:
+            # The only lifecycle path that leaves ACTIVE together with a pending
+            # operation is an ADD/RESTORE publication whose R outcome was
+            # ambiguous. Query R; never infer success from local M/C.
+            try:
+                reconciled = await lb.query_ready_operation.remote(
+                    operation.operation_id
+                )
+            except BaseException as exc:
+                raise RuntimeError(
+                    "service publication remains unknown during reconciliation"
+                ) from exc
+            if reconciled is not None:
+                evidence = _require_evidence(
+                    reconciled,
+                    operation.operation_id,
+                    EvidenceType.SERVICE_COMMITTED,
+                    "routing reconciliation",
+                )
+                self._pending_operation_targets.pop(operation.operation_id, None)
+                return evidence
+
+            # R authoritatively reports no publish. Retract owner-local service
+            # state while Trainer still owns G; Trainer will remove E before
+            # finalize_release performs destroy/re-sleep.
+            manager.transition_replica(target, ReplicaState.DRAINING)
+            manager.deactivate_service(target)
+            self._update_max_concurrent_samples()
+            return None
+
         if state is ReplicaState.CREATING:
             if kind is not ReplicaKind.BORROWED:
                 raise ValueError("only BORROWED replicas may publish from CREATING")
@@ -551,45 +592,16 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                             "ADD routing ledger",
                         )
                     else:
-                        # R authoritatively reports no publish.  Roll back the
-                        # hidden borrower while Trainer still owns G; returning
-                        # RELEASED lets Trainer remove E and TaskRunner close the
-                        # ADD as a verified failure without consuming the donor
-                        # handoff reservation.
+                        # R authoritatively reports no publish. Retract C/M but
+                        # do not destroy while E still says the runtime is an
+                        # effective receiver. Trainer owns G and will remove E
+                        # before calling finalize_release().
                         manager.transition_replica(target, ReplicaState.DRAINING)
                         if activated:
                             manager.deactivate_service(target)
                             activated = False
                             self._update_max_concurrent_samples()
-                        try:
-                            release_evidence = await manager.destroy(
-                                target,
-                                operation_id=operation.operation_id,
-                            )
-                            _require_evidence(
-                                release_evidence,
-                                operation.operation_id,
-                                EvidenceType.RELEASED,
-                                "ADD rollback release",
-                            )
-                            manager.transition_replica(
-                                target,
-                                ReplicaState.RELEASED,
-                            )
-                        except BaseException as rollback_exc:
-                            if manager.replica_state.get(target) is ReplicaState.DRAINING:
-                                manager.transition_replica(
-                                    target,
-                                    ReplicaState.QUARANTINED,
-                                )
-                            raise RuntimeError(
-                                "ADD routing was not published and rollback release is unverified"
-                            ) from rollback_exc
-                        self._pending_operation_targets.pop(
-                            operation.operation_id,
-                            None,
-                        )
-                        return release_evidence
+                        return None
 
                 self._pending_operation_targets.pop(operation.operation_id, None)
                 return evidence
@@ -671,16 +683,15 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                                 "RESTORE routing ledger conflicts with the operation"
                             ) from exc
                     else:
-                        # E is already effective, so a definite R failure cannot
-                        # safely re-sleep here. Retract local service/capacity and
-                        # quarantine M; Trainer will block G for reconciliation.
+                        # R is definitely absent. Retract C/M while Trainer still
+                        # owns G, then return a definite no-publish marker. Trainer
+                        # removes E before finalize_release() re-enters level-2 sleep.
                         manager.transition_replica(target, ReplicaState.DRAINING)
                         if activated:
                             manager.deactivate_service(target)
                             activated = False
                             self._update_max_concurrent_samples()
-                        manager.transition_replica(target, ReplicaState.QUARANTINED)
-                        raise commit_exc
+                        return None
 
                 self._pending_operation_targets.pop(operation.operation_id, None)
                 return evidence
