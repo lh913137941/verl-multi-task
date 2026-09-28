@@ -141,7 +141,6 @@ def _exercise_same_gpu_borrower(
         "lease_id": f"{token}-lease",
         "borrower_task_id": borrowed_key.task_session,
         "borrower_replica_id": borrowed_key.replica_id,
-        "replica_rank": None,
         "claims": [
             {
                 "claim_id": f"{token}-claim",
