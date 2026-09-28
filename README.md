@@ -187,6 +187,12 @@ natural drain timeout、FORCE abort ACK loss、RESTORE compensation；另有真�
 MessageQueue exactly-once 验证。
 
 完整运行方式、证据强度和 PASS/FAIL/BLOCKED 规则见
-`docs/e2e-acceptance.md`。真实生命周期场景需要从
+`docs/e2e-acceptance.md`。集群上一行即可运行完整验收：
+
+```bash
+bash scripts/e2e/verify_cluster.sh --launcher /path/to/test_launcher.sh --lease /tmp/lease.json
+```
+
+若测试 job 已运行，则使用 `--attach`。真实生命周期场景需要从
 `examples/e2e/lease.example.json` 生成当前环境的物理 Lease fixture。
 

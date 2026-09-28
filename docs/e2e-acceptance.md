@@ -32,6 +32,42 @@ abort reply 丢失等故障需要命中非常精确的 owner-commit 边界；在
 
 日志默认写到 `logs/multitask_e2e/`。
 
+## 集群一行验收
+
+实际集群上不需要逐个调用上面的脚本。推荐直接使用总入口。
+
+启动一个测试训练并做完整验收：
+
+```bash
+bash scripts/e2e/verify_cluster.sh --launcher /path/to/multitask_test_launcher.sh --lease /tmp/lease.json
+```
+
+如果测试 job 已经在 Ray 集群里运行：
+
+```bash
+bash scripts/e2e/verify_cluster.sh --attach --lease /tmp/lease.json
+```
+
+只想先验证不依赖真实生命周期拓扑的控制面/异常恢复/Exactly-once：
+
+```bash
+bash scripts/e2e/verify_cluster.sh --quick --lease /tmp/lease.json --attach
+```
+
+完整模式默认运行：
+
+```text
+control_plane -> exactly_once -> recovery -> lifecycle -> force
+```
+
+最终只需要看命令退出码和脚本打印的 `summary.json` 路径：
+
+- `0` = 全部要求通过；
+- `1` = 至少一个能力验证失败；
+- `2` = 环境/拓扑不足，存在 BLOCKED，不能宣称完整验收通过。
+
+若希望阶段性执行时允许 BLOCKED，但仍保留结果记录，可加 `--allow-blocked`。
+
 ## 先跑不需要 GPU 的恢复合同
 
 ```bash
