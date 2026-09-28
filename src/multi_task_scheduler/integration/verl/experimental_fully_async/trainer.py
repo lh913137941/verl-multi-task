@@ -323,6 +323,16 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                 operation_id=operation.operation_id,
                 loaded_version=self.current_param_version,
             )
+            if (
+                isinstance(weight_evidence, OperationEvidence)
+                and weight_evidence.type is EvidenceType.RELEASED
+            ):
+                return _require_evidence(
+                    weight_evidence,
+                    operation.operation_id,
+                    EvidenceType.RELEASED,
+                    "RESTORE bootstrap rollback",
+                )
             _require_evidence(
                 weight_evidence,
                 operation.operation_id,

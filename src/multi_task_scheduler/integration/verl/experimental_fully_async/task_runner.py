@@ -104,13 +104,23 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
         command: OperationCommand,
         evidence: OperationEvidence,
     ) -> None:
-        ray.get(
-            self.group_scheduler.advance_lease.remote(
-                command.lease_id,
-                evidence,
-            ),
-            timeout=30,
-        )
+        # GS advance_lease is evidence-idempotent. Retry the exact same evidence
+        # once so an ACK loss after a committed ledger write does not immediately
+        # turn a resolved lifecycle operation into UNKNOWN.
+        last_error = None
+        for _attempt in range(2):
+            try:
+                ray.get(
+                    self.group_scheduler.advance_lease.remote(
+                        command.lease_id,
+                        evidence,
+                    ),
+                    timeout=30,
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+        raise last_error
 
     def _launch_operation(self, operation_id: str) -> None:
         worker = threading.Thread(
@@ -189,7 +199,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
         return OperationRecord(
             operation_id=operation_id,
             status=OperationStatus.UNKNOWN,
-            result="operation not found in TaskRunner journal",
+            result=None,
         )
 
     def _execute_operation(self, operation_id: str) -> None:
@@ -277,6 +287,23 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                     )
                 )
                 evidence = ray.get(trainer.restore_and_publish.remote(operation))
+                if (
+                    isinstance(evidence, OperationEvidence)
+                    and evidence.type is EvidenceType.RELEASED
+                ):
+                    rollback_evidence = self._require_evidence(
+                        evidence,
+                        operation_id=operation_id,
+                        expected=EvidenceType.RELEASED,
+                    )
+                    self._advance_lease(command, rollback_evidence)
+                    with self._journal_lock:
+                        self._operation_journal.finish(
+                            operation_id,
+                            OperationStatus.FAILED,
+                            "RESTORE bootstrap failed; native runtime was verified re-slept",
+                        )
+                    return
                 final_evidence = self._require_evidence(
                     evidence,
                     operation_id=operation_id,

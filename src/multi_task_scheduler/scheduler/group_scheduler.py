@@ -243,7 +243,7 @@ class GroupScheduler:
                         isinstance(observed, OperationRecord)
                         and observed.operation_id == command.operation_id
                         and observed.status is OperationStatus.UNKNOWN
-                        and observed.result == "operation not found in TaskRunner journal"
+                        and observed.result is None
                     )
                 except BaseException:
                     # Unknown delivery/query outcome: preserve GS intent so a
@@ -336,7 +336,12 @@ class GroupScheduler:
                 "operation_id": evidence.operation_id,
             }
             if command.kind is OperationKind.RESTORE:
-                result["restored"] = True
+                if existing.type is EvidenceType.SERVICE_COMMITTED:
+                    result["restored"] = True
+                elif existing.type is EvidenceType.RELEASED:
+                    result["restore_rolled_back"] = True
+                else:
+                    raise ValueError("invalid RESTORE evidence replay")
             elif command.kind is OperationKind.ADD:
                 result["add_rolled_back"] = True
             else:
@@ -344,9 +349,12 @@ class GroupScheduler:
             return result
 
         if command.kind is OperationKind.RESTORE:
-            if evidence.type is not EvidenceType.SERVICE_COMMITTED:
+            if evidence.type not in {
+                EvidenceType.SERVICE_COMMITTED,
+                EvidenceType.RELEASED,
+            }:
                 raise ValueError(
-                    "RESTORE lease completion requires SERVICE_COMMITTED evidence"
+                    "RESTORE lease progression requires SERVICE_COMMITTED or RELEASED evidence"
                 )
             if any(
                 self.active_bundle_owner.get(bundle_key) != lease_id
@@ -358,6 +366,27 @@ class GroupScheduler:
                 raise ValueError(
                     "RESTORE completion requires its temporary claim reservation"
                 )
+
+            if evidence.type is EvidenceType.RELEASED:
+                if set(evidence.released_gpu_uuids) != set(lease.gpu_uuids):
+                    raise ValueError(
+                        "RESTORE rollback RELEASED evidence must exactly cover lease GPU claims"
+                    )
+                self.release_evidence[evidence_key] = evidence
+                # Compensation is not a successful lease-cycle close. Do not add
+                # it to release_history, otherwise a safe retry would be rejected
+                # as if RESTORE had completed successfully.
+                for bundle_key in lease.bundle_keys:
+                    if self.active_bundle_owner.get(bundle_key) == lease_id:
+                        self.active_bundle_owner.pop(bundle_key, None)
+                for gpu_uuid in lease.gpu_uuids:
+                    if self.active_gpu_owner.get(gpu_uuid) == lease_id:
+                        self.active_gpu_owner.pop(gpu_uuid, None)
+                return {
+                    "lease_id": lease_id,
+                    "operation_id": evidence.operation_id,
+                    "restore_rolled_back": True,
+                }
 
             self.release_evidence[evidence_key] = evidence
             self.release_history.setdefault(lease_id, []).append(
@@ -391,9 +420,18 @@ class GroupScheduler:
             self.release_history.setdefault(lease_id, []).append(
                 evidence.operation_id
             )
-            # The hidden borrower is gone, but the donor handoff remains
-            # reserved to this lease so a fresh ADD operation may retry safely.
+            # TaskRunner calls advance_lease only after the hidden borrower is
+            # proven gone and the ADD is being closed as FAILED. Release this
+            # aborted borrower reservation; a policy that wants an in-place retry
+            # must keep the lease frozen by not advancing it yet.
             self.borrower_targets.pop(lease_id, None)
+            self.handoff_ready_leases.discard(lease_id)
+            for bundle_key in lease.bundle_keys:
+                if self.active_bundle_owner.get(bundle_key) == lease_id:
+                    self.active_bundle_owner.pop(bundle_key, None)
+            for gpu_uuid in lease.gpu_uuids:
+                if self.active_gpu_owner.get(gpu_uuid) == lease_id:
+                    self.active_gpu_owner.pop(gpu_uuid, None)
             return {
                 "lease_id": lease_id,
                 "operation_id": evidence.operation_id,

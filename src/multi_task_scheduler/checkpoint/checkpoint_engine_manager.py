@@ -206,11 +206,29 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         if replica_kind not in {ReplicaKind.NATIVE, ReplicaKind.BORROWED}:
             raise ValueError("pending target has unsupported replica kind")
         native_restore = replica_kind is ReplicaKind.NATIVE
+        released_gpu_uuids: tuple[str, ...] = ()
 
         try:
             # Native RESTORE allocates only weight memory under the same G that
             # serializes parameter publication. ADD targets are already resident.
             if native_restore:
+                placement_sets = await asyncio.gather(
+                    *[replica.worker_placements() for replica in replicas]
+                )
+                released_gpu_uuids = tuple(
+                    dict.fromkeys(
+                        placement["gpu_uuid"]
+                        for placements in placement_sets
+                        for placement in placements
+                        if isinstance(placement, dict)
+                        and isinstance(placement.get("gpu_uuid"), str)
+                        and placement["gpu_uuid"]
+                    )
+                )
+                if not released_gpu_uuids:
+                    raise RuntimeError(
+                        "native RESTORE target has no verified physical GPU UUID"
+                    )
                 await asyncio.gather(
                     *[replica.wake_up(tags=["weights"]) for replica in replicas]
                 )
@@ -299,4 +317,14 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                 raise RuntimeError(
                     "target bootstrap failed and runtime cleanup is unverified"
                 ) from cleanup_error
+            if native_restore:
+                # A failed RESTORE that has been proven back in level-2 sleep is
+                # a resolved compensation outcome, not an UNKNOWN synchronization
+                # result. Reuse RELEASED so TaskRunner/GS can release only the
+                # temporary RESTORE reservation without claiming business success.
+                return OperationEvidence.now(
+                    operation_id,
+                    EvidenceType.RELEASED,
+                    released_gpu_uuids=released_gpu_uuids,
+                )
             raise exc

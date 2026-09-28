@@ -27,7 +27,11 @@ python -m verl.experimental.fully_async_policy.fully_async_main
 
 需要 VERL 入口具备 MultiTask 选择接线：配置规范化后、`run_ppo` 初始化 Ray 前，
 按 `multitask.enabled` 延迟解析 `MultiTaskFullyAsyncTaskRunner`。本包不使用
-`verl.plugins` 自动加载、不 monkey patch 原生类，也不提供另一份训练入口。
+`verl.plugins` 自动加载、不 monkey patch 原生类，也不提供另一份训练入口。当前
+v0.10.0.dev 基线固定到 VERL commit `f92febf50fe3db102273eaf59b1854f392ae761d`；
+对应入口接线已提交到 `lh913137941/verl:chatgpt/092203-multitask-entry`
+(commit `8fd550572bf4580282e5e80cf74f3408c9acc2ad`)，并随本仓
+`patches/verl-v0.10-fully-async-multitask-entry.patch` 一并交付。
 
 ## 首版 profile
 

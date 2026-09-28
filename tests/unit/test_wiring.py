@@ -424,7 +424,9 @@ def test_taskrunner_minimal_journal_surface_and_replay_does_not_relaunch():
     assert runner.submit_operation(command).status is OperationStatus.ACCEPTED
     assert runner.submit_operation(command).status is OperationStatus.ACCEPTED
     assert launched == ["op"]
-    assert runner.query_operation("missing").status is OperationStatus.UNKNOWN
+    missing = runner.query_operation("missing")
+    assert missing.status is OperationStatus.UNKNOWN
+    assert missing.result is None
 
 
 def test_taskrunner_add_is_admitted_with_matching_lease_snapshot():
@@ -495,6 +497,38 @@ def test_taskrunner_verified_add_rollback_finishes_failed_and_advances_lease():
         ("prepare_replica", key, "op-add-rollback"),
         ("advance_lease", "l1", EvidenceType.RELEASED, ("u0",)),
     ]
+
+
+def test_taskrunner_replays_identical_lease_evidence_after_ack_loss():
+    runner = taskrunner_class()()
+    command = OperationCommand(
+        "op-remove-ack-loss",
+        OperationKind.REMOVE,
+        ReplicaKey("task-a", "borrowed-0"),
+        "l1",
+    )
+    evidence = OperationEvidence(
+        command.operation_id,
+        EvidenceType.RELEASED,
+        4,
+        ("u0",),
+    )
+    calls = []
+
+    class GroupScheduler:
+        def __init__(self):
+            self.advance_lease = RemoteMethod(self._advance)
+
+        def _advance(self, lease_id, received):
+            calls.append((lease_id, received))
+            if len(calls) == 1:
+                raise TimeoutError("reply lost after commit")
+            return {"released": True}
+
+    runner.group_scheduler = GroupScheduler()
+    runner._advance_lease(command, evidence)
+
+    assert calls == [("l1", evidence), ("l1", evidence)]
 
 
 def test_taskrunner_executes_natural_borrowed_remove_and_advances_lease():
@@ -628,6 +662,55 @@ def test_taskrunner_restore_closes_gs_lease_after_service_commit():
         ("prepare_replica", key, "op-restore", None),
         ("restore_and_publish", "op-restore"),
         ("advance_lease", "l1", EvidenceType.SERVICE_COMMITTED),
+    ]
+
+
+def test_taskrunner_verified_restore_rollback_finishes_failed_and_releases_reservation():
+    runner = taskrunner_class()()
+    runner.task_session = "task-a"
+    runner._control_ready = True
+    runner._launch_operation = lambda operation_id: None
+    key = ReplicaKey("task-a", "native-0")
+    calls = []
+
+    class Rollouter:
+        prepare_replica = RemoteMethod(
+            lambda target, **kwargs: calls.append(
+                ("prepare_replica", target, kwargs["operation_id"], kwargs["spec"])
+            )
+        )
+
+    class Trainer:
+        restore_and_publish = RemoteMethod(
+            lambda operation: OperationEvidence(
+                operation.operation_id,
+                EvidenceType.RELEASED,
+                8,
+                ("u0",),
+            )
+        )
+
+    class GroupScheduler:
+        advance_lease = RemoteMethod(
+            lambda lease_id, evidence: calls.append(
+                ("advance_lease", lease_id, evidence.type, evidence.released_gpu_uuids)
+            )
+            or {"restore_rolled_back": True}
+        )
+
+    runner.components = {"rollouter": Rollouter(), "trainer": Trainer()}
+    runner.group_scheduler = GroupScheduler()
+    runner.submit_operation(
+        OperationCommand("op-restore-rollback", OperationKind.RESTORE, key, "l1")
+    )
+    runner._execute_operation("op-restore-rollback")
+
+    record = runner.query_operation("op-restore-rollback")
+    assert record.status is OperationStatus.FAILED
+    assert "verified re-slept" in record.result
+    assert calls == [
+        ("prepare_replica", key, "op-restore-rollback", None),
+        ("advance_lease", "l1", EvidenceType.RELEASED, ("u0",)),
     ]
 
 
@@ -1111,6 +1194,57 @@ def test_trainer_internal_restore_rebinds_parked_native_and_publishes_current_vp
         ("commit_pending", key, 11),
         ("commit_service", "op-restore"),
     ]
+
+
+def test_trainer_restore_bootstrap_release_returns_compensation_without_blocking_g():
+    key = ReplicaKey("task-a", "native-0")
+    runtime = type("Runtime", (), {"replica_kind": ReplicaKind.NATIVE})()
+    calls = []
+
+    class CE:
+        def __init__(self):
+            self.pending_bootstrap = {key: ((runtime,), "op-donate")}
+
+        def discard_pending(self, target):
+            self.pending_bootstrap.pop(target, None)
+
+        def register_pending(self, target, replicas, *, operation_id):
+            self.pending_bootstrap[target] = (tuple(replicas), operation_id)
+
+        async def bootstrap_target(self, target, *, operation_id, loaded_version):
+            calls.append(("bootstrap_target", loaded_version))
+            return OperationEvidence(
+                operation_id,
+                EvidenceType.RELEASED,
+                2,
+                ("u0",),
+            )
+
+        def commit_pending(self, *args, **kwargs):
+            raise AssertionError("compensated RESTORE must not enter E")
+
+    class Rollouter:
+        get_pending_target = AsyncRemoteMethod(lambda operation_id: key)
+        commit_service_change = AsyncRemoteMethod(
+            lambda operation: (_ for _ in ()).throw(
+                AssertionError("compensated RESTORE must not publish service")
+            )
+        )
+
+    trainer = trainer_class()()
+    trainer.rollouter = Rollouter()
+    trainer.checkpoint_manager = CE()
+    trainer.current_param_version = 11
+
+    evidence = asyncio.run(
+        trainer.restore_and_publish(
+            OperationRecord("op-restore", OperationStatus.RUNNING)
+        )
+    )
+    assert evidence.type is EvidenceType.RELEASED
+    assert evidence.released_gpu_uuids == ("u0",)
+    assert trainer.replica_sync_gate.health == "HEALTHY"
+    assert calls == [("bootstrap_target", 11)]
 
 
 def test_trainer_restore_service_failure_keeps_e_effective_and_blocks_g():
@@ -2477,6 +2611,9 @@ def test_ce_native_restore_failure_resleeps_before_escaping():
         async def validate_server_runtime(self):
             raise AssertionError("failed transfer must not reach health")
 
+        async def worker_placements(self):
+            return ({"node_id": "n0", "gpu_uuid": "u0"},)
+
         async def sleep(self):
             calls.append(("sleep",))
             return ({"sleep_level": 2, "sleeping": True},)
@@ -2491,10 +2628,11 @@ def test_ce_native_restore_failure_resleeps_before_escaping():
     key = ReplicaKey("task-a", "native-0")
     ce.register_pending(key, [Replica()], operation_id="op-restore")
 
-    with pytest.raises(RuntimeError, match="target transfer failed"):
-        asyncio.run(
-            ce.bootstrap_target(key, operation_id="op-restore", loaded_version=13)
-        )
+    evidence = asyncio.run(
+        ce.bootstrap_target(key, operation_id="op-restore", loaded_version=13)
+    )
+    assert evidence.type is EvidenceType.RELEASED
+    assert evidence.released_gpu_uuids == ("u0",)
     assert ("wake", ("weights",)) in calls
     assert ("sleep",) in calls
 
@@ -3169,13 +3307,10 @@ def test_manager_native_sleep_binds_released_evidence_to_runtime_gpu_uuids():
     key = ReplicaKey("task-a", "native-0")
 
     class Runtime:
-        workers = [object(), object()]
+        workers = [object()]
 
         async def worker_placements(self):
-            return (
-                {"node_id": "n0", "gpu_uuid": "u0"},
-                {"node_id": "n0", "gpu_uuid": "u1"},
-            )
+            return ({"node_id": "n0", "gpu_uuid": "u0"},)
 
         async def sleep(self):
             return (
@@ -3187,11 +3322,12 @@ def test_manager_native_sleep_binds_released_evidence_to_runtime_gpu_uuids():
     manager.replica_kind = {key: ReplicaKind.NATIVE}
     manager.replica_state = {key: ReplicaState.DRAINING}
     manager._runtime_inventory = {key: Runtime()}
+    manager._native_release_evidence = {}
 
     evidence = asyncio.run(manager.sleep(key, operation_id="op-donate"))
     assert evidence.type is EvidenceType.RELEASED
     assert evidence.operation_id == "op-donate"
-    assert evidence.released_gpu_uuids == ("u0", "u1")
+    assert evidence.released_gpu_uuids == ("u0",)
 
 
 def test_manager_native_release_replay_returns_identical_evidence():
@@ -3213,6 +3349,7 @@ def test_manager_native_release_replay_returns_identical_evidence():
     manager.replica_kind = {key: ReplicaKind.NATIVE}
     manager.replica_state = {key: ReplicaState.DRAINING}
     manager._runtime_inventory = {key: Runtime()}
+    manager._native_release_evidence = {}
 
     first = asyncio.run(manager.sleep(key, operation_id="op-donate"))
     manager.replica_state[key] = ReplicaState.DORMANT
@@ -3319,7 +3456,7 @@ def test_group_scheduler_rolls_back_staged_add_state_when_taskrunner_rejects():
             lambda operation_id: OperationRecord(
                 operation_id,
                 OperationStatus.UNKNOWN,
-                "operation not found in TaskRunner journal",
+                None,
             )
         )
 
@@ -3354,7 +3491,7 @@ def test_group_scheduler_rolls_back_restore_reservation_when_taskrunner_rejects(
             lambda operation_id: OperationRecord(
                 operation_id,
                 OperationStatus.UNKNOWN,
-                "operation not found in TaskRunner journal",
+                None,
             )
         )
 
@@ -3418,6 +3555,37 @@ def test_group_scheduler_rejects_second_add_with_new_operation_id():
         gs.submit_operation(
             OperationCommand("op-add-2", OperationKind.ADD, target, lease.lease_id)
         )
+
+
+def test_group_scheduler_add_release_compensation_unfreezes_claims():
+    cls = _isolated_group_scheduler_class()
+    gs = cls()
+    lease = _scheduler_test_lease("l-add-fail")
+    gs.open_lease(lease)
+    gs.handoff_ready_leases.add(lease.lease_id)
+    target = ReplicaKey("task-b", "borrowed-0")
+    command = OperationCommand(
+        "op-add-fail",
+        OperationKind.ADD,
+        target,
+        lease.lease_id,
+    )
+    gs.operation_commands[command.operation_id] = command
+    gs.borrower_targets[lease.lease_id] = target
+    evidence = OperationEvidence(
+        command.operation_id,
+        EvidenceType.RELEASED,
+        5,
+        ("u0",),
+    )
+
+    result = gs.advance_lease(lease.lease_id, evidence)
+
+    assert result["add_rolled_back"] is True
+    assert lease.lease_id not in gs.handoff_ready_leases
+    assert lease.lease_id not in gs.borrower_targets
+    assert "u0" not in gs.active_gpu_owner
+    assert ("pg", 0) not in gs.active_bundle_owner
 
 
 def test_group_scheduler_binds_donate_to_lease_donor_rank():
@@ -3595,6 +3763,33 @@ def test_group_scheduler_restore_requires_original_donor_and_returned_claims():
         "restored": True,
     }
     assert gs.advance_lease("l1", restore_evidence) == result
+    assert "u0" not in gs.active_gpu_owner
+    assert ("pg", 0) not in gs.active_bundle_owner
+
+    # A failed RESTORE that is proven re-slept releases only its temporary
+    # reservation and remains retryable under the same lease.
+    retry_lease = _scheduler_test_lease("l-restore-retry")
+    gs.open_lease(retry_lease)
+    gs.active_gpu_owner.pop("u0")
+    gs.active_bundle_owner.pop(("pg", 0))
+    retry_command = OperationCommand(
+        "op-restore-fail",
+        OperationKind.RESTORE,
+        ReplicaKey("task-a", "native-0"),
+        retry_lease.lease_id,
+    )
+    gs.operation_commands[retry_command.operation_id] = retry_command
+    gs.active_gpu_owner["u0"] = retry_lease.lease_id
+    gs.active_bundle_owner[("pg", 0)] = retry_lease.lease_id
+    rollback = OperationEvidence(
+        retry_command.operation_id,
+        EvidenceType.RELEASED,
+        10,
+        ("u0",),
+    )
+    rollback_result = gs.advance_lease(retry_lease.lease_id, rollback)
+    assert rollback_result["restore_rolled_back"] is True
+    assert gs.advance_lease(retry_lease.lease_id, rollback) == rollback_result
     assert "u0" not in gs.active_gpu_owner
     assert ("pg", 0) not in gs.active_bundle_owner
 
