@@ -213,13 +213,6 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
             timeout=30,
         )
 
-    async def create_borrowed_replica(self, spec: dict) -> dict:
-        """Thin runtime entry; Manager owns placement validation and creation."""
-        manager = getattr(self, "llm_server_manager", None)
-        if manager is None:
-            raise RuntimeError("LLM server manager is not initialized")
-        return await manager.create_borrowed_replica(spec)
-
     async def prepare_replica(
         self,
         replica_key: ReplicaKey,
@@ -237,10 +230,10 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         if previous_target is not None and previous_target != replica_key:
             raise ValueError("operation_id is already bound to another replica")
 
+        manager = getattr(self, "llm_server_manager", None)
+        if manager is None:
+            raise RuntimeError("LLM server manager is not initialized")
         if spec is None:
-            manager = getattr(self, "llm_server_manager", None)
-            if manager is None:
-                raise RuntimeError("LLM server manager is not initialized")
             kind, state = manager.replica_meta(replica_key)
             if kind is not ReplicaKind.NATIVE or state is not ReplicaState.DORMANT:
                 raise ValueError(
@@ -261,7 +254,7 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
             raise ValueError("placement spec belongs to another replica")
 
         self._pending_operation_targets[operation_id] = replica_key
-        return await self.create_borrowed_replica(spec)
+        return await manager.create_borrowed_replica(spec)
 
     async def prepare_exit(
         self,
