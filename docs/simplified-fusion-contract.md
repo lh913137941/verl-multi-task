@@ -1,6 +1,6 @@
 # Simplified fusion contract (092203 with 092303 parameter-sync clarification)
 
-Current first release: experimental Fully Async, pure STANDALONE, non-PD vLLM, single-node whole-GPU lending, DP=1, PP=1 and currently verified TP=1 only. Physical whole-GPU exclusivity is enforced by GS ownership of the PG bundle/GPU UUID, not by Ray's fractional actor accounting. The first release fixes `max_colocate_count=2`, so each donor/borrower CE actor requests `gpu_fraction=0.5` and one CPU from a bundle; this accounting share does not authorize fractional physical-GPU lending. Native replicas keep their runtime across DONATE/RESTORE; borrowed replicas create an independent borrower runtime and are destroyed on REMOVE. Unverified GPU primitives must raise `NotImplementedError`.
+Current first release: experimental Fully Async, pure STANDALONE, non-PD vLLM, single-node whole-GPU lending, DP=1, PP=1 and currently verified TP=1 only. Physical whole-GPU exclusivity is enforced by GS ownership of the PG bundle/GPU UUID, not by Ray's fractional actor accounting. The first release fixes `max_colocate_count=2`, so each donor/borrower CE actor requests `gpu_fraction=0.5` and one CPU from a bundle; this accounting share does not authorize fractional physical-GPU lending. Native replicas keep their runtime across DONATE/RESTORE; borrowed replicas create an independent borrower runtime and are destroyed on REMOVE. Unsupported backend combinations must fail explicitly; lifecycle success requires runtime/placement/weight evidence and is never inferred from configuration alone.
 
 ## Ownership
 
@@ -28,7 +28,7 @@ FORCE_VERIFIED is borrowed-only. It reuses VERL's native Fully Async partial-rol
 
 RESTORE wakes the same native runtime, restores current parameters and re-enters E/R/C/M. Before E commit, a failed bootstrap may return to DORMANT only after proven re-sleep. After E is effective, service-publication failure must not re-sleep behind E: a definite no-publish result quarantines the local service projection, while an unknown R outcome keeps the runtime awake and fences G for reconciliation.
 
-Current branch status: natural borrowed REMOVE is the only lifecycle path admitted end-to-end. ADD, native DONATE, RESTORE and FORCE are rejected by TaskRunner before journal/worker creation because their native/GPU completion boundary is not yet verified; Rollouter also keeps FORCE fail-closed before M/R mutation or abort. Lower-level borrowed create/destroy, CE target bootstrap, continuation wiring, and native vLLM level-2 sleep / staged wake primitives are available for isolated validation. RESTORE now internally reuses the existing CE pending/bootstrap and LB ready-commit paths: current-Vpub bootstrap is committed into E under G before service exposure, then C/M are prepared and R is the final externally visible publish; ACK loss is reconciled through the LB operation ledger. TaskRunner admission remains closed until the real GPU loop is validated; these control-plane paths do not by themselves certify end-to-end operation. In particular, a level-2 RESTORE must install the complete current Vpub between weights-only wake and final KV wake; advancing a version tag without reconstructing discarded weights is not sufficient. Whole-GPU DONATE is valid only when VERL's own sleep-level resolver selects level 2; MTP rollout and LoRA rollout configurations that require level 1 are rejected by the first-release profile.
+Current branch status: ADD, DONATE, natural REMOVE, FORCE_VERIFIED and RESTORE are all admitted through TaskRunner and have complete control-plane orchestration paths. ADD uses hidden borrowed creation plus target-only current-Vpub bootstrap; DONATE uses natural drain plus verified native level-2 sleep; FORCE_VERIFIED uses targeted abort/continuation proof; RESTORE reuses CE pending/bootstrap and LB ready-commit with E committed before externally visible R. This code-level completion is not the same as a successful CUDA/vLLM/NCCL acceptance run: unsupported runtime combinations still fail explicitly and unresolved side effects fence G or quarantine M. Whole-GPU DONATE remains valid only when VERL's own sleep-level resolver selects level 2; MTP rollout and LoRA rollout configurations that require level 1 are rejected by the first-release profile.
 
 Idle detection is Rollouter-local: production window + C + read-only Manager M. LB request state does not decide bubbles. Rollouter reports metadata directly to GS; draining starts only after GS issues a lifecycle operation.
 
@@ -51,8 +51,8 @@ RESTORE now reuses the same target bootstrap/version-confirmation machinery for
 a parked native runtime; weights-only wake is performed inside CE bootstrap while
 Trainer G is held, followed by current-Vpub transfer, KV restore and version
 confirmation. The opt-in real GPU acceptance mutates sender tensor data before
-transfer so a version tag alone cannot satisfy the check; that test must actually
-pass before TaskRunner admission is enabled.
+transfer so a version tag alone cannot satisfy the check; it remains the runtime
+acceptance criterion rather than a TaskRunner admission gate.
 
 The first-release profile is CUDA/NCCL-only and requires
 `actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nccl.rebuild_group=true`.
@@ -62,9 +62,9 @@ remain outside the verified first-release boundary.
 
 `Vpub` denotes a version, not a cached weight snapshot. Wiring ADD/RESTORE must
 also prove that the sender's actual weights match that version: the membership
-gate alone does not serialize optimizer updates. ADD `bootstrap_and_publish`
-remains fail-closed; RESTORE has internal staged wiring but TaskRunner admission
-remains fail-closed until the real GPU current-Vpub path is verified.
+gate alone does not serialize optimizer updates. ADD and RESTORE both use the
+same G-serialized target-bootstrap/version-confirmation boundary; runtime
+acceptance still requires the real current-Vpub GPU path to succeed.
 
 See [092303 repair and validation notes](2026-09-23-092303-ce-repair.md) for the
 source baseline, tests and remaining runtime work.
