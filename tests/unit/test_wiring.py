@@ -2186,6 +2186,58 @@ def test_standalone_sleep_and_weights_wake_are_idempotent_by_stage():
     ]
 
 
+def test_weights_only_wake_never_opens_admission_on_backend_anomaly():
+    class Event:
+        def __init__(self):
+            self.set_calls = 0
+            self.clear_calls = 0
+
+        def clear(self):
+            self.clear_calls += 1
+
+        def set(self):
+            self.set_calls += 1
+
+    class Engine:
+        def __init__(self):
+            self.sleeping = True
+
+        async def is_sleeping(self):
+            return self.sleeping
+
+        async def wake_up(self, *, tags=None):
+            assert tags == ["weights"]
+            self.sleeping = False
+
+        async def reset_prefix_cache(self, *, reset_connector):
+            raise AssertionError("weights-only anomaly must not reach full-wake cleanup")
+
+        async def check_health(self):
+            raise AssertionError("weights-only anomaly must not open admission")
+
+    server = http_server_class()()
+    server.nnodes = 1
+    server.node_rank = 0
+    server.replica_rank = 0
+    server.global_steps = 5
+    server.config = type(
+        "Config",
+        (),
+        {"enable_sleep_mode": True, "free_cache_engine": True},
+    )()
+    server.engine = Engine()
+    server._multitask_sleep_stage_value = "level2"
+    server._submission_paused = True
+    server._resume_event = Event()
+
+    with pytest.raises(RuntimeError, match="weights-only wake unexpectedly"):
+        asyncio.run(server.wake_weights())
+
+    assert server._submission_paused is True
+    assert server._resume_event.set_calls == 0
+    assert server._multitask_sleep_stage() == "level2"
+
+
 def test_full_wake_rejects_direct_level2_to_awake_skip():
     class Event:
         def clear(self):
