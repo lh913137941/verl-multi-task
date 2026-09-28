@@ -1087,7 +1087,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         manager.validate_borrowed_spec(wrong_world)
 
     manager.rollout_config.tensor_model_parallel_size = 2
-    with pytest.raises(ValueError, match="parallel topology"):
+    with pytest.raises(ValueError, match="TP=DP=PP=1"):
         manager.validate_borrowed_spec(valid_spec)
     manager.rollout_config.tensor_model_parallel_size = 1
 
