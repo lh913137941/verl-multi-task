@@ -364,34 +364,102 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                 if not isinstance(server_id, str) or not server_id or server_handle is None:
                     raise RuntimeError("native RESTORE runtime lacks routable server identity")
 
-                # Prepare owner-local service/capacity before opening R.  No
-                # request can reach this replica through the global LB yet.
+                # Prepare all owner-local state before opening R.  Native
+                # weight synchronization is still excluded by Trainer G, so
+                # making M/C ready here does not expose the replica externally.
                 manager.activate_service(target)
                 activated = True
                 self._update_max_concurrent_samples()
-
-                # R is the final externally visible commit. commit_ready() is
-                # owner-atomic and replayable for this operation.
-                evidence = await lb.commit_ready.remote(
-                    target,
-                    server_id,
-                    server_handle,
-                    operation.operation_id,
-                )
-                if not isinstance(evidence, OperationEvidence):
-                    raise TypeError("RESTORE routing commit returned non-evidence")
-                if evidence.operation_id != operation.operation_id:
-                    raise ValueError("RESTORE service evidence belongs to another operation")
-                if evidence.type is not EvidenceType.SERVICE_COMMITTED:
-                    raise ValueError("RESTORE routing commit did not produce SERVICE_COMMITTED")
-
                 manager.transition_replica(target, ReplicaState.ACTIVE)
+
+                # R is the final externally visible commit.  If the RPC loses
+                # its reply, query the LB's existing operation ledger before
+                # deciding whether rollback is safe.
+                try:
+                    evidence = await lb.commit_ready.remote(
+                        target,
+                        server_id,
+                        server_handle,
+                        operation.operation_id,
+                    )
+                    if not isinstance(evidence, OperationEvidence):
+                        raise TypeError("RESTORE routing commit returned non-evidence")
+                    if evidence.operation_id != operation.operation_id:
+                        raise ValueError("RESTORE service evidence belongs to another operation")
+                    if evidence.type is not EvidenceType.SERVICE_COMMITTED:
+                        raise ValueError("RESTORE routing commit did not produce SERVICE_COMMITTED")
+                except BaseException as commit_exc:
+                    try:
+                        reconciled = await lb.query_ready_operation.remote(
+                            operation.operation_id
+                        )
+                    except BaseException as reconcile_exc:
+                        # R may already be open.  Keep the runtime awake and M/C
+                        # ACTIVE rather than risking a routed-to-sleeping replica;
+                        # Trainer will fence G because the operation is unknown.
+                        raise RuntimeError(
+                            "RESTORE routing commit outcome is unknown"
+                        ) from reconcile_exc
+
+                    if reconciled is not None:
+                        if not isinstance(reconciled, OperationEvidence):
+                            raise RuntimeError(
+                                "RESTORE routing ledger returned invalid evidence"
+                            ) from commit_exc
+                        if (
+                            reconciled.operation_id != operation.operation_id
+                            or reconciled.type is not EvidenceType.SERVICE_COMMITTED
+                        ):
+                            raise RuntimeError(
+                                "RESTORE routing ledger conflicts with the operation"
+                            ) from commit_exc
+                        evidence = reconciled
+                    else:
+                        # The LB authoritatively reports no publish.  Only now is
+                        # it safe to retract M/C and re-enter level-2 sleep.
+                        try:
+                            manager.transition_replica(
+                                target,
+                                ReplicaState.DRAINING,
+                            )
+                            manager.deactivate_service(target)
+                            activated = False
+                            self._update_max_concurrent_samples()
+                            sleep_receipts = await runtime.sleep()
+                            if not isinstance(sleep_receipts, (tuple, list)) or not sleep_receipts:
+                                raise RuntimeError(
+                                    "RESTORE rollback returned no sleep receipts"
+                                )
+                            if any(
+                                not isinstance(receipt, dict)
+                                or receipt.get("sleep_level") != 2
+                                or receipt.get("sleeping") is not True
+                                for receipt in sleep_receipts
+                            ):
+                                raise RuntimeError(
+                                    "RESTORE rollback did not confirm level-2 sleep"
+                                )
+                            manager.transition_replica(
+                                target,
+                                ReplicaState.DORMANT,
+                            )
+                        except BaseException as rollback_exc:
+                            if manager.replica_state.get(target) is ReplicaState.DRAINING:
+                                manager.transition_replica(
+                                    target,
+                                    ReplicaState.QUARANTINED,
+                                )
+                            raise RuntimeError(
+                                "RESTORE publish failed and rollback is unverified"
+                            ) from rollback_exc
+                        raise commit_exc
+
                 self._pending_operation_targets.pop(operation.operation_id, None)
                 return evidence
             except BaseException:
-                # Before R is committed we can still return to a proven DORMANT
-                # state: remove local service bookkeeping and deep-sleep again.
-                # If that compensation itself cannot be proved, quarantine.
+                # Failures before M becomes ACTIVE are still provably pre-route.
+                # Return to DORMANT when possible; once M is ACTIVE, only the
+                # commit/query branch above may decide whether rollback is safe.
                 if manager.replica_state.get(target) is ReplicaState.DORMANT:
                     compensated = False
                     try:
