@@ -1314,8 +1314,7 @@ def test_http_server_health_and_shutdown_use_real_engine_boundaries():
         assert server.engine.healthy is True
 
         engine = server.engine
-        receipt = await server.shutdown_runtime()
-        assert receipt["shutdown"] is True
+        assert await server.shutdown_runtime() is None
         assert engine.drained is True
         assert engine.shutdown_called is True
         assert server.engine is None
@@ -1776,7 +1775,7 @@ def test_init_from_lease_reaches_runtime_ready_only_after_server_health():
                 (),
                 {
                     "runtime_health": AsyncRemoteMethod(lambda: health),
-                    "shutdown_runtime": AsyncRemoteMethod(lambda: {"shutdown": True}),
+                    "shutdown_runtime": AsyncRemoteMethod(lambda: None),
                 },
             )()
             self.servers = [server]
