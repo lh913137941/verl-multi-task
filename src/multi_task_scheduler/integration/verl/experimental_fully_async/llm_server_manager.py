@@ -223,16 +223,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         if len(raw_claims) != 1:
             raise ValueError("current borrowed runtime requires one GPU claim")
 
-        max_colocate_count = spec.get(
-            "max_colocate_count",
-            FIRST_RELEASE_MAX_COLOCATE_COUNT,
-        )
-        if max_colocate_count != FIRST_RELEASE_MAX_COLOCATE_COUNT:
-            raise ValueError(
-                "first release max_colocate_count must match the native "
-                f"Ray accounting layout ({FIRST_RELEASE_MAX_COLOCATE_COUNT})"
-            )
-
         placement_epoch = spec.get("placement_epoch", 0)
         if type(placement_epoch) is not int or placement_epoch < 0:
             raise ValueError("placement_epoch must be a nonnegative integer")
@@ -264,7 +254,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         normalized = dict(spec)
         normalized.pop("world_size", None)
         normalized["claims"] = claims
-        normalized["max_colocate_count"] = max_colocate_count
         normalized["placement_epoch"] = placement_epoch
         normalized["expires_at"] = lease.expires_at
         return normalized
@@ -373,7 +362,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             replica_kind=ReplicaKind.BORROWED,
             placement_claims=resolved_spec["claims"],
             runtime_epoch=resolved_spec["placement_epoch"],
-            max_colocate_count=resolved_spec["max_colocate_count"],
+            max_colocate_count=FIRST_RELEASE_MAX_COLOCATE_COUNT,
         )
 
     def _borrowed_record_for_key(self, key: ReplicaKey) -> dict:
