@@ -113,12 +113,17 @@ class MultiTaskvLLMReplica(vLLMReplica):
         ):
             raise ValueError("current borrowed claim requires rank=node_rank=local_rank=0")
 
-    def build_borrowed_worker_plan(self, spec: dict) -> tuple[dict, ...]:
-        """Build deterministic CE actor placement metadata with no Ray side effects."""
+    def build_borrowed_worker_plan(self, spec: dict) -> dict:
+        """Build deterministic TP=1 CE actor placement metadata."""
         self.validate_placement(spec)
         prefix = f"borrowed_ce_{self.replica_rank}_"
         claim = spec["claims"][0]
-        plan = ({
+        self.placement_claims = (dict(claim),)
+        self.borrowed_server_names = (
+            f"{super()._get_server_name_prefix()}server_"
+            f"{self.replica_rank}_0{self.name_suffix}",
+        )
+        return {
             "rank": 0,
             "claim_id": claim["claim_id"],
             "actor_name": f"{prefix}r0",
@@ -135,13 +140,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
                 "WG_PREFIX": prefix,
                 "WG_BACKEND": "ray",
             },
-        },)
-        self.placement_claims = (dict(claim),)
-        self.borrowed_server_names = (
-            f"{super()._get_server_name_prefix()}server_"
-            f"{self.replica_rank}_0{self.name_suffix}",
-        )
-        return plan
+        }
 
     async def _get_master_addr_port_for_slot(self, pg, bundle_index: int):
         """Create a borrower communication root on the selected borrower bundle."""
@@ -247,7 +246,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
         pg_by_id: dict[str, object],
     ) -> None:
         """Create the verified TP=1 borrower CE actor on its claimed PG bundle."""
-        item = self.build_borrowed_worker_plan(spec)[0]
+        item = self.build_borrowed_worker_plan(spec)
         if set(pg_by_id) != {item["pg_id"]}:
             raise ValueError("placement-group handles do not exactly cover claims")
 
