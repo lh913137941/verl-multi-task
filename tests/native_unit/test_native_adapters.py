@@ -30,7 +30,7 @@ from multi_task_scheduler.integration.verl.experimental_fully_async.task_runner 
 from multi_task_scheduler.integration.verl.experimental_fully_async.trainer import (
     MultiTaskFullyAsyncTrainer,
 )
-from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
+from verl.single_controller.ray.base import _unwrap_ray_remote
 from multi_task_scheduler.orchestration.contracts import (
     AttemptState,
     EvidenceType,
@@ -47,8 +47,8 @@ def test_actor_subclasses_keep_native_business_methods():
         (MultiTaskFullyAsyncTrainer, FullyAsyncTrainer, "fit"),
         (MultiTaskFullyAsyncRollouter, FullyAsyncRollouter, "fit"),
     ]:
-        extended_class = unwrap_native_actor_class(extension)
-        native_class = unwrap_native_actor_class(native)
+        extended_class = _unwrap_ray_remote(extension)
+        native_class = _unwrap_ray_remote(native)
         assert issubclass(extended_class, native_class)
         assert getattr(extended_class, method) is getattr(native_class, method)
 
@@ -110,7 +110,7 @@ def test_initial_native_route_and_drain_keep_exact_request_facts():
 
 
 def test_message_queue_deduplicates_completed_native_samples():
-    queue_cls = unwrap_native_actor_class(MultiTaskMessageQueue)
+    queue_cls = _unwrap_ray_remote(MultiTaskMessageQueue)
     queue = queue_cls({}, max_queue_size=8, task_session="task-a")
     first_payload = ray.cloudpickle.dumps(SimpleNamespace(sample_id="s1", value=1))
     replay_payload = bytes(first_payload)
