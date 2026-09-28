@@ -17,7 +17,6 @@ class CompletionEvidence:
     payload_digest: str
     enqueue_seq: int
     dropped_oldest: bool
-    original_return_value: bool
 
     def __post_init__(self) -> None:
         if not self.task_session or not self.logical_sample_id or not self.payload_digest:
@@ -80,7 +79,6 @@ class MultiTaskMessageQueue(_unwrap_ray_remote(MessageQueue)):
                 payload_digest=payload_digest,
                 enqueue_seq=self._next_completion_seq,
                 dropped_oldest=not original_return_value,
-                original_return_value=original_return_value,
             )
             self._next_completion_seq += 1
             self._completion_evidence[key] = evidence
@@ -92,4 +90,4 @@ class MultiTaskMessageQueue(_unwrap_ray_remote(MessageQueue)):
         if sample is None:
             return await super().put_sample(sample)
         evidence = await self.put_sample_once(sample)
-        return evidence.original_return_value
+        return not evidence.dropped_oldest
