@@ -2121,6 +2121,41 @@ def test_final_wake_can_commit_admission_after_ce_already_restored_kv():
     assert calls == [("reset", True), ("health",), ("gate", "set")]
 
 
+def test_native_runtime_health_probe_confirms_server_and_ce_worker_node():
+    health = {
+        "node_id": "node-0",
+        "replica_rank": 2,
+        "node_rank": 0,
+        "nnodes": 1,
+        "server_address": "127.0.0.1",
+        "server_port": 8000,
+        "engine_ready": True,
+        "global_steps": 12,
+    }
+
+    class Server:
+        runtime_health = AsyncRemoteMethod(lambda: dict(health))
+
+    class Worker:
+        runtime_placement = AsyncRemoteMethod(
+            lambda: {"node_id": "node-0", "gpu_uuid": "u0"}
+        )
+
+    cls = replica_class()
+    replica = cls.__new__(cls)
+    replica.replica_kind = ReplicaKind.NATIVE
+    replica.replica_rank = 2
+    replica.nnodes = 1
+    replica.servers = [Server()]
+    replica.workers = [Worker()]
+    replica._server_handle = replica.servers[0]
+    replica._server_address = "127.0.0.1:8000"
+
+    result = asyncio.run(replica.validate_server_runtime())
+    assert result["global_steps"] == 12
+    assert result["node_id"] == "node-0"
+
+
 def test_native_replica_requires_verified_server_receipts_for_sleep_and_wake():
     class Server:
         sleep = AsyncRemoteMethod(
