@@ -183,6 +183,34 @@ def test_admitted_request_blocks_removal_until_verified_continuation():
     assert key not in lb.routes
 
 
+def test_settled_request_reuse_drops_previous_continuation_proof():
+    key0 = ReplicaKey("task-a", "r0")
+    key1 = ReplicaKey("task-a", "r1")
+    lb = load_balancer_class()(
+        {"s0": object(), "s1": object()},
+        initial_routes={key0: "s0", key1: "s1"},
+    )
+    lb.acquire_server("request-1")
+    old_server = lb.active_request_server["request-1"]
+    old_key = key0 if old_server == "s0" else key1
+    lb.begin_drain(old_key, "op-old")
+    old_evidence = lb.confirm_continuation(
+        "request-1", "client-1", "prefix-old"
+    )
+    lb.finish_remove(old_key)
+    assert lb.query_attempt("request-1") is AttemptState.SETTLED
+    assert lb.confirm_continuation(
+        "request-1", "client-1", "prefix-old"
+    ) == old_evidence
+
+    # Reusing the logical request id creates a new attempt and invalidates the
+    # old handoff receipt before any new continuation can be confirmed.
+    new_server, _ = lb.acquire_server("request-1")
+    assert new_server != old_server
+    assert "request-1" not in lb.continuation_proofs
+    assert lb.query_attempt("request-1") is AttemptState.ADMITTED
+
+
 def test_lb_commit_ready_is_atomic_and_idempotent():
     key = ReplicaKey("task-a", "borrowed-0")
     handle = object()
@@ -337,6 +365,89 @@ def test_taskrunner_add_fails_before_hidden_runtime_creation():
 
     assert launched == []
     assert runner._ensure_journal().query("op-add") is None
+
+
+def test_taskrunner_executes_natural_borrowed_remove_and_advances_lease():
+    runner = taskrunner_class()()
+    runner.task_session = "task-a"
+    runner._control_ready = True
+    runner._launch_operation = lambda operation_id: None
+    key = ReplicaKey("task-a", "borrowed-0")
+    calls = []
+
+    class Rollouter:
+        prepare_exit = RemoteMethod(
+            lambda target, **kwargs: calls.append(
+                ("prepare_exit", target, kwargs["operation_id"], kwargs["force"])
+            )
+            or OperationEvidence(
+                kwargs["operation_id"], EvidenceType.EXIT_READY, 1
+            )
+        )
+        finalize_release = RemoteMethod(
+            lambda operation: calls.append(("finalize_release", operation.operation_id))
+            or OperationEvidence(
+                operation.operation_id,
+                EvidenceType.RELEASED,
+                3,
+                ("u0",),
+            )
+        )
+
+    class Trainer:
+        remove_and_commit = RemoteMethod(
+            lambda operation: calls.append(("remove_and_commit", operation.operation_id))
+            or OperationEvidence(
+                operation.operation_id,
+                EvidenceType.SERVICE_COMMITTED,
+                2,
+            )
+        )
+
+    class GroupScheduler:
+        advance_lease = RemoteMethod(
+            lambda lease_id, evidence: calls.append(
+                ("advance_lease", lease_id, evidence.released_gpu_uuids)
+            )
+            or {"released": True}
+        )
+
+    runner.components = {"rollouter": Rollouter(), "trainer": Trainer()}
+    runner.group_scheduler = GroupScheduler()
+    runner.submit_operation(
+        OperationCommand("op-remove", OperationKind.REMOVE, key, "l1")
+    )
+    runner._execute_operation("op-remove")
+
+    record = runner.query_operation("op-remove")
+    assert record.status is OperationStatus.SUCCEEDED
+    assert record.result == EvidenceType.RELEASED.value
+    assert calls == [
+        ("prepare_exit", key, "op-remove", False),
+        ("remove_and_commit", "op-remove"),
+        ("finalize_release", "op-remove"),
+        ("advance_lease", "l1", ("u0",)),
+    ]
+
+
+def test_taskrunner_restore_fails_before_journal_or_worker_launch():
+    runner = taskrunner_class()()
+    runner.task_session = "task-a"
+    runner._control_ready = True
+    launched = []
+    runner._launch_operation = launched.append
+    key = ReplicaKey("task-a", "native-0")
+
+    with pytest.raises(
+        NotImplementedError,
+        match="verified native wake/bootstrap backend",
+    ):
+        runner.submit_operation(
+            OperationCommand("op-restore", OperationKind.RESTORE, key, "l1")
+        )
+
+    assert launched == []
+    assert runner._ensure_journal().query("op-restore") is None
 
 
 def test_taskrunner_borrowed_spec_rebuilds_rank_view_from_claim_order():
