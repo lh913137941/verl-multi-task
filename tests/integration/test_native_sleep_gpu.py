@@ -131,7 +131,6 @@ def _exercise_same_gpu_borrower(
     borrower_manager.replica_kind = {}
     borrower_manager._runtime_inventory = {}
     borrower_manager.next_replica_rank = 0
-    borrower_manager.retired_replica_ranks = set()
     borrower_manager._allocated_replica_ranks = set()
     borrower_manager.borrowed_operations = {}
     borrower_manager.replica_operation_lock = asyncio.Lock()
