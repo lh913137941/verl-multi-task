@@ -14,6 +14,7 @@ from multi_task_scheduler.orchestration.contracts import (
     OperationEvidence,
     OperationKind,
     OperationRecord,
+    OperationStatus,
     ReplicaKey,
     ReplicaKind,
 )
@@ -218,12 +219,34 @@ class GroupScheduler:
             )
             if not isinstance(result, OperationRecord):
                 raise TypeError("TaskRunner returned a non-OperationRecord")
+            if result.operation_id != command.operation_id:
+                raise ValueError("TaskRunner returned a record for another operation")
             return result
         except BaseException:
-            # A rejected/unaccepted command must leave no GS intent behind.
-            # Roll back only state staged by this invocation; replays preserve
-            # the already-accepted ledger.
+            # Submission failure can be ambiguous (for example a timeout after
+            # TaskRunner already journaled/launched the worker). Reconcile with
+            # the existing query API and roll back GS staging only when the
+            # TaskRunner authoritatively says the operation was never journaled.
+            definitely_unaccepted = False
             if staged_command:
+                try:
+                    observed = ray.get(
+                        task_runner.query_operation.remote(command.operation_id),
+                        timeout=30,
+                    )
+                    definitely_unaccepted = (
+                        isinstance(observed, OperationRecord)
+                        and observed.operation_id == command.operation_id
+                        and observed.status is OperationStatus.UNKNOWN
+                        and observed.result == "operation not found in TaskRunner journal"
+                    )
+                except BaseException:
+                    # Unknown delivery/query outcome: preserve GS intent so a
+                    # possibly-running lifecycle worker can still reconcile its
+                    # evidence. A same-command retry remains idempotent.
+                    definitely_unaccepted = False
+
+            if definitely_unaccepted:
                 self.operation_commands.pop(command.operation_id, None)
                 if staged_borrower:
                     if self.borrower_targets.get(command.lease_id) == command.target:
