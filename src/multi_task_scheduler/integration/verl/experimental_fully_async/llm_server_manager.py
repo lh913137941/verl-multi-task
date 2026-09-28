@@ -220,9 +220,8 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             )
         ):
             raise ValueError("current borrowed runtime requires TP=DP=PP=1")
-        world_size = spec.get("world_size")
-        if world_size != 1 or len(raw_claims) != 1:
-            raise ValueError("current borrowed runtime requires world_size=1")
+        if len(raw_claims) != 1:
+            raise ValueError("current borrowed runtime requires one GPU claim")
 
         max_colocate_count = spec.get(
             "max_colocate_count",
@@ -263,8 +262,8 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         claims = [claim]
 
         normalized = dict(spec)
+        normalized.pop("world_size", None)
         normalized["claims"] = claims
-        normalized["world_size"] = world_size
         normalized["max_colocate_count"] = max_colocate_count
         normalized["placement_epoch"] = placement_epoch
         normalized["expires_at"] = lease.expires_at
