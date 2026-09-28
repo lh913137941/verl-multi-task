@@ -435,8 +435,8 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                     or not self._same_borrowed_create_request(existing, normalized)
                 ):
                     raise ValueError("conflicting borrowed create replay")
-                if existing["state"] == "FAILED":
-                    error = existing.get("error") or {}
+                if existing.get("error") is not None:
+                    error = existing["error"]
                     if error.get("type") == "NotImplementedError":
                         raise NotImplementedError(error.get("message", "borrowed create failed"))
                     raise RuntimeError(error.get("message", "borrowed create failed"))
@@ -468,7 +468,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 "lease_id": lease_id,
                 "replica_key": replica_key,
                 "replica_rank": rank,
-                "state": "CREATING",
                 "result": None,
                 "error": None,
                 # Manager-local replay fence and resolved placement. Retries
@@ -501,7 +500,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             async with self.replica_operation_lock:
                 current = self.borrowed_operations[lease_id]
                 replica_key = current["replica_key"]
-                current["state"] = "RUNTIME_READY"
                 current["error"] = None
                 current["result"] = {
                     "operation_id": current["operation_id"],
@@ -545,7 +543,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 # Runtime cleanup success is a resource fact, not create
                 # success. Keep the operation FAILED so exact replay raises the
                 # original failure instead of synthesizing RUNTIME_READY.
-                current["state"] = "FAILED"
                 current["released"] = cleanup_verified
                 current["error"] = {
                     "type": type(exc).__name__,
@@ -654,6 +651,5 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             released_gpu_uuids=gpu_uuids,
         )
         record["destroy_evidence"] = evidence
-        record["state"] = "RELEASED"
         record["released"] = True
         return evidence
