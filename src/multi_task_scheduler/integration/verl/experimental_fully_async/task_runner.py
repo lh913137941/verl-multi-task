@@ -81,7 +81,6 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
         return {
             "operation_id": command.operation_id,
             "lease_id": lease.lease_id,
-            "lease_ids": list(lease.source_lease_ids),
             "borrower_task_id": command.target.task_session,
             "borrower_replica_id": command.target.replica_id,
             "replica_rank": None,
