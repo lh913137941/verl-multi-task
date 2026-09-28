@@ -1,7 +1,6 @@
 """Native vLLM replica extension for the supported STANDALONE profile."""
 
 import asyncio
-import os
 import subprocess
 
 import ray
@@ -10,11 +9,7 @@ from ray.util.state import list_actors
 
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.single_controller.ray.base import get_master_addr_port
-from verl.utils.device import (
-    get_device_name,
-    get_resource_name,
-    get_visible_devices_keyword,
-)
+from verl.utils.device import get_device_name, get_resource_name
 from verl.workers.rollout.replica import RolloutMode
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
@@ -91,15 +86,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
             raise RuntimeError(
                 f"cannot map Ray GPU accelerator id {accelerator_id!r} to a UUID"
             )
-        return {
-            "node_id": context.get_node_id(),
-            "accelerator_id": accelerator_id,
-            "gpu_uuid": gpu_uuid,
-            "visible_devices": os.environ.get(
-                get_visible_devices_keyword().upper(),
-                "",
-            ),
-        }
+        return {"node_id": context.get_node_id(), "gpu_uuid": gpu_uuid}
 
     def validate_placement(self, spec: dict) -> None:
         """Validate runtime identity/topology on a normalized Lease spec."""
