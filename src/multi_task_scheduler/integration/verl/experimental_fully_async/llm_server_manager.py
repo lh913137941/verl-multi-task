@@ -54,7 +54,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         self.replica_kind: dict[ReplicaKey, ReplicaKind] = {}
         self._runtime_inventory: dict[ReplicaKey, object] = {}
         self.next_replica_rank = 0
-        self._allocated_replica_ranks: set[int] = set()
         self.borrowed_operations: dict[str, dict] = {}
         self._native_release_evidence: dict[
             str, tuple[ReplicaKey, OperationEvidence]
@@ -76,7 +75,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             )
             if type(rank) is not int or rank < 0:
                 raise ValueError("native replica_rank must be a nonnegative integer")
-            self._allocated_replica_ranks.add(rank)
             self.next_replica_rank = max(self.next_replica_rank, rank + 1)
 
     async def _init_global_load_balancer(self) -> None:
@@ -227,12 +225,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         if type(placement_epoch) is not int or placement_epoch < 0:
             raise ValueError("placement_epoch must be a nonnegative integer")
 
-        replica_rank = spec.get("replica_rank")
-        if replica_rank is not None and (
-            type(replica_rank) is not int or replica_rank < 0
-        ):
-            raise ValueError("replica_rank must be a nonnegative integer or None")
-
         lease = Lease(
             spec["lease_id"],
             tuple(raw_claims),
@@ -254,32 +246,17 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         normalized = dict(spec)
         normalized.pop("world_size", None)
         normalized.pop("max_colocate_count", None)
+        normalized.pop("replica_rank", None)
         normalized["claims"] = claims
         normalized["placement_epoch"] = placement_epoch
         normalized["expires_at"] = lease.expires_at
         return normalized
 
-    def _allocate_replica_rank_locked(self, requested_rank: int | None) -> int:
-        """Allocate a task-local rank exactly once while replica_operation_lock is held."""
-        if requested_rank is not None:
-            if requested_rank in self._allocated_replica_ranks:
-                raise ValueError("replica_rank is already allocated")
-            rank = requested_rank
-            self.next_replica_rank = max(self.next_replica_rank, rank + 1)
-        else:
-            rank = self.next_replica_rank
-            while rank in self._allocated_replica_ranks:
-                rank += 1
-            self.next_replica_rank = rank + 1
-        self._allocated_replica_ranks.add(rank)
-        return rank
-
     @staticmethod
     def _same_borrowed_create_request(record: dict, incoming: dict) -> bool:
-        current = dict(incoming)
-        if current.get("replica_rank") is None:
-            current["replica_rank"] = record["resolved_spec"]["replica_rank"]
-        return record["resolved_spec"] == current
+        resolved = dict(record["resolved_spec"])
+        resolved.pop("replica_rank", None)
+        return resolved == incoming
 
     def _resolve_placement_groups(self, claims) -> dict[str, object]:
         """Resolve verified PG handles from serialized claim metadata.
@@ -416,7 +393,8 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 raise ValueError(
                     "borrowed ReplicaKey is already registered; use a new runtime_epoch"
                 )
-            rank = self._allocate_replica_rank_locked(normalized.get("replica_rank"))
+            rank = self.next_replica_rank
+            self.next_replica_rank += 1
             resolved_spec = dict(normalized)
             resolved_spec["claims"] = [dict(claim) for claim in normalized["claims"]]
             resolved_spec["replica_rank"] = rank
