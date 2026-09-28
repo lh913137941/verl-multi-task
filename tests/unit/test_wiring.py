@@ -1686,6 +1686,7 @@ def checkpoint_manager_class(**extra_scope):
         "ReplicaKey": ReplicaKey,
         "OperationEvidence": OperationEvidence,
         "EvidenceType": EvidenceType,
+        "ReplicaKind": ReplicaKind,
         "asyncio": asyncio,
         **extra_scope,
     }
@@ -1797,6 +1798,7 @@ def test_ce_target_bootstrap_syncs_only_pending_target_and_is_idempotent():
             return list(value)
 
     class Replica:
+        replica_kind = ReplicaKind.BORROWED
         workers = ["worker-0"]
 
         async def release_kv_cache(self):
@@ -1849,6 +1851,175 @@ def test_ce_target_bootstrap_syncs_only_pending_target_and_is_idempotent():
         )
 
 
+def test_ce_native_restore_wakes_weights_under_bootstrap_and_restores_kv_before_health():
+    calls = []
+
+    class FakeRolloutWG:
+        world_size = 1
+
+        @classmethod
+        def from_detached(cls, *, worker_handles, **kwargs):
+            calls.append(("wrap", tuple(worker_handles)))
+            return cls()
+
+        def update_weights(self, *, global_steps):
+            calls.append(("target-update", global_steps))
+            return [None]
+
+        def execute_checkpoint_engine(self, methods):
+            calls.append(("target-finalize", tuple(methods)))
+            return [None]
+
+    class FakeCIA:
+        def __init__(self, cls, *args, **kwargs):
+            pass
+
+    class ActorWG:
+        world_size = 1
+
+        def update_weights(self, *, global_steps, mode):
+            calls.append(("actor-update", global_steps, mode))
+            return [None]
+
+        def execute_checkpoint_engine(self, methods):
+            calls.append(("actor-finalize", tuple(methods)))
+            return [None]
+
+    class FakeRay:
+        @staticmethod
+        def remote(cls):
+            return cls
+
+        @staticmethod
+        def get(value):
+            return value
+
+    class Replica:
+        replica_kind = ReplicaKind.NATIVE
+        workers = ["worker-0"]
+
+        async def wake_up(self, *, tags=None):
+            calls.append(("wake", tuple(tags) if tags is not None else None))
+            return ({"sleeping": True, "fully_awake": False},)
+
+        async def release_kv_cache(self):
+            calls.append(("release-kv",))
+
+        async def resume_kv_cache(self):
+            calls.append(("resume-kv",))
+
+        async def validate_server_runtime(self):
+            calls.append(("health",))
+            return {"global_steps": 13}
+
+        async def sleep(self):
+            raise AssertionError("successful RESTORE bootstrap must not rollback")
+
+    config = type("Config", (), {"backend": "nccl"})()
+    cls = checkpoint_manager_class(
+        ray=FakeRay,
+        RayClassWithInitArgs=FakeCIA,
+        RayWorkerGroup=FakeRolloutWG,
+        MultiTaskCheckpointEngineWorker=object,
+    )
+    ce = cls(config=config, actor_wg=ActorWG(), replicas=[])
+    key = ReplicaKey("task-a", "native-0")
+    replica = Replica()
+    ce.register_pending(key, [replica], operation_id="op-restore")
+
+    evidence = asyncio.run(
+        ce.bootstrap_target(key, operation_id="op-restore", loaded_version=13)
+    )
+    assert evidence.type is EvidenceType.WEIGHT_READY
+    assert calls.index(("wake", ("weights",))) < calls.index(("release-kv",))
+    assert calls.index(("release-kv",)) < calls.index(("target-update", 13))
+    assert calls.index(("target-update", 13)) < calls.index(("resume-kv",))
+    assert calls.index(("resume-kv",)) < calls.index(("health",))
+
+
+def test_ce_native_restore_failure_resleeps_before_escaping():
+    calls = []
+
+    class FakeRolloutWG:
+        world_size = 1
+
+        @classmethod
+        def from_detached(cls, *, worker_handles, **kwargs):
+            return cls()
+
+        def update_weights(self, *, global_steps):
+            calls.append(("target-update", global_steps))
+            raise RuntimeError("target transfer failed")
+
+        def execute_checkpoint_engine(self, methods):
+            calls.append(("target-finalize", tuple(methods)))
+            return [None]
+
+    class FakeCIA:
+        def __init__(self, cls, *args, **kwargs):
+            pass
+
+    class ActorWG:
+        world_size = 1
+
+        def update_weights(self, *, global_steps, mode):
+            calls.append(("actor-update", global_steps, mode))
+            return [None]
+
+        def execute_checkpoint_engine(self, methods):
+            calls.append(("actor-finalize", tuple(methods)))
+            return [None]
+
+    class FakeRay:
+        @staticmethod
+        def remote(cls):
+            return cls
+
+        @staticmethod
+        def get(value):
+            # Evaluate enough of the fake result list to surface transfer failure.
+            return value
+
+    class Replica:
+        replica_kind = ReplicaKind.NATIVE
+        workers = ["worker-0"]
+
+        async def wake_up(self, *, tags=None):
+            calls.append(("wake", tuple(tags) if tags is not None else None))
+            return ({"sleeping": True, "fully_awake": False},)
+
+        async def release_kv_cache(self):
+            calls.append(("release-kv",))
+
+        async def resume_kv_cache(self):
+            raise AssertionError("failed transfer must not resume KV")
+
+        async def validate_server_runtime(self):
+            raise AssertionError("failed transfer must not reach health")
+
+        async def sleep(self):
+            calls.append(("sleep",))
+            return ({"sleep_level": 2, "sleeping": True},)
+
+    config = type("Config", (), {"backend": "nccl"})()
+    cls = checkpoint_manager_class(
+        ray=FakeRay,
+        RayClassWithInitArgs=FakeCIA,
+        RayWorkerGroup=FakeRolloutWG,
+        MultiTaskCheckpointEngineWorker=object,
+    )
+    ce = cls(config=config, actor_wg=ActorWG(), replicas=[])
+    key = ReplicaKey("task-a", "native-0")
+    ce.register_pending(key, [Replica()], operation_id="op-restore")
+
+    with pytest.raises(RuntimeError, match="target transfer failed"):
+        asyncio.run(
+            ce.bootstrap_target(key, operation_id="op-restore", loaded_version=13)
+        )
+    assert ("wake", ("weights",)) in calls
+    assert ("sleep",) in calls
+
+
 def test_ce_target_bootstrap_requires_server_version_confirmation():
     class FakeRolloutWG:
         world_size = 1
@@ -1886,6 +2057,7 @@ def test_ce_target_bootstrap_requires_server_version_confirmation():
             return value
 
     class Replica:
+        replica_kind = ReplicaKind.BORROWED
         workers = ["worker-0"]
 
         async def release_kv_cache(self):
@@ -2798,22 +2970,22 @@ def test_rollouter_prepare_replica_reuses_existing_entry_for_native_restore():
             self.replica_kind = {key: ReplicaKind.NATIVE}
 
         def replica_meta(self, target):
+            calls.append(("replica_meta", target))
             return self.replica_kind[target], self.replica_state[target]
 
         async def wake_weights(self, target):
-            calls.append(("wake_weights", target))
-            return ({"sleeping": True, "fully_awake": False},)
+            raise AssertionError("RESTORE pre-bind must not mutate GPU before Trainer G")
 
     rollouter.llm_server_manager = Manager()
-    receipts = asyncio.run(
+    result = asyncio.run(
         rollouter.prepare_replica(
             key,
             operation_id="op-restore",
             spec=None,
         )
     )
-    assert receipts[0]["fully_awake"] is False
-    assert calls == [("wake_weights", key)]
+    assert result is None
+    assert calls == [("replica_meta", key)]
     assert rollouter.get_pending_target("op-restore") == key
 
 
