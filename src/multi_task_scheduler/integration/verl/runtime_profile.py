@@ -93,6 +93,30 @@ def validate_runtime_profile(config) -> bool:
             "first release owns the request-state LB and does not support router_config_path"
         )
 
+    mtp = _select(config, f"{prefix}.mtp", None)
+    if mtp is not None:
+        if not isinstance(mtp, Mapping):
+            raise ProfileConfigurationError(f"{prefix}.mtp must be a mapping")
+        if mtp.get("enable", False) and mtp.get("enable_rollout", False):
+            raise ProfileConfigurationError(
+                "first release whole-GPU DONATE requires level-2 sleep and does not support MTP rollout"
+            )
+
+    model = _select(config, "actor_rollout_ref.model", None)
+    if model is not None:
+        if not isinstance(model, Mapping):
+            raise ProfileConfigurationError("actor_rollout_ref.model must be a mapping")
+        lora_rank = model.get("lora_rank", 0)
+        lora = model.get("lora", {}) or {}
+        if not isinstance(lora, Mapping):
+            raise ProfileConfigurationError("actor_rollout_ref.model.lora must be a mapping")
+        if (type(lora_rank) is int and lora_rank > 0) or (
+            type(lora.get("rank", 0)) is int and lora.get("rank", 0) > 0
+        ):
+            raise ProfileConfigurationError(
+                "first release whole-GPU DONATE requires level-2 sleep and does not support LoRA rollout"
+            )
+
     backend = _select(config, f"{prefix}.checkpoint_engine.backend")
     if not isinstance(backend, str) or not backend.strip() or backend == "naive":
         raise ProfileConfigurationError(
