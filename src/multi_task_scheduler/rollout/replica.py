@@ -98,9 +98,6 @@ class MultiTaskvLLMReplica(vLLMReplica):
             raise ValueError("placement replica_rank does not match runtime identity")
         if spec.get("placement_epoch", 0) != self.runtime_epoch:
             raise ValueError("placement_epoch does not match runtime identity")
-        if spec.get("max_colocate_count") != FIRST_RELEASE_MAX_COLOCATE_COUNT:
-            raise ValueError("placement max_colocate_count does not match first release")
-
         claims = Lease(
             spec["lease_id"],
             tuple(spec.get("claims") or ()),
