@@ -68,11 +68,10 @@ class _ContinuationAwareServer:
                 self._client_id,
                 prefix_digest,
             )
-        except Exception as exc:
+        except KeyError:
             # Native Fully Async also aborts for ordinary weight-sync/rebalance.
             # Only an active lifecycle drain needs continuation evidence.
-            if "not part of an active drain operation" not in str(exc):
-                raise
+            pass
         return output
 
 
