@@ -148,7 +148,7 @@ python -m pytest -q -m ray_integration tests/integration
 MT_VERL_SOURCE_ROOT=/absolute/path/to/verl \
 python -m pytest -q -m native tests/native_unit
 
-# 真实 CUDA/vLLM；1 GPU 验 DONATE level-2/RELEASED，>=2 GPU 继续验 current-Vpub RESTORE
+# 真实 CUDA/vLLM；1 GPU 验 DONATE→同卡 borrower→REMOVE，>=2 GPU 继续验 current-Vpub RESTORE
 VERL_MULTITASK_GPU_MODEL_PATH=/path/to/local/model \
 python -m pytest -q -s -m gpu_integration tests/integration/test_native_sleep_gpu.py
 ```
