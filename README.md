@@ -163,3 +163,18 @@ python -m pytest -q -s -m gpu_integration tests/integration/test_native_sleep_gp
 验收仍必须按上面的分层命令单独执行，不能由 unit 结果替代。
 
 详细设计以当前 092203 设计文档和 `docs/simplified-fusion-contract.md` 为准。
+
+## verl_expansion 融合来源
+
+融合分支 `chatgpt/0928-merge-verl-expansion` 基于当前 simplified-fusion 代码，
+吸收 `ZiqiGuan892/verl_expansion` 的 `D2` 分支（来源提交
+`ba920fd5f110bbf76811817a61f17411c7fd2dce`）。
+
+生产路径只合入与当前合同兼容的能力：Ray ActorClass 解包兼容层、
+`MultiTaskCheckpointEngineWorker` 扩展选择以及 GPU baseline 验收资产。
+源仓的多 source lease、多 TP/多节点 borrowed runtime、Ascend/NPU 启动脚本和旧 reclaim wire
+没有直接覆盖当前 Lease/OperationEvidence/ReplicaSyncGate/异常恢复实现。
+
+源仓 D2 设计资料保存在 `docs/verl-expansion-reference/`，用于后续能力扩展参考；
+若其中内容与 `docs/simplified-fusion-contract.md` 冲突，以当前合同和源码为准。
+
