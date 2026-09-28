@@ -33,6 +33,7 @@ def _require_evidence(value, operation_id: str, expected: EvidenceType, label: s
 class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
     def __init__(self, *args, task_session=None, **kwargs):
         self.task_session = task_session
+        self._replica_sync_gate = ReplicaSyncGate()
         super().__init__(*args, **kwargs)
 
     async def _setup_checkpoint_manager(self):
@@ -61,14 +62,9 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
             f"(backend={checkpoint_engine_config.backend}, effective={len(replicas)})"
         )
 
-    def _ensure_gate(self) -> ReplicaSyncGate:
-        if not hasattr(self, "_replica_sync_gate"):
-            self._replica_sync_gate = ReplicaSyncGate()
-        return self._replica_sync_gate
-
     @property
     def replica_sync_gate(self) -> ReplicaSyncGate:
-        return self._ensure_gate()
+        return self._replica_sync_gate
 
     async def _fit_update_weights(self):
         if self.local_trigger_step != 1:
