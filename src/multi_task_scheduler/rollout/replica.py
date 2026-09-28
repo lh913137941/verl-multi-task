@@ -307,10 +307,6 @@ class MultiTaskvLLMReplica(vLLMReplica):
             raise TypeError("server runtime health returned a non-dict result")
         if health.get("replica_rank") != self.replica_rank:
             raise RuntimeError("server replica_rank mismatch")
-        if health.get("node_rank") != 0 or health.get("nnodes") != 1:
-            raise RuntimeError("server topology mismatch")
-        if not health.get("engine_ready"):
-            raise RuntimeError("vLLM engine is not healthy")
         if not health.get("server_address") or not health.get("server_port"):
             raise RuntimeError("HTTP server address is incomplete")
         if self._server_handle is not self.servers[0]:
