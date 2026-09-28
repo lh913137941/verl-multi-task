@@ -197,6 +197,108 @@ def test_group_scheduler_fences_active_claims_until_verified_release():
         ray.shutdown()
 
 
+def test_restore_temporary_reservation_closes_one_shot_lease():
+    ray.init(num_cpus=2, ignore_reinit_error=True)
+    try:
+        gs = GroupScheduler.remote()
+        runner = Runner.remote()
+        ray.get(gs.attach_task.remote("task-a", runner))
+        lease = Lease("l1", (claim(),), 0)
+        ray.get(gs.open_lease.remote(lease))
+
+        donate = OperationCommand(
+            "op-donate",
+            OperationKind.DONATE,
+            ReplicaKey("task-a", "native-0"),
+            "l1",
+        )
+        ray.get(gs.submit_operation.remote(donate))
+        ray.get(
+            gs.advance_lease.remote(
+                "l1",
+                OperationEvidence(
+                    "op-donate",
+                    EvidenceType.RELEASED,
+                    1,
+                    ("u0",),
+                ),
+            )
+        )
+        add = OperationCommand(
+            "op-add",
+            OperationKind.ADD,
+            ReplicaKey("task-a", "borrowed-0"),
+            "l1",
+        )
+        ray.get(gs.submit_operation.remote(add))
+        remove = OperationCommand(
+            "op-remove",
+            OperationKind.REMOVE,
+            ReplicaKey("task-a", "borrowed-0"),
+            "l1",
+        )
+        ray.get(gs.submit_operation.remote(remove))
+        ray.get(
+            gs.advance_lease.remote(
+                "l1",
+                OperationEvidence(
+                    "op-remove",
+                    EvidenceType.RELEASED,
+                    2,
+                    ("u0",),
+                ),
+            )
+        )
+
+        restore = OperationCommand(
+            "op-restore",
+            OperationKind.RESTORE,
+            ReplicaKey("task-a", "native-0"),
+            "l1",
+        )
+        ray.get(gs.submit_operation.remote(restore))
+
+        overlapping = Lease(
+            "l2",
+            (
+                claim(
+                    claim_id="claim-2",
+                    source_lease_id="source-2",
+                ),
+            ),
+            0,
+        )
+        with pytest.raises(ValueError, match="already active"):
+            ray.get(gs.open_lease.remote(overlapping))
+
+        result = ray.get(
+            gs.advance_lease.remote(
+                "l1",
+                OperationEvidence(
+                    "op-restore",
+                    EvidenceType.SERVICE_COMMITTED,
+                    3,
+                ),
+            )
+        )
+        assert result["restored"] is True
+        assert ray.get(gs.open_lease.remote(overlapping)) == overlapping
+
+        with pytest.raises(ValueError, match="lifecycle is complete"):
+            ray.get(
+                gs.submit_operation.remote(
+                    OperationCommand(
+                        "op-old-lease-reuse",
+                        OperationKind.DONATE,
+                        ReplicaKey("task-a", "native-0"),
+                        "l1",
+                    )
+                )
+            )
+    finally:
+        ray.shutdown()
+
+
 def test_add_requires_verified_donor_handoff():
     ray.init(num_cpus=2, ignore_reinit_error=True)
     try:
