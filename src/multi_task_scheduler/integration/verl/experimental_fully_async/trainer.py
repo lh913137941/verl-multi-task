@@ -14,6 +14,7 @@ from multi_task_scheduler.orchestration.contracts import (
     OperationEvidence,
     OperationRecord,
     ReplicaKey,
+    ReplicaKind,
 )
 from multi_task_scheduler.orchestration.replica_sync_gate import GateKind, ReplicaSyncGate
 
@@ -106,8 +107,26 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
             member = self.checkpoint_manager.effective_replicas.get(target)
             if member is None:
                 raise KeyError(f"replica {target!r} is not an effective CE member")
+            replicas, _loaded_version = member
+            replica_kinds = {
+                getattr(replica, "replica_kind", None)
+                for replica in replicas
+            }
+            if len(replica_kinds) != 1:
+                raise ValueError("CE member contains inconsistent replica kinds")
+            replica_kind = next(iter(replica_kinds))
 
             await lease.guard(self.checkpoint_manager.remove_effective, target)
+            # Reuse CE's existing pending set as the parked receiver reference
+            # for retained native DONATE. Borrowed REMOVE is destroyed later and
+            # therefore must not leave a stale pending runtime behind.
+            if replica_kind is ReplicaKind.NATIVE:
+                await lease.guard(
+                    self.checkpoint_manager.register_pending,
+                    target,
+                    replicas,
+                    operation_id=operation.operation_id,
+                )
             mutated = True
             evidence = await lease.guard(
                 self.rollouter.commit_service_change.remote,
@@ -132,9 +151,88 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
         finally:
             await lease.release()
 
-    async def restore_and_publish(self, operation: OperationRecord):
+    async def restore_and_publish(self, operation: OperationRecord) -> OperationEvidence:
+        """Restore current Vpub into one parked native runtime and republish it.
+
+        TaskRunner admission remains fail-closed until this path is validated on
+        the real CUDA/vLLM backend.  This method intentionally reuses the
+        existing CE pending/bootstrap state instead of introducing RESTORE-only
+        interfaces or lifecycle DTOs.
+        """
         if not isinstance(operation, OperationRecord):
             raise TypeError("restore_and_publish requires OperationRecord")
-        raise NotImplementedError(
-            "restore_and_publish requires verified native wake/bootstrap wiring"
-        )
+        if self.rollouter is None or self.checkpoint_manager is None:
+            raise RuntimeError("Trainer owner dependencies are not initialized")
+        if type(self.current_param_version) is not int or self.current_param_version < 0:
+            raise RuntimeError("current parameter version is unavailable for RESTORE")
+
+        gate = self.replica_sync_gate
+        lease = await gate.acquire(operation.operation_id, GateKind.RESTORE)
+        mutated = False
+        try:
+            target = await self.rollouter.get_pending_target.remote(operation.operation_id)
+            parked = self.checkpoint_manager.pending_bootstrap.get(target)
+            if parked is None:
+                raise KeyError(f"no parked native CE runtime for {target!r}")
+            replicas, _parked_operation = parked
+            replica_kinds = {
+                getattr(replica, "replica_kind", None)
+                for replica in replicas
+            }
+            if replica_kinds != {ReplicaKind.NATIVE}:
+                raise ValueError("RESTORE requires a parked NATIVE CE runtime")
+
+            # Rebind the already-retained receiver to this RESTORE operation
+            # using CE's existing pending API; no new lifecycle state is added.
+            await lease.guard(self.checkpoint_manager.discard_pending, target)
+            await lease.guard(
+                self.checkpoint_manager.register_pending,
+                target,
+                replicas,
+                operation_id=operation.operation_id,
+            )
+            mutated = True
+
+            weight_evidence = await lease.guard(
+                self.checkpoint_manager.bootstrap_target,
+                target,
+                operation_id=operation.operation_id,
+                loaded_version=self.current_param_version,
+            )
+            if not isinstance(weight_evidence, OperationEvidence):
+                raise TypeError("RESTORE bootstrap did not return OperationEvidence")
+            if weight_evidence.operation_id != operation.operation_id:
+                raise ValueError("RESTORE weight evidence belongs to another operation")
+            if weight_evidence.type is not EvidenceType.WEIGHT_READY:
+                raise ValueError(
+                    f"expected WEIGHT_READY, got {weight_evidence.type.value}"
+                )
+
+            await lease.guard(
+                self.checkpoint_manager.commit_pending,
+                target,
+                weight_evidence,
+                loaded_version=self.current_param_version,
+            )
+            service_evidence = await lease.guard(
+                self.rollouter.commit_service_change.remote,
+                operation,
+            )
+            if not isinstance(service_evidence, OperationEvidence):
+                raise TypeError("RESTORE service commit did not return OperationEvidence")
+            if service_evidence.operation_id != operation.operation_id:
+                raise ValueError("RESTORE service evidence belongs to another operation")
+            if service_evidence.type is not EvidenceType.SERVICE_COMMITTED:
+                raise ValueError(
+                    f"expected SERVICE_COMMITTED, got {service_evidence.type.value}"
+                )
+            return service_evidence
+        except BaseException as exc:
+            if mutated:
+                gate.block(
+                    lease.owner,
+                    f"RESTORE outcome unknown: {type(exc).__name__}",
+                )
+            raise
+        finally:
+            await lease.release()
