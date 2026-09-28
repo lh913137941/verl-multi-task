@@ -4432,6 +4432,7 @@ def rollouter_class():
         EvidenceType=EvidenceType,
         _require_evidence=_test_require_evidence,
         asyncio=asyncio,
+        json=__import__("json"),
         ray=FakeRay,
     )
 
