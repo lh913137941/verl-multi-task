@@ -30,6 +30,11 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         self.continuation_proofs: dict[
             str, tuple[str, str, str, OperationEvidence]
         ] = {}
+        # operation_id -> logical request ids whose aborted prefix was observed
+        # by the continuation-aware FullyAsync client. Unlike per-attempt proof,
+        # this survives immediate re-admission on another server until removal
+        # commits, so FORCE can verify handoff even after the retry has started.
+        self.continuation_handoffs: dict[str, set[str]] = {}
         for key, server_id in dict(initial_routes or {}).items():
             if not isinstance(key, ReplicaKey):
                 raise TypeError("initial route key must be ReplicaKey")
@@ -97,8 +102,14 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             operation_id,
             evidence,
         )
+        self.continuation_handoffs.setdefault(operation_id, set()).add(request_id)
         self.attempt_state[request_id] = AttemptState.TERMINATED
         return evidence
+
+    def continuation_handoff_requests(self, operation_id: str) -> tuple[str, ...]:
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("operation_id must be a nonempty string")
+        return tuple(sorted(self.continuation_handoffs.get(operation_id, ())))
 
     def requests_for_server(self, server_id: str) -> tuple[str, ...]:
         return tuple(r for r, s in self.active_request_server.items() if s == server_id)
@@ -203,7 +214,9 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
                 self.active_request_server.pop(request_id, None)
 
         self.remove_servers([server_id])
-        self.draining_operations.pop(server_id, None)
+        operation_id = self.draining_operations.pop(server_id, None)
+        if operation_id is not None:
+            self.continuation_handoffs.pop(operation_id, None)
         self.routes.pop(key, None)
         for operation_id, (ready_key, _server_id, _evidence) in tuple(
             self.ready_operations.items()
