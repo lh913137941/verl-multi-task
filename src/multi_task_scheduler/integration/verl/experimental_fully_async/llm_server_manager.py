@@ -332,20 +332,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             expected["replica_rank"] = None
         return expected == current
 
-    @staticmethod
-    def _borrowed_receipt(record: dict) -> dict:
-        result = record.get("result")
-        if result is not None:
-            return dict(result)
-        return {
-            "operation_id": record["operation_id"],
-            "lease_id": record["lease_id"],
-            "replica_rank": record["replica_rank"],
-            "state": record["state"],
-            "released": bool(record.get("released", False)),
-            "error": record.get("error"),
-        }
-
     def _resolve_placement_groups(self, claims) -> dict[str, object]:
         """Resolve verified PG handles from serialized claim metadata.
 
@@ -465,7 +451,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                         raise NotImplementedError(error.get("message", "borrowed create failed"))
                     raise RuntimeError(error.get("message", "borrowed create failed"))
                 if existing.get("result") is not None:
-                    return self._borrowed_receipt(existing)
+                    return dict(existing["result"])
                 raise RuntimeError("borrowed create is already in progress")
 
             request_spec = dict(normalized)
@@ -493,7 +479,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             record = {
                 "operation_id": normalized["operation_id"],
                 "lease_id": lease_id,
-                "borrower_task_id": normalized["borrower_task_id"],
                 "replica_key": replica_key,
                 "replica_rank": rank,
                 "state": "CREATING",
@@ -542,7 +527,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                     "server_address": runtime_receipt.get("server_address"),
                 }
                 self._runtime_inventory[replica_key] = runtime
-                return self._borrowed_receipt(current)
+                return dict(current["result"])
         except BaseException as exc:
             if runtime is not None and not getattr(
                 runtime,
@@ -620,8 +605,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         placements = await runtime.worker_placements()
         gpu_uuids = []
         for placement in placements:
-            if not isinstance(placement, dict):
-                raise TypeError("native runtime placement probe returned a non-dict result")
             gpu_uuid = placement.get("gpu_uuid")
             if not isinstance(gpu_uuid, str) or not gpu_uuid:
                 raise RuntimeError("native runtime placement is missing physical GPU UUID")
