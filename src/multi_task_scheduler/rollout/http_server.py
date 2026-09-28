@@ -73,6 +73,90 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
             "shutdown": True,
         }
 
-    def wake_weights(self) -> None:
-        raise NotImplementedError("native wake requires verified vLLM sleep backend")
+    def _require_sleep_engine(self):
+        if self.nnodes != 1 or self.node_rank != 0:
+            raise NotImplementedError(
+                "first release native sleep/wake supports one-node servers only"
+            )
+        if not getattr(self.config, "enable_sleep_mode", False):
+            raise RuntimeError("native sleep/wake requires rollout.enable_sleep_mode=true")
+        if not getattr(self.config, "free_cache_engine", False):
+            raise RuntimeError("native sleep/wake requires rollout.free_cache_engine=true")
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            raise RuntimeError("vLLM engine is not initialized")
+        return engine
+
+    async def sleep(self) -> dict:
+        """Deep-sleep one retained native STANDALONE server.
+
+        Level 2 intentionally discards weights and KV cache: a later RESTORE
+        must load the current published parameters instead of reviving stale
+        pre-DONATE weights.  Admission remains closed until a full wake succeeds.
+        """
+        engine = self._require_sleep_engine()
+        self._submission_paused = True
+        self._resume_event.clear()
+
+        # Normal DONATE has already drained at R, but keep the runtime boundary
+        # independently safe: level-2 sleep must never abort a hidden late request.
+        await engine.wait_for_requests_to_drain()
+        await engine.sleep(level=2, mode="wait")
+        if not await engine.is_sleeping():
+            raise RuntimeError("vLLM engine did not enter level-2 sleep")
+
+        return {
+            "replica_rank": self.replica_rank,
+            "node_rank": self.node_rank,
+            "sleep_level": 2,
+            "sleeping": True,
+            "global_steps": self.global_steps,
+        }
+
+    async def wake_up(self, tags: list[str] | None = None) -> dict:
+        """Wake selected vLLM allocations while keeping admission fenced.
+
+        Partial wakes (notably weights-only RESTORE preparation) deliberately
+        keep the server gate closed.  Only a fully resident, healthy engine can
+        reopen admission.
+        """
+        engine = self._require_sleep_engine()
+        self._submission_paused = True
+        self._resume_event.clear()
+        if not await engine.is_sleeping():
+            raise RuntimeError("native wake requires a sleeping vLLM engine")
+
+        await engine.wake_up(tags=tags)
+        sleeping = bool(await engine.is_sleeping())
+        if sleeping:
+            return {
+                "replica_rank": self.replica_rank,
+                "node_rank": self.node_rank,
+                "sleeping": True,
+                "fully_awake": False,
+                "global_steps": self.global_steps,
+            }
+
+        # No request can cross the local gate while stale cache state is cleared
+        # and the fully resident engine is health-checked.
+        await engine.reset_prefix_cache(reset_connector=True)
+        await engine.check_health()
+        self._submission_paused = False
+        self._resume_event.set()
+        return {
+            "replica_rank": self.replica_rank,
+            "node_rank": self.node_rank,
+            "sleeping": False,
+            "fully_awake": True,
+            "global_steps": self.global_steps,
+        }
+
+    async def wake_weights(self) -> dict:
+        """Allocate weight memory only; parameters must be refreshed before full wake."""
+        receipt = await self.wake_up(tags=["weights"])
+        if receipt["fully_awake"] or not receipt["sleeping"]:
+            raise RuntimeError(
+                "weights-only wake unexpectedly made the vLLM engine fully awake"
+            )
+        return receipt
 
