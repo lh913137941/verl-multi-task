@@ -23,7 +23,6 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         super().__init__(*args, **kwargs)
         self._effective_replica_map = {}
         self._pending_bootstrap_map = {}
-        self._bootstrap_commit_map = {}
         self._bootstrap_ready_map = {}
 
     @property
@@ -62,7 +61,8 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
 
         effective = self._effective_replica_map.get(key)
         if effective is not None:
-            if effective[0] == replicas and self._bootstrap_commit_map.get(key) == operation_id:
+            ready = self._bootstrap_ready_map.get(key)
+            if effective[0] == replicas and ready is not None and ready[0] == operation_id:
                 return
             raise ValueError("ReplicaKey is already an effective CE member")
 
@@ -94,16 +94,14 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         if type(loaded_version) is not int or loaded_version < 0:
             raise ValueError("loaded_version must be a nonnegative integer")
 
-        existing_commit = self._bootstrap_commit_map.get(key)
-        if existing_commit is not None:
-            if existing_commit != evidence.operation_id:
-                raise ValueError("ReplicaKey bootstrap was committed by another operation")
-            confirmed = self._bootstrap_ready_map.get(key)
-            if confirmed != (evidence.operation_id, loaded_version, evidence):
-                raise ValueError("WEIGHT_READY does not match confirmed bootstrap")
-            member = self._effective_replica_map.get(key)
-            if member is None or member[1] != loaded_version:
-                raise ValueError("conflicting bootstrap commit replay")
+        confirmed = self._bootstrap_ready_map.get(key)
+        member = self._effective_replica_map.get(key)
+        if (
+            key not in self._pending_bootstrap_map
+            and confirmed == (evidence.operation_id, loaded_version, evidence)
+            and member is not None
+            and member[1] == loaded_version
+        ):
             return
 
         try:
@@ -117,7 +115,6 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
 
         self.add_effective(key, replicas, loaded_version=loaded_version)
         self._pending_bootstrap_map.pop(key, None)
-        self._bootstrap_commit_map[key] = operation_id
 
     def discard_pending(self, key: ReplicaKey) -> None:
         self._pending_bootstrap_map.pop(key, None)
@@ -145,7 +142,6 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
 
     def remove_effective(self, key: ReplicaKey) -> None:
         self.discard_pending(key)
-        self._bootstrap_commit_map.pop(key, None)
         entry = self._effective_replica_map.pop(key, None)
         if entry is None:
             return
