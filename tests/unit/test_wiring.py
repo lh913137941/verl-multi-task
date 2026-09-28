@@ -471,6 +471,42 @@ def test_taskrunner_exact_unknown_add_replay_relaunches_same_operation():
     assert launched == [command.operation_id]
 
 
+def test_taskrunner_unknown_reconciliation_launch_failure_preserves_fence_and_lease():
+    runner = taskrunner_class()()
+    runner.task_session = "task-a"
+    runner._control_ready = True
+    command = OperationCommand(
+        "op-add-reconcile-launch-fail",
+        OperationKind.ADD,
+        ReplicaKey("task-a", "borrowed-0"),
+        "l1",
+    )
+    lease = taskrunner_lease()
+    runner._operation_journal.begin(command)
+    runner._operation_journal.mark_running(command.operation_id)
+    runner._operation_journal.finish(
+        command.operation_id,
+        OperationStatus.UNKNOWN,
+        "owner outcome unknown",
+    )
+    runner._operation_leases[command.operation_id] = lease
+
+    def fail_launch(operation_id):
+        runner._operation_threads[operation_id] = object()
+        raise RuntimeError("thread start failed")
+
+    runner._launch_operation = fail_launch
+
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        runner.submit_operation(command, lease=lease)
+
+    record = runner.query_operation(command.operation_id)
+    assert record.status is OperationStatus.UNKNOWN
+    assert record.result == "owner outcome unknown"
+    assert runner._operation_leases[command.operation_id] == lease
+    assert command.operation_id not in runner._operation_threads
+
+
 def test_taskrunner_add_is_admitted_with_matching_lease_snapshot():
     runner = taskrunner_class()()
     runner.task_session = "task-a"

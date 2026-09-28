@@ -155,6 +155,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             raise ValueError("ADD requires the GS-resolved Lease snapshot")
 
         launch = False
+        reconciliation_launch = False
         with self._journal_lock:
             if not self._control_ready or self.task_session is None:
                 raise RuntimeError("TaskRunner control plane is not ready")
@@ -172,11 +173,13 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                 self._operation_leases.setdefault(command.operation_id, lease)
 
             snapshot = self._snapshot_record(record)
-            launch = existing is None or (
-                existing.status is OperationStatus.UNKNOWN
+            reconciliation_launch = (
+                existing is not None
+                and existing.status is OperationStatus.UNKNOWN
                 and command.kind in {OperationKind.ADD, OperationKind.RESTORE}
                 and command.operation_id not in self._operation_threads
             )
+            launch = existing is None or reconciliation_launch
 
         if launch:
             try:
@@ -184,12 +187,19 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             except BaseException as exc:
                 with self._journal_lock:
                     self._operation_threads.pop(command.operation_id, None)
-                    self._operation_leases.pop(command.operation_id, None)
-                    self._operation_journal.finish(
-                        command.operation_id,
-                        OperationStatus.FAILED,
-                        f"failed to launch lifecycle worker: {type(exc).__name__}: {exc}",
-                    )
+                    if reconciliation_launch:
+                        # The prior UNKNOWN owner outcome still exists. A local
+                        # thread-launch failure creates no new owner fact and must
+                        # not erase the preserved ADD lease snapshot or rewrite
+                        # the old UNKNOWN into a resolved FAILED result.
+                        pass
+                    else:
+                        self._operation_leases.pop(command.operation_id, None)
+                        self._operation_journal.finish(
+                            command.operation_id,
+                            OperationStatus.FAILED,
+                            f"failed to launch lifecycle worker: {type(exc).__name__}: {exc}",
+                        )
                 raise
         return snapshot
 
