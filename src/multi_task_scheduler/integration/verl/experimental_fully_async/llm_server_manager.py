@@ -482,26 +482,16 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         runtime = self._runtime_inventory.get(key)
         if runtime is None:
             raise RuntimeError("native runtime handle is unavailable for verified sleep")
-        workers = tuple(getattr(runtime, "workers", ()) or ())
-        if not workers:
-            raise RuntimeError("native runtime has no CE workers for placement proof")
-
-        placements = await runtime.worker_placements()
-        gpu_uuids = []
-        for placement in placements:
-            gpu_uuid = placement.get("gpu_uuid")
-            if not isinstance(gpu_uuid, str) or not gpu_uuid:
-                raise RuntimeError("native runtime placement is missing physical GPU UUID")
-            gpu_uuids.append(gpu_uuid)
-        if len(set(gpu_uuids)) != len(gpu_uuids):
-            raise RuntimeError("native runtime placement contains duplicate GPU UUIDs")
+        (placement,) = await runtime.worker_placements()
+        gpu_uuid = placement.get("gpu_uuid")
+        if not isinstance(gpu_uuid, str) or not gpu_uuid:
+            raise RuntimeError("native runtime placement is missing physical GPU UUID")
 
         await runtime.sleep()
-
         evidence = OperationEvidence.now(
             operation_id,
             EvidenceType.RELEASED,
-            released_gpu_uuids=tuple(gpu_uuids),
+            released_gpu_uuids=(gpu_uuid,),
         )
         self._native_release_evidence[operation_id] = (key, evidence)
         return evidence
