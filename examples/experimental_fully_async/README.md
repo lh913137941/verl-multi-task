@@ -35,8 +35,8 @@ DP=1、PP=1、non-PD vLLM；当前真实 GPU 验收仅覆盖 TP=1，因此 TP>1 
 6. 启动两个隔离的训练 job，检查它们发现同一 detached GS；一个正常退出不影响另一个。
 7. GPU 借还、target-only bootstrap、DONATE sleep、RESTORE wake、FORCE targeted abort
    和真实 RELEASED 逐卡核验必须单独做 GPU 验收。当前 level-2 sleep/staged wake、
-   borrowed create/destroy 和 RESTORE 控制面编排已有隔离实现，但 ADD/DONATE/RESTORE/FORCE
-   的 TaskRunner 入口仍 fail-closed；不可把 unit/mock/CPU Ray 测试当成借还闭环完成。
+   borrowed create/destroy、ADD/DONATE/RESTORE/FORCE 控制面编排均已接入 TaskRunner；
+   这些入口可执行不等于真实 GPU 闭环已经验收，不可把 unit/mock/CPU Ray 测试当成借还完成。
 8. 可先运行真实 DONATE primitive 验收（单卡、真实本地模型）：
    ```bash
    VERL_MULTITASK_GPU_MODEL_PATH=/path/to/local/model \
