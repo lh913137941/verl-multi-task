@@ -168,9 +168,15 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                     except BaseException as discard_exc:
                         cleanup_error = discard_exc
                 try:
-                    await lease.guard(
+                    release_evidence = await lease.guard(
                         self.rollouter.finalize_release.remote,
                         operation,
+                    )
+                    _require_evidence(
+                        release_evidence,
+                        operation.operation_id,
+                        EvidenceType.RELEASED,
+                        "ADD rollback release",
                     )
                 except BaseException as release_exc:
                     cleanup_error = release_exc
