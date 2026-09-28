@@ -233,6 +233,31 @@ def test_settled_request_reuse_drops_previous_continuation_proof():
     assert lb.query_attempt("request-1") is AttemptState.ADMITTED
 
 
+def test_failed_settled_request_readmission_preserves_previous_continuation_proof():
+    key = ReplicaKey("task-a", "r0")
+    lb = load_balancer_class()({"s0": object()}, initial_routes={key: "s0"})
+    lb.acquire_server("request-1")
+    lb.begin_drain(key, "op-old")
+    old_evidence = lb.confirm_continuation(
+        "request-1", "client-1", "prefix-old"
+    )
+    lb.finish_remove(key)
+    assert lb.query_attempt("request-1") is AttemptState.SETTLED
+
+    # Model a routing race: native selection still sees s1 while our lifecycle
+    # view has already fenced it as draining. The replacement attempt fails and
+    # therefore must not erase the previous ACK-loss proof.
+    lb.add_servers({"s1": object()})
+    lb.draining_servers.add("s1")
+    with pytest.raises(RuntimeError, match="draining server"):
+        lb.acquire_server("request-1")
+
+    assert lb.query_attempt("request-1") is AttemptState.SETTLED
+    assert lb.confirm_continuation(
+        "request-1", "client-1", "prefix-old"
+    ) == old_evidence
+
+
 def test_lb_commit_ready_is_atomic_and_idempotent():
     key = ReplicaKey("task-a", "borrowed-0")
     handle = object()
