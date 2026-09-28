@@ -1364,6 +1364,7 @@ def replica_class():
         "MultiTaskvLLMReplica",
         Parent,
         ReplicaKind=ReplicaKind,
+        Lease=Lease,
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
         RayClassWithInitArgs=object,
         RayWorkerGroup=object,
@@ -1407,6 +1408,9 @@ def test_borrowed_worker_plan_is_deterministic_and_side_effect_free():
         "claims": [
             {
                 "claim_id": "claim-0",
+                "source_lease_id": "source-lease-0",
+                "donor_task_id": "donor-task",
+                "donor_replica_rank": 0,
                 "rank": 0,
                 "pg_id": "pg",
                 "bundle_index": 4,
@@ -1465,6 +1469,9 @@ def test_borrowed_worker_plan_rejects_donor_topology_or_wrong_identity():
         "claims": [
             {
                 "claim_id": "claim-0",
+                "source_lease_id": "source-lease-0",
+                "donor_task_id": "donor-task",
+                "donor_replica_rank": 0,
                 "rank": 0,
                 "pg_id": "pg",
                 "bundle_index": 0,
@@ -1517,6 +1524,7 @@ def test_worker_gpu_uuid_probe_uses_native_worker_ray_call_context():
         "MultiTaskvLLMReplica",
         object,
         ReplicaKind=ReplicaKind,
+        Lease=Lease,
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
         MultiTaskvLLMHttpServer=object,
         os=__import__("os"),
@@ -1627,6 +1635,7 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
         "MultiTaskvLLMReplica",
         Parent,
         ReplicaKind=ReplicaKind,
+        Lease=Lease,
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
         RayClassWithInitArgs=FakeCIA,
         RayWorkerGroup=FakeWG,
@@ -1635,7 +1644,7 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
         PlacementGroupSchedulingStrategy=object,
         get_master_addr_port=object,
         get_device_name=lambda: "cuda",
-                MultiTaskvLLMHttpServer=object,
+        MultiTaskvLLMHttpServer=object,
         asyncio=asyncio,
         list_actors=lambda **kwargs: [],
         ray=fake_ray,
@@ -1672,6 +1681,9 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
         "claims": [
             {
                 "claim_id": "claim-0",
+                "source_lease_id": "source-lease-0",
+                "donor_task_id": "donor-task",
+                "donor_replica_rank": 0,
                 "rank": 0,
                 "pg_id": "pg",
                 "bundle_index": 2,
@@ -1778,6 +1790,7 @@ def test_init_from_lease_reaches_runtime_ready_only_after_server_health():
         "MultiTaskvLLMReplica",
         Parent,
         ReplicaKind=ReplicaKind,
+        Lease=Lease,
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
         RayClassWithInitArgs=object,
         RayWorkerGroup=object,
@@ -1786,7 +1799,7 @@ def test_init_from_lease_reaches_runtime_ready_only_after_server_health():
         PlacementGroupSchedulingStrategy=object,
         get_master_addr_port=object,
         get_device_name=lambda: "cuda",
-                MultiTaskvLLMHttpServer=object,
+        MultiTaskvLLMHttpServer=object,
         asyncio=asyncio,
         list_actors=lambda **kwargs: [],
         ray=fake_ray,
@@ -1840,6 +1853,9 @@ def test_init_from_lease_reaches_runtime_ready_only_after_server_health():
         "claims": [
             {
                 "claim_id": "claim-0",
+                "source_lease_id": "source-lease-0",
+                "donor_task_id": "donor-task",
+                "donor_replica_rank": 0,
                 "rank": 0,
                 "pg_id": "pg",
                 "bundle_index": 0,
@@ -2387,6 +2403,7 @@ def replica_class():
         object,
         asyncio=asyncio,
         ReplicaKind=ReplicaKind,
+        Lease=Lease,
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
     )
 
