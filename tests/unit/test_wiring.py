@@ -3815,6 +3815,7 @@ def _isolated_group_scheduler_class():
         "RUNTIME_KIND": "test",
         "EvidenceType": EvidenceType,
         "_RELEASE_KINDS": {OperationKind.DONATE, OperationKind.REMOVE},
+        "_IDLE_REPORT_MAX_AGE_S": 10.0,
         "time": time,
         "ray": FakeRay,
     }
@@ -4022,6 +4023,40 @@ def test_group_scheduler_add_release_compensation_unfreezes_claims():
     assert ("pg", 0) not in gs.active_bundle_owner
 
 
+def test_group_scheduler_rejects_stale_or_mismatched_idle_donate_when_report_exists():
+    cls = _isolated_group_scheduler_class()
+    gs = cls()
+    lease = _scheduler_test_lease()
+    gs.open_lease(lease)
+    target = ReplicaKey("task-a", "native-0")
+
+    class Runner:
+        submit_operation = RemoteMethod(
+            lambda command, lease=None: OperationRecord(command.operation_id)
+        )
+
+    gs.task_runners["task-a"] = Runner()
+    gs.idle_reports["task-a"] = {
+        "observed_at": time.monotonic() - 11.0,
+        "candidates": ({"replica_key": target, "kind": ReplicaKind.NATIVE.value},),
+    }
+    with pytest.raises(ValueError, match="idle report is stale"):
+        gs.submit_operation(
+            OperationCommand("op-stale", OperationKind.DONATE, target, lease.lease_id)
+        )
+
+    gs.idle_reports["task-a"] = {
+        "observed_at": time.monotonic(),
+        "candidates": ({
+            "replica_key": ReplicaKey("task-a", "native-1"),
+            "kind": ReplicaKind.NATIVE.value,
+        },),
+    }
+    with pytest.raises(ValueError, match="not a currently reported idle NATIVE"):
+        gs.submit_operation(
+            OperationCommand("op-mismatch", OperationKind.DONATE, target, lease.lease_id)
+        )
+
 def test_group_scheduler_binds_donate_to_lease_donor_rank():
     path = SOURCE / "scheduler/group_scheduler.py"
     tree = ast.parse(path.read_text())
@@ -4036,6 +4071,7 @@ def test_group_scheduler_binds_donate_to_lease_donor_rank():
     )
     env = {
         "ReplicaKey": ReplicaKey,
+        "ReplicaKind": ReplicaKind,
         "ActorHandle": object,
         "Lease": Lease,
         "OperationCommand": OperationCommand,
@@ -4044,6 +4080,8 @@ def test_group_scheduler_binds_donate_to_lease_donor_rank():
         "OperationRecord": OperationRecord,
         "RUNTIME_KIND": "test",
         "EvidenceType": EvidenceType,
+        "_RELEASE_KINDS": {OperationKind.DONATE, OperationKind.REMOVE},
+        "_IDLE_REPORT_MAX_AGE_S": 10.0,
         "time": time,
         "ray": type("Ray", (), {"remote": staticmethod(lambda **kwargs: (lambda cls: cls))}),
     }
@@ -4066,8 +4104,9 @@ def test_group_scheduler_binds_donate_to_lease_donor_rank():
     )
 
     assert cls._target_matches_donor(ReplicaKey("task-a", "native-1"), lease)
-    assert cls._target_matches_donor(ReplicaKey("task-a", "r1"), lease)
+    assert not cls._target_matches_donor(ReplicaKey("task-a", "r1"), lease)
     assert not cls._target_matches_donor(ReplicaKey("task-a", "native-0"), lease)
+    assert not cls._target_matches_donor(ReplicaKey("task-a", "native-1", 1), lease)
 
 def test_group_scheduler_restore_requires_original_donor_and_returned_claims():
     path = SOURCE / "scheduler/group_scheduler.py"
@@ -4090,6 +4129,7 @@ def test_group_scheduler_restore_requires_original_donor_and_returned_claims():
         "RUNTIME_KIND": "test",
         "EvidenceType": EvidenceType,
         "_RELEASE_KINDS": {OperationKind.DONATE, OperationKind.REMOVE},
+        "_IDLE_REPORT_MAX_AGE_S": 10.0,
         "time": time,
         "ray": FakeRay,
     }

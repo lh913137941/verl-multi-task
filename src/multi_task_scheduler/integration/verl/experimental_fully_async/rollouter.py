@@ -139,6 +139,7 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         )
         self._natural_drain_timeout_s = float(timeout_value)
         self._idle_report_signature = None
+        self._idle_report_last_sent = None
         super().__init__(
             config,
             tokenizer,
@@ -235,6 +236,7 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                 continue
             if not getattr(self, "paused", False) or self.group_scheduler is None:
                 self._idle_report_signature = None
+                self._idle_report_last_sent = None
                 continue
 
             candidates = self.collect_idle_candidates()
@@ -242,7 +244,14 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                 (key.task_session, key.replica_id, key.runtime_epoch, kind.value)
                 for key, kind in candidates
             )
-            if not signature or signature == self._idle_report_signature:
+            if not signature:
+                continue
+            now = asyncio.get_running_loop().time()
+            if (
+                signature == self._idle_report_signature
+                and self._idle_report_last_sent is not None
+                and now - self._idle_report_last_sent < 5.0
+            ):
                 continue
             try:
                 await self.submit_idle_report()
@@ -257,6 +266,7 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                 )
             else:
                 self._idle_report_signature = signature
+                self._idle_report_last_sent = now
 
     async def fit(self):
         reporter = asyncio.create_task(self._idle_report_loop())

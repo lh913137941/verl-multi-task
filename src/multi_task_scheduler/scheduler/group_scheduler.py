@@ -21,6 +21,7 @@ from multi_task_scheduler.orchestration.contracts import (
 
 RUNTIME_KIND = "verl-multi-task:experimental_fully_async_standalone:092203-r2"
 _RELEASE_KINDS = {OperationKind.DONATE, OperationKind.REMOVE}
+_IDLE_REPORT_MAX_AGE_S = 10.0
 
 
 @ray.remote(num_cpus=0)
@@ -135,6 +136,19 @@ class GroupScheduler:
 
             donor_task_id = lease.claims[0]["donor_task_id"]
             if command.kind is OperationKind.DONATE:
+                idle_report = self.idle_reports.get(command.target.task_session)
+                if idle_report is not None:
+                    age = time.monotonic() - idle_report["observed_at"]
+                    if age > _IDLE_REPORT_MAX_AGE_S:
+                        raise ValueError("DONATE idle report is stale; wait for a fresh paused-window report")
+                    reported = {
+                        candidate["replica_key"]: ReplicaKind(candidate["kind"])
+                        for candidate in idle_report["candidates"]
+                    }
+                    if reported.get(command.target) is not ReplicaKind.NATIVE:
+                        raise ValueError(
+                            "DONATE target is not a currently reported idle NATIVE replica"
+                        )
                 if history:
                     last_command = self.operation_commands.get(history[-1])
                     if (
@@ -270,8 +284,9 @@ class GroupScheduler:
         """Match first-release donor identity without trusting a handle from GS."""
         claim = lease.claims[0]
         rank = claim["donor_replica_rank"]
-        replica_id = target.replica_id
-        return replica_id in {f"r{rank}", f"native-{rank}"}
+        # Manager and Trainer both register native owner identity as
+        # ReplicaKey(task_session, f"native-{replica_rank}", epoch=0).
+        return target.replica_id == f"native-{rank}" and target.runtime_epoch == 0
 
     def open_lease(self, lease: Lease) -> Lease:
         """GS-internal ledger action; scheduler policy calls this before command issue."""
