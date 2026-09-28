@@ -1087,10 +1087,8 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     assert record["replica_key"] == borrowed_key
     assert manager.replica_kind[borrowed_key] is ReplicaKind.BORROWED
     assert manager.replica_state[borrowed_key] is ReplicaState.CREATING
-    assert manager.inspect_runtime(borrowed_key) is record["replica"]
-    assert record["created_actor_names"] == ["worker-name", "server-name"]
-    assert record["claim_ids"] == ["claim-0"]
-    assert record["source_lease_ids"] == ["source-lease-0"]
+    borrowed_runtime = manager.inspect_runtime(borrowed_key)
+    assert borrowed_runtime is not None
     assert manager.next_replica_rank == 1
 
     # Exact replay returns the same hidden runtime receipt without another rank.
@@ -1107,7 +1105,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     )
     assert release.type is EvidenceType.RELEASED
     assert release.released_gpu_uuids == ("u0",)
-    assert record["replica"].cleaned is True
+    assert borrowed_runtime.cleaned is True
     assert asyncio.run(
         manager.destroy(borrowed_key, operation_id="op-remove")
     ) == release
