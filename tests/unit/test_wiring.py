@@ -5619,6 +5619,76 @@ def test_rollouter_force_timeout_same_op_resumes_without_repeating_abort():
     assert calls.count(("abort_all_requests",)) == 1
 
 
+def test_rollouter_force_abort_ack_loss_recovers_from_full_continuation_proof_without_reabort():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "borrowed-0")
+    rollouter._force_handoff_timeout_s = 0.01
+    calls = []
+    state = {"handoff": False, "unsettled": True}
+
+    rollouter.config = type(
+        "Config",
+        (),
+        {"async_training": type("Async", (), {"partial_rollout": True})()},
+    )()
+
+    class Runtime:
+        async def abort_all_requests(self):
+            calls.append(("abort_all_requests",))
+            raise RuntimeError("abort reply lost")
+
+    class LB:
+        server_for_replica = AsyncRemoteMethod(lambda target: "s0")
+        get_all_servers = AsyncRemoteMethod(lambda: ["s1"])
+        begin_drain = AsyncRemoteMethod(lambda target, operation_id: "s0")
+        requests_for_server = AsyncRemoteMethod(lambda server_id: ("request-1",))
+        query_attempt = AsyncRemoteMethod(lambda request_id: AttemptState.ADMITTED)
+        has_unsettled_requests = AsyncRemoteMethod(
+            lambda server_id: state["unsettled"]
+        )
+        continuation_handoff_requests = AsyncRemoteMethod(
+            lambda operation_id: ("request-1",) if state["handoff"] else ()
+        )
+
+    class Manager:
+        global_load_balancer = LB()
+
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.ACTIVE}
+            self.replica_kind = {key: ReplicaKind.BORROWED}
+
+        def replica_meta(self, target):
+            return self.replica_kind[target], self.replica_state[target]
+
+        def inspect_runtime(self, target):
+            return Runtime()
+
+        def transition_replica(self, target, new_state):
+            self.replica_state[target] = new_state
+
+    manager = Manager()
+    rollouter.llm_server_manager = manager
+
+    with pytest.raises(RuntimeError, match="abort reply lost"):
+        asyncio.run(
+            rollouter.prepare_exit(key, operation_id="op-force-ack-loss", force=True)
+        )
+
+    assert manager.replica_state[key] is ReplicaState.DRAINING
+    assert calls == [("abort_all_requests",)]
+
+    state["handoff"] = True
+    state["unsettled"] = False
+    evidence = asyncio.run(
+        rollouter.prepare_exit(key, operation_id="op-force-ack-loss", force=True)
+    )
+
+    assert evidence.type is EvidenceType.EXIT_READY
+    assert manager.replica_state[key] is ReplicaState.DRAINING
+    assert calls == [("abort_all_requests",)]
+
+
 def test_rollouter_force_rejects_native_before_backend_capability_gate():
     cls = rollouter_class()
     rollouter = cls(object(), object())
