@@ -1900,7 +1900,6 @@ def checkpoint_manager_class(**extra_scope):
         "EvidenceType": EvidenceType,
         "ReplicaKind": ReplicaKind,
         "asyncio": asyncio,
-        "CheckpointEngineWorker": object,
         **extra_scope,
     }
     return isolated(
@@ -2013,6 +2012,9 @@ def test_ce_target_bootstrap_syncs_only_pending_target_and_is_idempotent():
     class Replica:
         replica_kind = ReplicaKind.BORROWED
         workers = ["worker-0"]
+
+        def get_ray_class_with_init_args(self):
+            return object()
 
         async def release_kv_cache(self):
             raise AssertionError("native RESTORE already has KV released after weights-only wake")
