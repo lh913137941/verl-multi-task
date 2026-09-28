@@ -2813,6 +2813,9 @@ def checkpoint_manager_class(**extra_scope):
         "EvidenceType": EvidenceType,
         "ReplicaKind": ReplicaKind,
         "asyncio": asyncio,
+        "hashlib": __import__("hashlib"),
+        "json": __import__("json"),
+        "os": __import__("os"),
         **extra_scope,
     }
     return isolated(
