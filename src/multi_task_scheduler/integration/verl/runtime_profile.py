@@ -157,6 +157,10 @@ def validate_runtime_profile(config) -> bool:
         raise ProfileConfigurationError(
             "first release requires pipeline_model_parallel_size=1"
         )
+    if sizes["tensor_model_parallel_size"] != 1:
+        raise ProfileConfigurationError(
+            "current verified whole-GPU profile requires tensor_model_parallel_size=1"
+        )
 
     for field in ("nnodes", "n_gpus_per_node"):
         value = _select(config, f"rollout.{field}")
@@ -165,10 +169,6 @@ def validate_runtime_profile(config) -> bool:
                 f"Native main must map rollout.{field} before selecting MultiTask"
             )
 
-    if sizes["tensor_model_parallel_size"] > sizes["n_gpus_per_node"]:
-        raise ProfileConfigurationError(
-            "TP replica must fit on the single supported node"
-        )
     return True
 
 
