@@ -14,6 +14,7 @@ from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
 
 from verl.single_controller.ray.base import _unwrap_ray_remote
 from multi_task_scheduler.orchestration.contracts import (
+    AttemptState,
     EvidenceType,
     OperationEvidence,
     OperationRecord,
@@ -321,7 +322,7 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                     request_id
                     for request_id in await lb.requests_for_server.remote(server_id)
                     if await lb.query_attempt.remote(request_id)
-                    is not None
+                    is AttemptState.ADMITTED
                 )
                 abort_result = await runtime.abort_all_requests()
                 if not isinstance(abort_result, dict):
@@ -464,6 +465,12 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                 return evidence
             except BaseException:
                 if manager.replica_state.get(target) is ReplicaState.CREATING:
+                    if activated:
+                        try:
+                            manager.deactivate_service(target)
+                            self._update_max_concurrent_samples()
+                        except BaseException:
+                            pass
                     manager.transition_replica(target, ReplicaState.QUARANTINED)
                 raise
 
