@@ -472,6 +472,61 @@ def test_taskrunner_restore_fails_before_journal_or_worker_launch():
     assert runner._ensure_journal().query("op-restore") is None
 
 
+def test_taskrunner_internal_restore_closes_gs_lease_after_service_commit():
+    runner = taskrunner_class()()
+    runner.task_session = "task-a"
+    runner._control_ready = True
+    key = ReplicaKey("task-a", "native-0")
+    command = OperationCommand(
+        "op-restore-internal",
+        OperationKind.RESTORE,
+        key,
+        "l1",
+    )
+    runner._ensure_journal().begin(command)
+    calls = []
+
+    class Rollouter:
+        prepare_replica = RemoteMethod(
+            lambda target, **kwargs: calls.append(
+                ("prepare_replica", target, kwargs["operation_id"], kwargs["spec"])
+            )
+        )
+
+    class Trainer:
+        restore_and_publish = RemoteMethod(
+            lambda operation: calls.append(
+                ("restore_and_publish", operation.operation_id)
+            )
+            or OperationEvidence(
+                operation.operation_id,
+                EvidenceType.SERVICE_COMMITTED,
+                7,
+            )
+        )
+
+    class GroupScheduler:
+        advance_lease = RemoteMethod(
+            lambda lease_id, evidence: calls.append(
+                ("advance_lease", lease_id, evidence.type)
+            )
+            or {"restored": True}
+        )
+
+    runner.components = {"rollouter": Rollouter(), "trainer": Trainer()}
+    runner.group_scheduler = GroupScheduler()
+    runner._execute_operation("op-restore-internal")
+
+    record = runner.query_operation("op-restore-internal")
+    assert record.status is OperationStatus.SUCCEEDED
+    assert record.result == EvidenceType.SERVICE_COMMITTED.value
+    assert calls == [
+        ("prepare_replica", key, "op-restore-internal", None),
+        ("restore_and_publish", "op-restore-internal"),
+        ("advance_lease", "l1", EvidenceType.SERVICE_COMMITTED),
+    ]
+
+
 def test_taskrunner_borrowed_spec_rebuilds_rank_view_from_claim_order():
     command = OperationCommand(
         "op-rank",
@@ -2613,6 +2668,50 @@ def test_group_scheduler_restore_requires_original_donor_and_returned_claims():
     assert gs.operation_commands["op-restore"].target == ReplicaKey(
         "task-a", "native-0"
     )
+    assert gs.active_gpu_owner["u0"] == "l1"
+    assert gs.active_bundle_owner[("pg", 0)] == "l1"
+
+    restore_evidence = OperationEvidence(
+        "op-restore",
+        EvidenceType.SERVICE_COMMITTED,
+        9,
+    )
+    result = gs.advance_lease("l1", restore_evidence)
+    assert result == {
+        "lease_id": "l1",
+        "operation_id": "op-restore",
+        "restored": True,
+    }
+    assert gs.advance_lease("l1", restore_evidence) == result
+    assert "u0" not in gs.active_gpu_owner
+    assert ("pg", 0) not in gs.active_bundle_owner
+
+    with pytest.raises(ValueError, match="lifecycle is complete"):
+        gs.submit_operation(
+            OperationCommand(
+                "op-reuse-old-lease",
+                OperationKind.DONATE,
+                ReplicaKey("task-a", "native-0"),
+                "l1",
+            )
+        )
+
+    next_lease = Lease(
+        "l2",
+        ({
+            "claim_id": "claim-2",
+            "source_lease_id": "source-2",
+            "donor_task_id": "task-a",
+            "donor_replica_rank": 0,
+            "pg_id": "pg",
+            "bundle_index": 0,
+            "node_id": "n0",
+            "gpu_uuid": "u0",
+            "gpu_fraction": 0.5,
+            "cpu_request": 1.0,
+        },),
+    )
+    assert gs.open_lease(next_lease) == next_lease
 
 
 def rollouter_class():
