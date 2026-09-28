@@ -399,8 +399,8 @@ def _training_sender_class():
 def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
     """Two-GPU acceptance for the current-Vpub RESTORE data path.
 
-    GPU 0 hosts a real FSDP TrainingWorker/NCCL sender. GPU 1 hosts the retained
-    STANDALONE vLLM replica. The receiver is level-2 slept first, so its weights
+    One GPU hosts a real FSDP TrainingWorker/NCCL sender and another hosts the
+    retained STANDALONE vLLM replica. The receiver is level-2 slept first, so its weights
     must be reconstructed by the checkpoint-engine transfer before final wake.
     """
 
@@ -601,12 +601,7 @@ def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
             )
         )
         assert weight_ready.type is EvidenceType.WEIGHT_READY
-        checkpoint_manager.commit_pending(
-            key,
-            weight_ready,
-            loaded_version=17,
-        )
-        assert checkpoint_manager.effective_replicas[key][1] == 17
+        assert key not in checkpoint_manager.effective_replicas
 
         # bootstrap_target has restored KV memory, but the local admission gate
         # must remain closed until the explicit final wake commits service.
@@ -630,6 +625,13 @@ def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
         )
         health = asyncio.run(replica.validate_server_runtime())
         assert health["global_steps"] == 17
+
+        checkpoint_manager.commit_pending(
+            key,
+            weight_ready,
+            loaded_version=17,
+        )
+        assert checkpoint_manager.effective_replicas[key][1] == 17
 
         restored = ray.get(parked_ref, timeout=120)
         assert getattr(restored, "token_ids", None)
