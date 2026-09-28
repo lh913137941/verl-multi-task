@@ -44,7 +44,6 @@ class MultiTaskvLLMReplica(vLLMReplica):
                 "first release requires max_colocate_count="
                 f"{FIRST_RELEASE_MAX_COLOCATE_COUNT}"
             )
-        self.max_colocate_count = max_colocate_count
         super().__init__(*args, **kwargs)
         self.server_class = ray.remote(MultiTaskvLLMHttpServer)
 
