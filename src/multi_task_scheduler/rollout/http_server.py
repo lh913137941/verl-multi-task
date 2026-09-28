@@ -128,7 +128,20 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
                 "sleeping": True,
                 "global_steps": self.global_steps,
             }
-        if stage != "awake":
+        if stage == "weights":
+            # RESTORE rollback: weights may be resident while KV is still
+            # absent (engine sleeping) or CE may already have restored KV
+            # (engine awake).  Keep admission fenced, make the engine fully
+            # resident if needed, then enter a fresh proven level-2 sleep.
+            self._submission_paused = True
+            self._resume_event.clear()
+            if await engine.is_sleeping():
+                await engine.wake_up(tags=["kv_cache"])
+                if await engine.is_sleeping():
+                    raise RuntimeError(
+                        "RESTORE rollback could not restore KV before deep sleep"
+                    )
+        elif stage != "awake":
             raise RuntimeError(
                 f"cannot enter level-2 sleep from partial stage {stage!r}"
             )
@@ -240,6 +253,26 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
             # issuing another sleep/wake cycle.
             return {"kv_cache_released": True, "already_sleeping": True}
         return await super().release_kv_cache()
+
+    async def resume_kv_cache(self):
+        """Restore KV after a weights-only RESTORE while keeping admission closed."""
+        if self.node_rank != 0 or not getattr(self.config, "free_cache_engine", False):
+            return None
+        engine = self._require_sleep_engine()
+        if self._multitask_sleep_stage() == "weights":
+            self._submission_paused = True
+            self._resume_event.clear()
+            if await engine.is_sleeping():
+                await engine.wake_up(tags=["kv_cache"])
+            if await engine.is_sleeping():
+                raise RuntimeError("KV resume did not make RESTORE runtime resident")
+            await engine.reset_prefix_cache(reset_connector=True)
+            return {
+                "kv_cache_resumed": True,
+                "admission_paused": True,
+                "global_steps": self.global_steps,
+            }
+        return await super().resume_kv_cache()
 
     async def wake_weights(self) -> dict:
         """Allocate weight memory only; parameters must be refreshed before full wake."""
