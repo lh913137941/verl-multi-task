@@ -1,6 +1,6 @@
 # Simplified fusion contract (092203 with 092303 parameter-sync clarification)
 
-Current first release: experimental Fully Async, pure STANDALONE, non-PD vLLM, single-node whole-GPU lending, DP=1, PP=1 and verified TP only. Physical whole-GPU exclusivity is enforced by GS ownership of the PG bundle/GPU UUID, not by Ray's fractional actor accounting. The first release fixes `max_colocate_count=2`, so each donor/borrower CE actor requests `gpu_fraction=0.5` and one CPU from a bundle; this accounting share does not authorize fractional physical-GPU lending. Native replicas keep their runtime across DONATE/RESTORE; borrowed replicas create an independent borrower runtime and are destroyed on REMOVE. Unverified GPU primitives must raise `NotImplementedError`.
+Current first release: experimental Fully Async, pure STANDALONE, non-PD vLLM, single-node whole-GPU lending, DP=1, PP=1 and currently verified TP=1 only. Physical whole-GPU exclusivity is enforced by GS ownership of the PG bundle/GPU UUID, not by Ray's fractional actor accounting. The first release fixes `max_colocate_count=2`, so each donor/borrower CE actor requests `gpu_fraction=0.5` and one CPU from a bundle; this accounting share does not authorize fractional physical-GPU lending. Native replicas keep their runtime across DONATE/RESTORE; borrowed replicas create an independent borrower runtime and are destroyed on REMOVE. Unverified GPU primitives must raise `NotImplementedError`.
 
 ## Ownership
 
