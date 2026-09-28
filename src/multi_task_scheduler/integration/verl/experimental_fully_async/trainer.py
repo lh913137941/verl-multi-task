@@ -262,10 +262,10 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
     async def restore_and_publish(self, operation: OperationRecord) -> OperationEvidence:
         """Restore current Vpub into one parked native runtime and republish it.
 
-        TaskRunner admission remains fail-closed until this path is validated on
-        the real CUDA/vLLM backend.  This method intentionally reuses the
-        existing CE pending/bootstrap state instead of introducing RESTORE-only
-        interfaces or lifecycle DTOs.
+        This method reuses the existing CE pending/bootstrap state instead of
+        introducing RESTORE-only interfaces or lifecycle DTOs. Runtime success
+        is still evidence-driven: unsupported or unverifiable GPU behavior fails
+        the operation instead of synthesizing service success.
         """
         if not isinstance(operation, OperationRecord):
             raise TypeError("restore_and_publish requires OperationRecord")
