@@ -203,13 +203,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         actor_wg = self.actor_wg
         topology_started = False
         finalized = False
-        native_restore = False
-        native_wake_started = False
-
-        replica_kinds = {
-            getattr(replica, "replica_kind", None)
-            for replica in replicas
-        }
+        replica_kinds = {getattr(replica, "replica_kind", None) for replica in replicas}
         if len(replica_kinds) != 1:
             raise ValueError("pending target contains inconsistent replica kinds")
         replica_kind = next(iter(replica_kinds))
@@ -221,7 +215,6 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             # Native RESTORE allocates only weight memory under the same G that
             # serializes parameter publication. ADD targets are already resident.
             if native_restore:
-                native_wake_started = True
                 await asyncio.gather(
                     *[replica.wake_up(tags=["weights"]) for replica in replicas]
                 )
@@ -292,7 +285,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             # A failed native RESTORE must not escape with a partially awake
             # retained runtime.  Re-enter proven level-2 sleep while G is still
             # held; server admission never opens on this path.
-            if native_restore and native_wake_started:
+            if native_restore:
                 try:
                     receipts = await asyncio.gather(
                         *[replica.sleep() for replica in replicas]
