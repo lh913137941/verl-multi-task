@@ -288,16 +288,72 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                 raise ValueError(
                     f"FORCE prepare_exit requires ACTIVE replica, got {state.value}"
                 )
+            async_training = getattr(self.config, "async_training", None)
+            if not bool(getattr(async_training, "partial_rollout", False)):
+                raise ValueError("FORCE REMOVE requires async_training.partial_rollout=true")
 
-            # FORCE reclaim is a first-release requirement, but this branch has
-            # not completed the required native/GPU targeted-abort + continuation
-            # validation.  Configuration and control-plane wiring are not proof
-            # that an in-flight request can be handed off safely.  Fail before
-            # changing M/R or aborting requests so an unsupported FORCE attempt
-            # cannot create a partially-drained replica.
-            raise NotImplementedError(
-                "FORCE REMOVE requires verified targeted abort/continuation backend"
-            )
+            server_id = await lb.server_for_replica.remote(replica_key)
+            if not isinstance(server_id, str) or not server_id:
+                raise RuntimeError("FORCE target has no active route")
+            active_servers = tuple(await lb.get_all_servers.remote())
+            if not any(candidate != server_id for candidate in active_servers):
+                raise RuntimeError("FORCE REMOVE requires another active rollout server")
+
+            runtime = manager.inspect_runtime(replica_key)
+            if runtime is None:
+                raise RuntimeError("FORCE target runtime is unavailable")
+
+            manager.transition_replica(replica_key, ReplicaState.DRAINING)
+            self._pending_operation_targets[operation_id] = replica_key
+            try:
+                try:
+                    drained_server = await lb.begin_drain.remote(
+                        replica_key, operation_id
+                    )
+                except BaseException:
+                    drained_server = await lb.begin_drain.remote(
+                        replica_key, operation_id
+                    )
+                if drained_server != server_id:
+                    raise RuntimeError("FORCE drain bound a different server")
+
+                admitted = tuple(
+                    request_id
+                    for request_id in await lb.requests_for_server.remote(server_id)
+                    if await lb.query_attempt.remote(request_id)
+                    is not None
+                )
+                abort_result = await runtime.abort_all_requests()
+                if not isinstance(abort_result, dict):
+                    raise TypeError("FORCE abort returned a non-dict result")
+                aborted_count = abort_result.get("aborted_count")
+                if type(aborted_count) is not int or aborted_count < 0:
+                    raise RuntimeError("FORCE abort did not report aborted_count")
+                if aborted_count > len(admitted):
+                    raise RuntimeError(
+                        "FORCE abort count exceeds LB requests owned by target"
+                    )
+
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 30.0
+                while True:
+                    handoffs = set(
+                        await lb.continuation_handoff_requests.remote(operation_id)
+                    )
+                    unsettled = await lb.has_unsettled_requests.remote(server_id)
+                    if not unsettled and len(handoffs.intersection(admitted)) >= aborted_count:
+                        break
+                    if loop.time() >= deadline:
+                        raise TimeoutError(
+                            "FORCE continuation handoff did not complete before timeout"
+                        )
+                    await asyncio.sleep(0.05)
+
+                return OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
+            except BaseException:
+                if manager.replica_state.get(replica_key) is ReplicaState.DRAINING:
+                    manager.transition_replica(replica_key, ReplicaState.QUARANTINED)
+                raise
 
         if state not in {ReplicaState.ACTIVE, ReplicaState.DRAINING}:
             raise ValueError(
