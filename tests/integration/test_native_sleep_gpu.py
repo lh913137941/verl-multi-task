@@ -447,6 +447,23 @@ def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
             loaded_version=17,
         )
         assert checkpoint_manager.effective_replicas[key][1] == 17
+        assert ray.get(
+            replica.servers[0]._multitask_sleep_stage.remote()
+        ) == "weights"
+
+        # bootstrap_target has restored KV memory, but the local admission gate
+        # must remain closed until the explicit final wake commits service.
+        parked_ref = replica._server_handle.generate.remote(
+            request_id=f"parked-before-final-wake-{uuid4().hex}",
+            prompt_ids=prompt_ids,
+            sampling_params={
+                "temperature": 0.0,
+                "max_tokens": 16,
+            },
+            image_data=None,
+        )
+        ready, _pending = ray.wait([parked_ref], timeout=1.0)
+        assert ready == []
 
         wake_receipts = asyncio.run(replica.wake_up())
         assert all(
@@ -457,7 +474,7 @@ def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
         health = asyncio.run(replica.validate_server_runtime())
         assert health["global_steps"] == 17
 
-        restored = generate_once("after-restore")
+        restored = ray.get(parked_ref, timeout=120)
         assert getattr(restored, "token_ids", None)
         assert restored.token_ids == baseline.token_ids
     finally:
