@@ -30,6 +30,11 @@ def test_replica_selects_multitask_checkpoint_worker_without_importing_verl():
         if isinstance(node, ast.ClassDef) and node.name == "MultiTaskCheckpointEngineWorker"
     )
     assert any(isinstance(base, ast.Name) and base.id == "CheckpointEngineWorker" for base in worker.bases)
+    worker_methods = {
+        node.name for node in worker.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert {"update_weights", "get_parameter_manifest"} <= worker_methods
 
     replica_path = ROOT / "src/multi_task_scheduler/rollout/replica.py"
     replica_tree = ast.parse(replica_path.read_text(encoding="utf-8"))

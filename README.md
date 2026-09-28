@@ -167,11 +167,11 @@ python -m pytest -q -s -m gpu_integration tests/integration/test_native_sleep_gp
 ## verl_expansion 融合来源
 
 融合分支 `chatgpt/0928-merge-verl-expansion` 基于当前 simplified-fusion 代码，
-吸收 `ZiqiGuan892/verl_expansion` 的 `D2` 分支（来源提交
-`ba920fd5f110bbf76811817a61f17411c7fd2dce`）。
+吸收 `ZiqiGuan892/verl_expansion` 的 `main` 分支（来源提交
+`761bd6ddc296f7170ade3489ba9fbc8c8c04db62`，包含此前 D2 基线 `ba920fd5f110bbf76811817a61f17411c7fd2dce`）。
 
 生产路径只合入与当前合同兼容的能力：Ray ActorClass 解包兼容层、
-`MultiTaskCheckpointEngineWorker` 扩展选择以及 GPU baseline 验收资产。
+`MultiTaskCheckpointEngineWorker` 扩展选择、可选逐参数 receiver manifest、独立 `multitask_hccl` backend 模块，以及 GPU baseline 验收资产。
 源仓的多 source lease、多 TP/多节点 borrowed runtime、Ascend/NPU 启动脚本和旧 reclaim wire
 没有直接覆盖当前 Lease/OperationEvidence/ReplicaSyncGate/异常恢复实现。
 
