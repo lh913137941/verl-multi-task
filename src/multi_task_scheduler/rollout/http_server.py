@@ -273,21 +273,16 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         return await super().release_kv_cache()
 
     async def resume_kv_cache(self):
-        """Restore KV after a weights-only RESTORE while keeping admission closed."""
-        if self.node_rank != 0 or not getattr(self.config, "free_cache_engine", False):
-            return None
-        engine = self._require_sleep_engine()
-        if self._multitask_sleep_stage() == "weights":
-            self._submission_paused = True
-            self._resume_event.clear()
-            if await engine.is_sleeping():
-                await engine.wake_up(tags=["kv_cache"])
-            if await engine.is_sleeping():
-                raise RuntimeError("KV resume did not make RESTORE runtime resident")
-            await engine.reset_prefix_cache(reset_connector=True)
-            return {
-                "kv_cache_resumed": True,
-                "admission_paused": True,
-                "global_steps": self.global_steps,
-            }
-        return await super().resume_kv_cache()
+        """Reuse VERL KV restore while keeping RESTORE admission fenced."""
+        if self._multitask_sleep_stage() != "weights":
+            return await super().resume_kv_cache()
+        self._submission_paused = True
+        self._resume_event.clear()
+        await super().resume_kv_cache()
+        if await self._require_sleep_engine().is_sleeping():
+            raise RuntimeError("KV resume did not make RESTORE runtime resident")
+        return {
+            "kv_cache_resumed": True,
+            "admission_paused": True,
+            "global_steps": self.global_steps,
+        }
