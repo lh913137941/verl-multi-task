@@ -22,9 +22,22 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         self.routes: dict[ReplicaKey, str] = {}
         self.active_request_server: dict[str, str] = {}
         self.attempt_state: dict[str, AttemptState] = {}
-        self.draining_servers: set[str] = set()
         self.draining_operations: dict[str, str] = {}
         self.ready_operations: dict[str, tuple[ReplicaKey, str, OperationEvidence]] = {}
+        # request_id -> (client_id, prefix_digest, operation_id, evidence).
+        # This remains LB-internal request truth: exact retries are idempotent,
+        # while a different client/prefix cannot overwrite an accepted handoff.
+        self.continuation_proofs: dict[
+            str, tuple[str, str, str, OperationEvidence]
+        ] = {}
+        # operation_id -> logical request ids whose aborted prefix was observed
+        # by the continuation-aware FullyAsync client. Unlike per-attempt proof,
+        # this survives immediate re-admission on another server until removal
+        # commits, so FORCE can verify handoff even after the retry has started.
+        self.continuation_handoffs: dict[str, set[str]] = {}
+        # Keep enough SETTLED history for ACK-loss queries without allowing
+        # request facts to grow for the entire task lifetime.
+        self._settled_retention = 10_000
         for key, server_id in dict(initial_routes or {}).items():
             if not isinstance(key, ReplicaKey):
                 raise TypeError("initial route key must be ReplicaKey")
@@ -35,17 +48,32 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
     def require_release_fields(self) -> list[str]:
         return ["request_id"]
 
-    def _is_draining_server(self, server_id: str) -> bool:
-        return server_id in self.draining_servers
+    def _gc_settled_requests(self) -> None:
+        overflow = len(self.attempt_state) - self._settled_retention
+        if overflow <= 0:
+            return
+        for request_id, state in tuple(self.attempt_state.items()):
+            if overflow <= 0:
+                break
+            if (
+                state is AttemptState.SETTLED
+                and request_id not in self.active_request_server
+            ):
+                self.attempt_state.pop(request_id, None)
+                self.continuation_proofs.pop(request_id, None)
+                overflow -= 1
 
     def acquire_server(self, request_id: str, **extra):
         state = self.attempt_state.get(request_id)
         if state in {AttemptState.ADMITTED, AttemptState.TERMINATED}:
             raise RuntimeError("request already has an unsettled generation")
+
         server_id, handle = super().acquire_server(request_id, **extra)
-        if self._is_draining_server(server_id):
-            super().release_server(server_id, request_id=request_id)
-            raise RuntimeError("draining server cannot accept new requests")
+        if state is AttemptState.SETTLED:
+            # Only a successfully admitted replacement attempt invalidates the
+            # previous ACK-loss continuation proof. A failed acquire must leave
+            # the settled attempt queryable exactly as it was.
+            self.continuation_proofs.pop(request_id, None)
         self.active_request_server[request_id] = server_id
         self.attempt_state[request_id] = AttemptState.ADMITTED
         return server_id, handle
@@ -62,6 +90,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         if request_id and state in {AttemptState.ADMITTED, AttemptState.TERMINATED}:
             self.attempt_state[request_id] = AttemptState.SETTLED
             self.active_request_server.pop(request_id, None)
+            self._gc_settled_requests()
 
     def query_attempt(self, request_id: str):
         return self.attempt_state.get(request_id)
@@ -70,14 +99,36 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
                              prefix_digest: str) -> OperationEvidence:
         if not request_id or not client_id or not prefix_digest:
             raise ValueError("continuation fields must be nonempty")
+
+        previous = self.continuation_proofs.get(request_id)
+        if previous is not None:
+            previous_client, previous_digest, _operation_id, evidence = previous
+            if previous_client != client_id or previous_digest != prefix_digest:
+                raise ValueError("conflicting continuation proof replay")
+            return evidence
+
         if self.attempt_state.get(request_id) is not AttemptState.ADMITTED:
             raise ValueError("request is not eligible for continuation")
         server_id = self.active_request_server.get(request_id)
         operation_id = self.draining_operations.get(server_id)
         if operation_id is None:
-            raise ValueError("request is not part of an active drain operation")
+            raise KeyError("request is not part of an active drain operation")
+
+        evidence = OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
+        self.continuation_proofs[request_id] = (
+            client_id,
+            prefix_digest,
+            operation_id,
+            evidence,
+        )
+        self.continuation_handoffs.setdefault(operation_id, set()).add(request_id)
         self.attempt_state[request_id] = AttemptState.TERMINATED
-        return OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
+        return evidence
+
+    def continuation_handoff_requests(self, operation_id: str) -> tuple[str, ...]:
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("operation_id must be a nonempty string")
+        return tuple(sorted(self.continuation_handoffs.get(operation_id, ())))
 
     def requests_for_server(self, server_id: str) -> tuple[str, ...]:
         return tuple(r for r, s in self.active_request_server.items() if s == server_id)
@@ -100,6 +151,8 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             raise ValueError("commit_ready requires nonempty server_id")
         if not isinstance(operation_id, str) or not operation_id:
             raise ValueError("commit_ready requires nonempty operation_id")
+        if server_handle is None:
+            raise ValueError("commit_ready requires server_handle")
 
         previous = self.ready_operations.get(operation_id)
         if previous is not None:
@@ -113,6 +166,9 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         existing_route = self.routes.get(key)
         if existing_route is not None and existing_route != server_id:
             raise ValueError("ReplicaKey already routes to another server")
+        existing_handle = self._servers.get(server_id)
+        if existing_handle is not None and existing_handle != server_handle:
+            raise ValueError("server_id is already bound to another handle")
         for existing_operation, (existing_key, existing_server, _evidence) in self.ready_operations.items():
             if existing_key == key and existing_operation != operation_id:
                 raise ValueError("ReplicaKey was published by another operation")
@@ -158,10 +214,8 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         existing = self.draining_operations.get(server_id)
         if existing is not None and existing != operation_id:
             raise ValueError("server is already draining under another operation")
-        self.draining_servers.add(server_id)
         self.draining_operations[server_id] = operation_id
-        if server_id in self._servers:
-            self.remove_servers([server_id])
+        self.remove_servers([server_id])
         return server_id
 
     def finish_remove(self, key: ReplicaKey):
@@ -178,10 +232,11 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
                 self.attempt_state[request_id] = AttemptState.SETTLED
                 self.active_request_server.pop(request_id, None)
 
-        if server_id in self._servers:
-            self.remove_servers([server_id])
-        self.draining_servers.discard(server_id)
-        self.draining_operations.pop(server_id, None)
+        self.remove_servers([server_id])
+        operation_id = self.draining_operations.pop(server_id, None)
+        if operation_id is not None:
+            self.continuation_handoffs.pop(operation_id, None)
+        self._gc_settled_requests()
         self.routes.pop(key, None)
         for operation_id, (ready_key, _server_id, _evidence) in tuple(
             self.ready_operations.items()
@@ -189,8 +244,3 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             if ready_key == key:
                 self.ready_operations.pop(operation_id, None)
 
-    def gc_settled_requests(self, request_ids):
-        for request_id in request_ids:
-            if self.attempt_state.get(request_id) is AttemptState.SETTLED:
-                self.attempt_state.pop(request_id, None)
-                self.active_request_server.pop(request_id, None)

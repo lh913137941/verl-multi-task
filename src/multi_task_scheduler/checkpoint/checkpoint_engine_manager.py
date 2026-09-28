@@ -6,55 +6,38 @@ import asyncio
 
 import ray
 from verl.checkpoint_engine.base import CheckpointEngineManager
-from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
-
-from multi_task_scheduler.checkpoint.checkpoint_engine_worker import (
-    MultiTaskCheckpointEngineWorker,
-)
+from verl.single_controller.ray import RayWorkerGroup
 
 from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
     OperationEvidence,
     ReplicaKey,
+    ReplicaKind,
 )
 
 
 class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
     """Keep only effective receiver membership as CE-owned mutable truth."""
 
-    def _members(self) -> dict:
-        if not hasattr(self, "_effective_replica_map"):
-            self._effective_replica_map = {}
-        return self._effective_replica_map
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._effective_replica_map = {}
+        self._pending_bootstrap_map = {}
+        self._bootstrap_ready_map = {}
 
     @property
     def effective_replicas(self) -> dict:
-        return self._members()
-
-    def _pending_members(self) -> dict:
-        if not hasattr(self, "_pending_bootstrap_map"):
-            self._pending_bootstrap_map = {}
-        return self._pending_bootstrap_map
-
-    def _bootstrap_commits(self) -> dict:
-        if not hasattr(self, "_bootstrap_commit_map"):
-            self._bootstrap_commit_map = {}
-        return self._bootstrap_commit_map
-
-    def _bootstrap_ready(self) -> dict:
-        if not hasattr(self, "_bootstrap_ready_map"):
-            self._bootstrap_ready_map = {}
-        return self._bootstrap_ready_map
+        return self._effective_replica_map
 
     @property
     def pending_bootstrap(self) -> dict:
-        return self._pending_members()
+        return self._pending_bootstrap_map
 
     def _validate_runtime_membership(self, key: ReplicaKey, replicas: tuple) -> None:
         for index, replica in enumerate(replicas):
             if replica in replicas[:index]:
                 raise ValueError("duplicate runtime in CE membership")
-        for entries in (self._members(), self._pending_members()):
+        for entries in (self._effective_replica_map, self._pending_bootstrap_map):
             for other_key, (other_replicas, _) in entries.items():
                 if other_key != key and any(r in other_replicas for r in replicas):
                     raise ValueError("runtime already belongs to another ReplicaKey")
@@ -76,14 +59,15 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             raise ValueError("pending bootstrap requires at least one replica")
         self._validate_runtime_membership(key, replicas)
 
-        effective = self._members().get(key)
+        effective = self._effective_replica_map.get(key)
         if effective is not None:
-            if effective[0] == replicas and self._bootstrap_commits().get(key) == operation_id:
+            ready = self._bootstrap_ready_map.get(key)
+            if effective[0] == replicas and ready is not None and ready[0] == operation_id:
                 return
             raise ValueError("ReplicaKey is already an effective CE member")
 
         entry = (replicas, operation_id)
-        existing = self._pending_members().get(key)
+        existing = self._pending_bootstrap_map.get(key)
         if existing is not None:
             if existing != entry:
                 raise ValueError("ReplicaKey already has conflicting pending bootstrap")
@@ -93,7 +77,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         # Pending borrowed runtimes stay out until WEIGHT_READY is committed.
         if any(replica in self.replicas for replica in replicas):
             raise ValueError("pending replica is already part of native effective membership")
-        self._pending_members()[key] = entry
+        self._pending_bootstrap_map[key] = entry
 
     def commit_pending(
         self,
@@ -110,34 +94,30 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         if type(loaded_version) is not int or loaded_version < 0:
             raise ValueError("loaded_version must be a nonnegative integer")
 
-        existing_commit = self._bootstrap_commits().get(key)
-        if existing_commit is not None:
-            if existing_commit != evidence.operation_id:
-                raise ValueError("ReplicaKey bootstrap was committed by another operation")
-            confirmed = self._bootstrap_ready().get(key)
+        confirmed = self._bootstrap_ready_map.get(key)
+        member = self._effective_replica_map.get(key)
+        if key not in self._pending_bootstrap_map and confirmed is not None and member is not None:
             if confirmed != (evidence.operation_id, loaded_version, evidence):
                 raise ValueError("WEIGHT_READY does not match confirmed bootstrap")
-            member = self._members().get(key)
-            if member is None or member[1] != loaded_version:
+            if member[1] != loaded_version:
                 raise ValueError("conflicting bootstrap commit replay")
             return
 
         try:
-            replicas, operation_id = self._pending_members()[key]
+            replicas, operation_id = self._pending_bootstrap_map[key]
         except KeyError as exc:
             raise KeyError(f"no pending bootstrap for {key!r}") from exc
         if operation_id != evidence.operation_id:
             raise ValueError("WEIGHT_READY evidence belongs to another operation")
-        if self._bootstrap_ready().get(key) != (operation_id, loaded_version, evidence):
+        if self._bootstrap_ready_map.get(key) != (operation_id, loaded_version, evidence):
             raise ValueError("WEIGHT_READY does not match confirmed bootstrap")
 
         self.add_effective(key, replicas, loaded_version=loaded_version)
-        self._pending_members().pop(key, None)
-        self._bootstrap_commits()[key] = operation_id
+        self._pending_bootstrap_map.pop(key, None)
 
     def discard_pending(self, key: ReplicaKey) -> None:
-        self._pending_members().pop(key, None)
-        self._bootstrap_ready().pop(key, None)
+        self._pending_bootstrap_map.pop(key, None)
+        self._bootstrap_ready_map.pop(key, None)
 
     def add_effective(self, key: ReplicaKey, replicas, *, loaded_version: int) -> None:
         if not isinstance(key, ReplicaKey):
@@ -150,19 +130,18 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             raise ValueError("effective membership requires at least one replica")
         self._validate_runtime_membership(key, replicas)
         entry = (replicas, loaded_version)
-        existing = self._members().get(key)
+        existing = self._effective_replica_map.get(key)
         if existing is not None and existing != entry:
             raise ValueError("ReplicaKey already has conflicting CE membership")
 
-        for replica in replicas:
-            if replica not in self.replicas:
-                self.replicas.append(replica)
-        self._members()[key] = entry
+        super().add_replicas(
+            [replica for replica in replicas if replica not in self.replicas]
+        )
+        self._effective_replica_map[key] = entry
 
     def remove_effective(self, key: ReplicaKey) -> None:
         self.discard_pending(key)
-        self._bootstrap_commits().pop(key, None)
-        entry = self._members().pop(key, None)
+        entry = self._effective_replica_map.pop(key, None)
         if entry is None:
             return
         replicas, _loaded_version = entry
@@ -171,21 +150,8 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
     def mark_all_loaded_version(self, loaded_version: int) -> None:
         if type(loaded_version) is not int or loaded_version < 0:
             raise ValueError("loaded_version must be a nonnegative integer")
-        for key, (replicas, _old_version) in tuple(self._members().items()):
-            self._members()[key] = (replicas, loaded_version)
-
-    def mark_loaded_version(self, key: ReplicaKey, loaded_version: int) -> None:
-        """Advance one CE member after a target-only WEIGHT_READY commit."""
-        if not isinstance(key, ReplicaKey):
-            raise TypeError("key must be ReplicaKey")
-        if type(loaded_version) is not int or loaded_version < 0:
-            raise ValueError("loaded_version must be a nonnegative integer")
-        try:
-            replicas, _old_version = self._members()[key]
-        except KeyError as exc:
-            raise KeyError(f"unknown effective replica {key!r}") from exc
-        self._members()[key] = (replicas, loaded_version)
-
+        for key, (replicas, _old_version) in tuple(self._effective_replica_map.items()):
+            self._effective_replica_map[key] = (replicas, loaded_version)
 
     async def bootstrap_target(
         self,
@@ -206,7 +172,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                 "first-release target-only bootstrap requires non-naive checkpoint engine"
             )
 
-        ready = self._bootstrap_ready().get(key)
+        ready = self._bootstrap_ready_map.get(key)
         if ready is not None:
             ready_operation, ready_version, evidence = ready
             if ready_operation != operation_id or ready_version != loaded_version:
@@ -214,39 +180,76 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             return evidence
 
         try:
-            replicas, pending_operation = self._pending_members()[key]
+            replicas, pending_operation = self._pending_bootstrap_map[key]
         except KeyError as exc:
             raise KeyError(f"no pending bootstrap for {key!r}") from exc
         if pending_operation != operation_id:
             raise ValueError("pending target belongs to another operation")
 
-        workers = []
-        for replica in replicas:
-            workers.extend(replica.workers)
+        workers = [worker for replica in replicas for worker in replica.workers]
         if not workers:
             raise ValueError("pending target has no checkpoint-engine workers")
 
         rollout = RayWorkerGroup.from_detached(
             worker_handles=workers,
-            ray_cls_with_init=RayClassWithInitArgs(
-                cls=ray.remote(MultiTaskCheckpointEngineWorker)
-            ),
+            ray_cls_with_init=replicas[0].get_ray_class_with_init_args(),
             name_prefix=f"bootstrap_{operation_id}_",
             use_gpu=True,
         )
         actor_wg = self.actor_wg
         topology_started = False
         finalized = False
+        replica_kinds = {getattr(replica, "replica_kind", None) for replica in replicas}
+        if len(replica_kinds) != 1:
+            raise ValueError("pending target contains inconsistent replica kinds")
+        replica_kind = next(iter(replica_kinds))
+        if replica_kind not in {ReplicaKind.NATIVE, ReplicaKind.BORROWED}:
+            raise ValueError("pending target has unsupported replica kind")
+        native_restore = replica_kind is ReplicaKind.NATIVE
+        released_gpu_uuids: tuple[str, ...] = ()
 
         try:
-            # Target is hidden, so active replicas must not be aborted or touched.
-            await asyncio.gather(
-                *[replica.release_kv_cache() for replica in replicas]
-            )
+            # Native RESTORE allocates only weight memory under the same G that
+            # serializes parameter publication. ADD targets are already resident.
+            if native_restore:
+                placement_sets = await asyncio.gather(
+                    *[replica.worker_placements() for replica in replicas]
+                )
+                released_gpu_uuids = tuple(
+                    dict.fromkeys(
+                        placement["gpu_uuid"]
+                        for placements in placement_sets
+                        for placement in placements
+                        if isinstance(placement, dict)
+                        and isinstance(placement.get("gpu_uuid"), str)
+                        and placement["gpu_uuid"]
+                    )
+                )
+                if not released_gpu_uuids:
+                    raise RuntimeError(
+                        "native RESTORE target has no verified physical GPU UUID"
+                    )
+                await asyncio.gather(
+                    *[replica.wake_up(tags=["weights"]) for replica in replicas]
+                )
+
+            # Borrowed ADD targets are resident and use VERL's native
+            # KV-release path. Native RESTORE already has KV absent after the
+            # weights-only wake above.
+            if not native_restore:
+                await asyncio.gather(
+                    *[replica.release_kv_cache() for replica in replicas]
+                )
 
             topology_started = True
             self.build_process_group(rollout)
 
+            # Keep native VERL synchronization semantics here. Its
+            # CheckpointEngineManager.update_weights() is async but deliberately
+            # uses blocking ray.get() for the transfer/finalize boundary. Moving
+            # only this target path to a background thread/future would let the
+            # Trainer event loop progress while G still protects an in-flight
+            # collective, diverging from the native ordering contract.
             ray.get(
                 actor_wg.update_weights(
                     global_steps=loaded_version,
@@ -271,23 +274,23 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             health = await asyncio.gather(
                 *[replica.validate_server_runtime() for replica in replicas]
             )
-            for item in health:
-                if item.get("global_steps") != loaded_version:
-                    raise RuntimeError(
-                        "target server did not confirm the published parameter version"
-                    )
+            if any(item.get("global_steps") != loaded_version for item in health):
+                raise RuntimeError(
+                    "target server did not confirm the published parameter version"
+                )
 
             evidence = OperationEvidence.now(
                 operation_id,
                 EvidenceType.WEIGHT_READY,
             )
-            self._bootstrap_ready()[key] = (
+            self._bootstrap_ready_map[key] = (
                 operation_id,
                 loaded_version,
                 evidence,
             )
             return evidence
         except BaseException as exc:
+            cleanup_error = None
             if topology_started and not finalized:
                 try:
                     ray.get(
@@ -299,7 +302,29 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                         )
                     )
                 except BaseException as finalize_exc:
-                    raise RuntimeError(
-                        "target bootstrap failed and checkpoint topology cleanup is unverified"
-                    ) from finalize_exc
+                    cleanup_error = finalize_exc
+
+            # A failed native RESTORE must not escape with a partially awake
+            # retained runtime.  Re-enter proven level-2 sleep while G is still
+            # held; server admission never opens on this path.
+            if native_restore:
+                try:
+                    await asyncio.gather(*[replica.sleep() for replica in replicas])
+                except BaseException as rollback_exc:
+                    cleanup_error = rollback_exc
+
+            if cleanup_error is not None:
+                raise RuntimeError(
+                    "target bootstrap failed and runtime cleanup is unverified"
+                ) from cleanup_error
+            if native_restore:
+                # A failed RESTORE that has been proven back in level-2 sleep is
+                # a resolved compensation outcome, not an UNKNOWN synchronization
+                # result. Reuse RELEASED so TaskRunner/GS can release only the
+                # temporary RESTORE reservation without claiming business success.
+                return OperationEvidence.now(
+                    operation_id,
+                    EvidenceType.RELEASED,
+                    released_gpu_uuids=released_gpu_uuids,
+                )
             raise exc

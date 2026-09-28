@@ -15,7 +15,7 @@
 
 `multitask.enabled=true` 默认选择唯一的
 `experimental_fully_async_standalone` profile。当前首版只支持单节点、整卡、
-DP=1、PP=1、non-PD vLLM；TP 必须能在单节点放下并经实际组合验证。
+DP=1、PP=1、non-PD vLLM；当前真实 GPU 验收仅覆盖 TP=1，因此 TP>1 暂时 fail-closed。
 
 示例只提供接入条件，模型、数据、算法、训练步数以及 trainer/rollout 资源参数继续
 使用原生配置。GS 不分配初始规模；初始 Replica 数量仍由原生 rollout 资源字段决定。
@@ -34,11 +34,29 @@ DP=1、PP=1、non-PD vLLM；TP 必须能在单节点放下并经实际组合验�
    continuation 证明成立后才允许 `TERMINATED`，迟到 release 不得覆盖该终态。
 6. 启动两个隔离的训练 job，检查它们发现同一 detached GS；一个正常退出不影响另一个。
 7. GPU 借还、target-only bootstrap、DONATE sleep、RESTORE wake、FORCE targeted abort
-   和真实 RELEASED 逐卡核验必须单独做 GPU 验收。当前这些原语仍显式
-   `NotImplementedError`，不可把控制面测试当成借还闭环完成。
+   和真实 RELEASED 逐卡核验必须单独做 GPU 验收。当前 level-2 sleep/staged wake、
+   borrowed create/destroy、ADD/DONATE/RESTORE/FORCE 控制面编排均已接入 TaskRunner；
+   这些入口可执行不等于真实 GPU 闭环已经验收，不可把 unit/mock/CPU Ray 测试当成借还完成。
+8. 可先运行真实 DONATE primitive 验收（单卡、真实本地模型）：
+   ```bash
+   VERL_MULTITASK_GPU_MODEL_PATH=/path/to/local/model \
+   python -m pytest -q -s -m gpu_integration \
+     tests/integration/test_native_sleep_gpu.py
+   ```
+   同一文件包含两层验收：1 GPU 用例要求 native 真实生成成功、CE worker 报告物理
+   GPU UUID、Manager 生成精确 `RELEASED`、level-2 sleep 后 `nvidia-smi` 显存显著
+   下降，并继续在 donor 的同一 PG bundle/同一 GPU UUID 创建 borrower runtime、完成真实
+   生成和 verified destroy，最后确认 donor weights-only wake 仍处于 partial sleeping；
+   若至少有 2 张 GPU，还会运行 current-Vpub
+   RESTORE 用例，用真实 FSDP TrainingWorker + NCCL sender；donor 睡眠并完成同卡 borrower
+   借还后，测试 sender 会实际修改 output weights，再由 CE 在 G 内完成 weights-only wake、
+   current-Vpub 全量传输与 KV 恢复，验证 `global_steps == 17`，并证明生成请求在 final wake
+   前保持 parked、final wake 后才继续。只有第二个用例成功才可作为 RESTORE 数据路径的
+   GPU 证据，但它仍不等价于完整 GS→TaskRunner 借还业务闭环。
 
 记录完整命令、组合配置、两仓源码版本、环境依赖、实际导入路径、节点/GPU 数量、
-Actor 类型和日志。若没有实际触发中断/续推，只记录该配置运行结果。
+Actor 类型、GPU UUID、sleep 前后显存和日志。若没有实际触发中断/续推或 current-Vpub
+重装，只记录已实际覆盖的能力。
 
 当前分支没有可用的 GitHub Actions 运行结果；README 不声明未执行的 native/GPU
 测试通过。安装说明、状态 owner 与能力边界见 [README](../../README.md)。

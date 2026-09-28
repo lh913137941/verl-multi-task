@@ -2,23 +2,35 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
-import logging
+from dataclasses import dataclass
 
 import ray
 from verl.experimental.fully_async_policy.message_queue import MessageQueue
 
-from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
-from multi_task_scheduler.orchestration.exactly_once import (
-    CompletionEvidence,
-    DuplicateCompletionError,
-)
+from verl.single_controller.ray.base import _unwrap_ray_remote
+@dataclass(frozen=True)
+class CompletionEvidence:
+    task_session: str
+    logical_sample_id: str
+    payload_digest: str
+    enqueue_seq: int
+    dropped_oldest: bool
 
-logger = logging.getLogger(__name__)
+    def __post_init__(self) -> None:
+        if not self.task_session or not self.logical_sample_id or not self.payload_digest:
+            raise ValueError("CompletionEvidence identity/digest fields must be nonempty")
+        if self.enqueue_seq < 0:
+            raise ValueError("enqueue_seq must be nonnegative")
+
+
+class DuplicateCompletionError(RuntimeError):
+    """Same logical sample was re-submitted with a different payload digest."""
 
 
 @ray.remote(num_cpus=2, max_concurrency=20)
-class MultiTaskMessageQueue(unwrap_native_actor_class(MessageQueue)):
+class MultiTaskMessageQueue(_unwrap_ray_remote(MessageQueue)):
     """Reuse native queue behavior and add one internal completion ledger."""
 
     def __init__(self, config, max_queue_size: int = 1000, *, task_session: str):
@@ -27,6 +39,7 @@ class MultiTaskMessageQueue(unwrap_native_actor_class(MessageQueue)):
         self.task_session = task_session
         self._completion_evidence: dict[tuple[str, str], CompletionEvidence] = {}
         self._next_completion_seq = 0
+        self._completion_lock = asyncio.Lock()
         super().__init__(config, max_queue_size=max_queue_size)
 
     @staticmethod
@@ -49,7 +62,7 @@ class MultiTaskMessageQueue(unwrap_native_actor_class(MessageQueue)):
         logical_sample_id, payload_digest = self._decode_identity(sample)
         key = (self.task_session, logical_sample_id)
 
-        async with self._lock:
+        async with self._completion_lock:
             existing = self._completion_evidence.get(key)
             if existing is not None:
                 if existing.payload_digest != payload_digest:
@@ -59,22 +72,13 @@ class MultiTaskMessageQueue(unwrap_native_actor_class(MessageQueue)):
                     )
                 return existing
 
-            dropped_oldest = len(self.queue) >= self.max_queue_size
-            if dropped_oldest:
-                self.queue.popleft()
-                self.dropped_samples += 1
-                logger.warning("Queue full, dropped sample")
-
-            self.queue.append(sample)
-            self.total_produced += 1
-            self._consumer_condition.notify_all()
+            original_return_value = await super().put_sample(sample)
             evidence = CompletionEvidence(
                 task_session=self.task_session,
                 logical_sample_id=logical_sample_id,
                 payload_digest=payload_digest,
                 enqueue_seq=self._next_completion_seq,
-                dropped_oldest=dropped_oldest,
-                original_return_value=not dropped_oldest,
+                dropped_oldest=not original_return_value,
             )
             self._next_completion_seq += 1
             self._completion_evidence[key] = evidence
@@ -86,4 +90,4 @@ class MultiTaskMessageQueue(unwrap_native_actor_class(MessageQueue)):
         if sample is None:
             return await super().put_sample(sample)
         evidence = await self.put_sample_once(sample)
-        return evidence.original_return_value
+        return not evidence.dropped_oldest

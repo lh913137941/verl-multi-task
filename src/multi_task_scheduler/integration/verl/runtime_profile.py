@@ -35,16 +35,23 @@ def validate_runtime_profile(config) -> bool:
         return False
     if not isinstance(multitask, Mapping):
         raise ProfileConfigurationError("multitask must be a mapping")
-    enabled = multitask.get("enabled", False)
-    if "enabled" in multitask:
-        if type(enabled) is not bool:
-            raise ProfileConfigurationError("multitask.enabled must be a boolean")
-        if not enabled:
-            return False
+    if "enabled" not in multitask:
+        return False
+    enabled = multitask["enabled"]
+    if type(enabled) is not bool:
+        raise ProfileConfigurationError("multitask.enabled must be a boolean")
+    if not enabled:
+        return False
+    drain_timeout_s = multitask.get("drain_timeout_s", 300.0)
+    if (
+        type(drain_timeout_s) not in (int, float)
+        or drain_timeout_s <= 0
+    ):
+        raise ProfileConfigurationError(
+            "multitask.drain_timeout_s must be a positive number"
+        )
     profile = _select(config, "multitask.runtime.profile", None)
     if profile is None:
-        if not enabled:
-            return False
         profile = PROFILE_ID
     if not isinstance(profile, str) or profile != PROFILE_ID:
         raise ProfileConfigurationError(
@@ -65,6 +72,9 @@ def validate_runtime_profile(config) -> bool:
         ("actor_rollout_ref.rollout.mode", "async"),
         ("actor_rollout_ref.rollout.name", "vllm"),
         ("actor_rollout_ref.rollout.calculate_log_probs", True),
+        ("actor_rollout_ref.rollout.enable_sleep_mode", True),
+        ("actor_rollout_ref.rollout.free_cache_engine", True),
+        ("trainer.device", "cuda"),
         ("data.train_batch_size", 0),
         ("data.gen_batch_size", 1),
     ):
@@ -91,17 +101,41 @@ def validate_runtime_profile(config) -> bool:
             "first release owns the request-state LB and does not support router_config_path"
         )
 
-    backend = _select(config, f"{prefix}.checkpoint_engine.backend")
-    if not isinstance(backend, str) or not backend.strip() or backend == "naive":
-        raise ProfileConfigurationError(
-            "pure STANDALONE requires a non-naive checkpoint engine"
-        )
-    if backend in ("nccl", "hccl"):
-        rebuild_path = f"{prefix}.checkpoint_engine.engine_kwargs.{backend}.rebuild_group"
-        if _select(config, rebuild_path, False) is not True:
+    mtp = _select(config, f"{prefix}.mtp", None)
+    if mtp is not None:
+        if not isinstance(mtp, Mapping):
+            raise ProfileConfigurationError(f"{prefix}.mtp must be a mapping")
+        if mtp.get("enable", False) and mtp.get("enable_rollout", False):
             raise ProfileConfigurationError(
-                f"{rebuild_path} must be True for dynamic checkpoint membership"
+                "first release whole-GPU DONATE requires level-2 sleep and does not support MTP rollout"
             )
+
+    model = _select(config, "actor_rollout_ref.model", None)
+    if model is not None:
+        if not isinstance(model, Mapping):
+            raise ProfileConfigurationError("actor_rollout_ref.model must be a mapping")
+        lora_rank = model.get("lora_rank", 0)
+        lora = model.get("lora", {}) or {}
+        if not isinstance(lora, Mapping):
+            raise ProfileConfigurationError("actor_rollout_ref.model.lora must be a mapping")
+        lora_enabled = (type(lora_rank) is int and lora_rank > 0) or (
+            type(lora.get("rank", 0)) is int and lora.get("rank", 0) > 0
+        )
+        if lora_enabled and lora.get("merge", False) is not True:
+            raise ProfileConfigurationError(
+                "first release whole-GPU DONATE requires level-2 sleep and does not support unmerged LoRA rollout"
+            )
+
+    backend = _select(config, f"{prefix}.checkpoint_engine.backend")
+    if backend != "nccl":
+        raise ProfileConfigurationError(
+            "first release CUDA whole-GPU lending requires checkpoint_engine.backend='nccl'"
+        )
+    rebuild_path = f"{prefix}.checkpoint_engine.engine_kwargs.nccl.rebuild_group"
+    if _select(config, rebuild_path, False) is not True:
+        raise ProfileConfigurationError(
+            f"{rebuild_path} must be True for dynamic checkpoint membership"
+        )
 
     sizes = {}
     for field in (
@@ -130,6 +164,10 @@ def validate_runtime_profile(config) -> bool:
         raise ProfileConfigurationError(
             "first release requires pipeline_model_parallel_size=1"
         )
+    if sizes["tensor_model_parallel_size"] != 1:
+        raise ProfileConfigurationError(
+            "current verified whole-GPU profile requires tensor_model_parallel_size=1"
+        )
 
     for field in ("nnodes", "n_gpus_per_node"):
         value = _select(config, f"rollout.{field}")
@@ -138,10 +176,6 @@ def validate_runtime_profile(config) -> bool:
                 f"Native main must map rollout.{field} before selecting MultiTask"
             )
 
-    if sizes["tensor_model_parallel_size"] > sizes["n_gpus_per_node"]:
-        raise ProfileConfigurationError(
-            "TP replica must fit on the single supported node"
-        )
     return True
 
 

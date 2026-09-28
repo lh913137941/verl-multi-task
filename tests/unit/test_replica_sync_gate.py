@@ -153,3 +153,55 @@ def test_async_guard_cannot_return_success_after_its_lease_was_released():
             await lease.guard(late_result)
 
     run(scenario())
+
+
+def test_blocked_gate_requires_same_operation_and_successful_reconciliation():
+    async def scenario():
+        gate = ReplicaSyncGate()
+        owner = await gate.acquire("op-1", GateKind.ADD)
+        gate.block(owner.owner, "publish outcome is unknown")
+        await owner.release()
+
+        with pytest.raises(GateFencedError):
+            await gate.reconcile("op-2", lambda: None)
+
+        async def failed_repair():
+            raise RuntimeError("owner facts are still unknown")
+
+        with pytest.raises(RuntimeError, match="still unknown"):
+            await gate.reconcile("op-1", failed_repair)
+        assert gate.health == "BLOCKED"
+        assert gate.blocked_operation_id == "op-1"
+
+        repaired = []
+
+        async def repair():
+            await asyncio.sleep(0)
+            repaired.append("verified")
+
+        assert await gate.reconcile("op-1", repair) is True
+        assert repaired == ["verified"]
+        assert gate.health == "HEALTHY"
+        assert gate.blocked_reason is None
+        assert gate.blocked_operation_id is None
+
+        next_owner = await gate.acquire("op-3", GateKind.NATIVE_SYNC)
+        assert next_owner.owner.kind is GateKind.NATIVE_SYNC
+        await next_owner.release()
+
+    run(scenario())
+
+
+def test_reconcile_is_noop_when_gate_is_already_healthy():
+    async def scenario():
+        gate = ReplicaSyncGate()
+        called = False
+
+        def repair():
+            nonlocal called
+            called = True
+
+        assert await gate.reconcile("op-1", repair) is False
+        assert called is False
+
+    run(scenario())

@@ -1,23 +1,21 @@
 """Native vLLM replica extension for the supported STANDALONE profile."""
 
 import asyncio
-import hashlib
+import subprocess
 
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from ray.util.state import list_actors
 
-from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
+from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.single_controller.ray.base import get_master_addr_port
-from verl.utils.device import get_device_name
+from verl.utils.device import get_device_name, get_resource_name
 from verl.workers.rollout.replica import RolloutMode
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
-from multi_task_scheduler.checkpoint.checkpoint_engine_worker import (
-    MultiTaskCheckpointEngineWorker,
-)
 from multi_task_scheduler.orchestration.contracts import (
     FIRST_RELEASE_MAX_COLOCATE_COUNT,
+    Lease,
     ReplicaKind,
 )
 from .http_server import MultiTaskvLLMHttpServer
@@ -41,62 +39,57 @@ class MultiTaskvLLMReplica(vLLMReplica):
                 "first release requires max_colocate_count="
                 f"{FIRST_RELEASE_MAX_COLOCATE_COUNT}"
             )
-        self.max_colocate_count = max_colocate_count
         super().__init__(*args, **kwargs)
         self.server_class = ray.remote(MultiTaskvLLMHttpServer)
 
-    async def init_standalone(self):
-        """Create native PGs with the same Ray accounting M used by leases."""
-        self.rollout_mode = RolloutMode.STANDALONE
-        if self.is_reward_model:
-            resource_pool_name = f"rollout_pool_reward_{self.replica_rank}{self.name_suffix}"
-        elif self.is_teacher_model:
-            resource_pool_name = f"rollout_pool_teacher_{self.replica_rank}{self.name_suffix}"
-        else:
-            resource_pool_name = f"rollout_pool_{self.replica_rank}{self.name_suffix}"
-
-        resource_pool_manager = ResourcePoolManager(
-            resource_pool_spec={
-                resource_pool_name: [self.gpus_per_replica_node] * self.nnodes,
-            },
-            mapping=None,
-            max_colocate_count=self.max_colocate_count,
-        )
-        resource_pool_manager.create_resource_pool()
-        self.resource_pool = resource_pool_manager.resource_pool_dict[
-            resource_pool_name
-        ]
-
-        if self.is_reward_model:
-            name_prefix = (
-                f"rollout_reward_standalone_{self.replica_rank}{self.name_suffix}"
-            )
-        elif self.is_teacher_model:
-            name_prefix = (
-                f"rollout_teacher_standalone_{self.replica_rank}{self.name_suffix}"
-            )
-        else:
-            name_prefix = f"rollout_standalone_{self.replica_rank}{self.name_suffix}"
-
-        worker_group = RayWorkerGroup(
-            resource_pool=self.resource_pool,
-            ray_cls_with_init=self.get_ray_class_with_init_args(),
-            bin_pack=False,
-            name_prefix=name_prefix,
-            use_gpu=True,
-            device_name=get_device_name(),
-        )
-        self.workers = worker_group.workers
-        await self.launch_servers()
-
     @staticmethod
-    def _short_identity(value: str) -> str:
-        if not isinstance(value, str) or not value:
-            raise ValueError("identity value must be a nonempty string")
-        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    def _runtime_placement_probe(_worker) -> dict:
+        """Run inside VERL's native CheckpointEngineWorker via __ray_call__."""
+        resource_name = get_resource_name()
+        if resource_name != "GPU":
+            raise NotImplementedError(
+                f"first release placement probe supports GPU only, got {resource_name!r}"
+            )
+        context = ray.get_runtime_context()
+        ids = context.get_accelerator_ids().get(resource_name, [])
+        if len(ids) != 1:
+            raise RuntimeError(
+                f"expected exactly one Ray GPU id for CE actor, got {ids!r}"
+            )
+        accelerator_id = str(ids[0])
+        if accelerator_id.startswith("GPU-"):
+            gpu_uuid = accelerator_id
+        elif accelerator_id.startswith("MIG-"):
+            raise NotImplementedError("first release does not support MIG placement")
+        elif accelerator_id.isdigit():
+            output = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,uuid",
+                    "--format=csv,noheader,nounits",
+                ],
+                text=True,
+                timeout=10,
+            )
+            mapping = {}
+            for line in output.splitlines():
+                if line.strip():
+                    index, uuid = [part.strip() for part in line.split(",", 1)]
+                    mapping[index] = uuid
+            try:
+                gpu_uuid = mapping[accelerator_id]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"nvidia-smi did not report Ray GPU id {accelerator_id!r}"
+                ) from exc
+        else:
+            raise RuntimeError(
+                f"cannot map Ray GPU accelerator id {accelerator_id!r} to a UUID"
+            )
+        return {"node_id": context.get_node_id(), "gpu_uuid": gpu_uuid}
 
     def validate_placement(self, spec: dict) -> None:
-        """Validate the borrower-local topology without creating Ray actors."""
+        """Validate runtime identity/topology on a normalized Lease spec."""
         if self.replica_kind is not ReplicaKind.BORROWED:
             raise ValueError("lease placement is valid only for BORROWED replicas")
         if not isinstance(spec, dict):
@@ -105,108 +98,49 @@ class MultiTaskvLLMReplica(vLLMReplica):
             raise ValueError("placement replica_rank does not match runtime identity")
         if spec.get("placement_epoch", 0) != self.runtime_epoch:
             raise ValueError("placement_epoch does not match runtime identity")
-        if spec.get("max_colocate_count") != FIRST_RELEASE_MAX_COLOCATE_COUNT:
-            raise ValueError("placement max_colocate_count does not match first release")
+        claims = Lease(
+            spec["lease_id"],
+            tuple(spec.get("claims") or ()),
+            spec.get("expires_at", 0),
+        ).claims
+        if self.world_size != 1 or len(claims) != 1:
+            raise ValueError("current borrowed runtime requires one TP=1 claim")
+        claim = claims[0]
+        if (
+            claim.get("rank") != 0
+            or claim.get("node_rank") != 0
+            or claim.get("local_rank") != 0
+        ):
+            raise ValueError("current borrowed claim requires rank=node_rank=local_rank=0")
 
-        claims = spec.get("claims")
-        if not isinstance(claims, (list, tuple)) or not claims:
-            raise ValueError("borrowed placement requires normalized claims")
-        if spec.get("world_size") != len(claims):
-            raise ValueError("placement world_size must equal claim count")
-        if len(claims) != self.world_size:
-            raise ValueError("placement world_size does not match borrower model topology")
-
-        node_ids = set()
-        bundle_keys = set()
-        gpu_uuids = set()
-        claim_ids = set()
-        for rank, claim in enumerate(claims):
-            if claim.get("rank") != rank:
-                raise ValueError("borrower ranks must be ordered 0..world_size-1")
-            if claim.get("node_rank") != 0 or claim.get("local_rank") != rank:
-                raise ValueError("first release requires one-node borrower rank layout")
-            if claim.get("gpu_fraction") != 1.0 / self.max_colocate_count:
-                raise ValueError("claim GPU accounting share does not match runtime M")
-            if claim.get("cpu_request") != 1.0:
-                raise ValueError("first release requires one CPU per borrower CE actor")
-
-            claim_id = claim.get("claim_id")
-            gpu_uuid = claim.get("gpu_uuid")
-            bundle_key = (claim.get("pg_id"), claim.get("bundle_index"))
-            node_id = claim.get("node_id")
-            if not isinstance(claim_id, str) or not claim_id:
-                raise ValueError("claim_id must be nonempty")
-            if not isinstance(gpu_uuid, str) or not gpu_uuid:
-                raise ValueError("gpu_uuid must be nonempty")
-            if not isinstance(node_id, str) or not node_id:
-                raise ValueError("node_id must be nonempty")
-            if bundle_key[0] is None or bundle_key[1] is None:
-                raise ValueError("claim requires PG id and bundle index")
-            if claim_id in claim_ids or gpu_uuid in gpu_uuids or bundle_key in bundle_keys:
-                raise ValueError("first release claims must be unique per physical GPU")
-            claim_ids.add(claim_id)
-            gpu_uuids.add(gpu_uuid)
-            bundle_keys.add(bundle_key)
-            node_ids.add(node_id)
-
-        if len(node_ids) != 1:
-            raise ValueError("first release borrowed placement must be single-node")
-
-    def _worker_prefix(self, spec: dict) -> str:
-        token = self._short_identity(
-            f"{spec['lease_id']}:{spec['operation_id']}:{self.runtime_epoch}"
-        )
-        return f"borrowed_ce_{self.replica_rank}_{token}_"
-
-    def _worker_name(self, spec: dict, claim: dict) -> str:
-        claim_token = self._short_identity(claim["claim_id"])
-        return f"{self._worker_prefix(spec)}r{claim['rank']}_{claim_token}"
-
-    def build_borrowed_worker_plan(self, spec: dict) -> tuple[dict, ...]:
-        """Build deterministic CE actor placement metadata with no Ray side effects."""
+    def build_borrowed_worker_plan(self, spec: dict) -> dict:
+        """Build deterministic TP=1 CE actor placement metadata."""
         self.validate_placement(spec)
-        prefix = self._worker_prefix(spec)
-        plan = []
-        for claim in spec["claims"]:
-            plan.append(
-                {
-                    "rank": claim["rank"],
-                    "claim_id": claim["claim_id"],
-                    "actor_name": self._worker_name(spec, claim),
-                    "pg_id": claim["pg_id"],
-                    "bundle_index": claim["bundle_index"],
-                    "node_id": claim["node_id"],
-                    "gpu_uuid": claim["gpu_uuid"],
-                    "num_gpus": claim["gpu_fraction"],
-                    "num_cpus": claim["cpu_request"],
-                    "env_vars": {
-                        "WORLD_SIZE": str(spec["world_size"]),
-                        "RANK": str(claim["rank"]),
-                        "RAY_LOCAL_WORLD_SIZE": str(spec["world_size"]),
-                        "WG_PREFIX": prefix,
-                        "WG_BACKEND": "ray",
-                    },
-                }
-            )
-        self.placement_claims = tuple(dict(claim) for claim in spec["claims"])
-        token = self._short_identity(
-            f"{spec['lease_id']}:{spec['operation_id']}:{self.runtime_epoch}"
-        )
-        self.borrowed_server_name_prefix = f"vllm_borrowed_{token}_"
+        prefix = f"borrowed_ce_{self.replica_rank}_"
+        claim = spec["claims"][0]
+        self.placement_claims = (dict(claim),)
         self.borrowed_server_names = (
-            f"{self.borrowed_server_name_prefix}server_{self.replica_rank}_0",
+            f"{super()._get_server_name_prefix()}server_"
+            f"{self.replica_rank}_0{self.name_suffix}",
         )
-        return tuple(plan)
-
-    def _get_server_name_prefix(self) -> str:
-        if self.replica_kind is ReplicaKind.BORROWED:
-            prefix = getattr(self, "borrowed_server_name_prefix", None)
-            if not prefix:
-                raise RuntimeError(
-                    "borrowed server name prefix is unavailable before placement planning"
-                )
-            return prefix
-        return super()._get_server_name_prefix()
+        return {
+            "rank": 0,
+            "claim_id": claim["claim_id"],
+            "actor_name": f"{prefix}r0",
+            "pg_id": claim["pg_id"],
+            "bundle_index": claim["bundle_index"],
+            "node_id": claim["node_id"],
+            "gpu_uuid": claim["gpu_uuid"],
+            "num_gpus": claim["gpu_fraction"],
+            "num_cpus": claim["cpu_request"],
+            "env_vars": {
+                "WORLD_SIZE": "1",
+                "RANK": "0",
+                "RAY_LOCAL_WORLD_SIZE": "1",
+                "WG_PREFIX": prefix,
+                "WG_BACKEND": "ray",
+            },
+        }
 
     async def _get_master_addr_port_for_slot(self, pg, bundle_index: int):
         """Create a borrower communication root on the selected borrower bundle."""
@@ -217,6 +151,16 @@ class MultiTaskvLLMReplica(vLLMReplica):
             )
         ).remote()
 
+    async def worker_placements(self) -> tuple[dict, ...]:
+        if len(self.workers) != 1:
+            raise RuntimeError("current verified runtime requires one CE worker")
+        placement = await self.workers[0].__ray_call__.remote(
+            self._runtime_placement_probe
+        )
+        if not isinstance(placement, dict):
+            raise TypeError("runtime placement probe returned a non-dict result")
+        return (dict(placement),)
+
     async def validate_worker_placement(self) -> tuple[dict, ...]:
         """Verify each borrower CE actor landed on the claimed node/GPU UUID."""
         claims = tuple(self.placement_claims or ())
@@ -224,12 +168,8 @@ class MultiTaskvLLMReplica(vLLMReplica):
             raise RuntimeError(
                 "borrower worker count does not match normalized placement claims"
             )
-        placements = await asyncio.gather(
-            *[worker.runtime_placement.remote() for worker in self.workers]
-        )
+        placements = await self.worker_placements()
         for claim, actual in zip(claims, placements, strict=True):
-            if not isinstance(actual, dict):
-                raise TypeError("runtime placement probe returned a non-dict result")
             if actual.get("node_id") != claim["node_id"]:
                 raise RuntimeError(
                     f"borrower rank {claim['rank']} landed on unexpected node"
@@ -238,8 +178,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
                 raise RuntimeError(
                     f"borrower rank {claim['rank']} landed on unexpected GPU UUID"
                 )
-        self.borrowed_worker_placement = tuple(dict(item) for item in placements)
-        return self.borrowed_worker_placement
+        return placements
 
     @staticmethod
     def _non_dead_actor_names(
@@ -304,72 +243,51 @@ class MultiTaskvLLMReplica(vLLMReplica):
         self,
         spec: dict,
         pg_by_id: dict[str, object],
-    ) -> RayWorkerGroup:
-        """Create borrower-owned CE actors on the exact claimed PG bundles.
-
-        This low-level primitive is intentionally not wired into Manager yet.
-        Manager continues to stop before Ray side effects until bootstrap and
-        actor-exit verification are available as one complete transaction.
-        """
-        plan = self.build_borrowed_worker_plan(spec)
-        expected_pg_ids = {item["pg_id"] for item in plan}
-        if set(pg_by_id) != expected_pg_ids:
+    ) -> None:
+        """Create the verified TP=1 borrower CE actor on its claimed PG bundle."""
+        item = self.build_borrowed_worker_plan(spec)
+        if set(pg_by_id) != {item["pg_id"]}:
             raise ValueError("placement-group handles do not exactly cover claims")
 
-        first = plan[0]
+        pg = pg_by_id[item["pg_id"]]
         master_addr, master_port = await self._get_master_addr_port_for_slot(
-            pg_by_id[first["pg_id"]],
-            first["bundle_index"],
+            pg, item["bundle_index"]
         )
         base = self.get_ray_class_with_init_args()
-        workers = []
-        names = []
+        actor_args = RayClassWithInitArgs(base.cls, *base.args, **base.kwargs)
+        env_vars = dict(item["env_vars"], MASTER_ADDR=str(master_addr), MASTER_PORT=str(master_port))
+        actor_args.update_options(
+            {
+                "name": item["actor_name"],
+                "num_cpus": item["num_cpus"],
+                "runtime_env": {"env_vars": env_vars},
+            }
+        )
+        worker = None
         try:
-            for item in plan:
-                actor_args = RayClassWithInitArgs(
-                    base.cls,
-                    *base.args,
-                    **base.kwargs,
-                )
-                env_vars = dict(item["env_vars"])
-                env_vars["MASTER_ADDR"] = str(master_addr)
-                env_vars["MASTER_PORT"] = str(master_port)
-                actor_args.update_options(
-                    {
-                        "name": item["actor_name"],
-                        "num_cpus": item["num_cpus"],
-                        "runtime_env": {"env_vars": env_vars},
-                    }
-                )
-                worker = actor_args(
-                    placement_group=pg_by_id[item["pg_id"]],
-                    placement_group_bundle_idx=item["bundle_index"],
-                    use_gpu=True,
-                    num_gpus=item["num_gpus"],
-                    device_name=get_device_name(),
-                )
-                workers.append(worker)
-                names.append(item["actor_name"])
-
-            bind_args = RayClassWithInitArgs(
-                base.cls,
-                *base.args,
-                **base.kwargs,
+            worker = actor_args(
+                placement_group=pg,
+                placement_group_bundle_idx=item["bundle_index"],
+                use_gpu=True,
+                num_gpus=item["num_gpus"],
+                device_name=get_device_name(),
             )
             worker_group = RayWorkerGroup.from_detached(
-                worker_handles=workers,
-                ray_cls_with_init=bind_args,
-                name_prefix=self._worker_prefix(spec),
+                worker_handles=[worker],
+                ray_cls_with_init=base,
+                name_prefix=f"borrowed_ce_{self.replica_rank}_",
                 use_gpu=True,
                 device_name=get_device_name(),
             )
             self.workers = list(worker_group.workers)
-            self.borrowed_worker_names = tuple(names)
+            self.borrowed_worker_names = (item["actor_name"],)
             await self.validate_worker_placement()
-            return worker_group
         except BaseException as exc:
             try:
-                await self._kill_workers_verified(workers, tuple(names))
+                await self._kill_workers_verified(
+                    [] if worker is None else [worker],
+                    (item["actor_name"],) if worker is not None else (),
+                )
             except BaseException as cleanup_exc:
                 self.workers = []
                 raise RuntimeError(
@@ -379,35 +297,40 @@ class MultiTaskvLLMReplica(vLLMReplica):
             raise exc
 
     async def validate_server_runtime(self) -> dict:
-        """Verify the one-node borrower server and vLLM engine before RUNTIME_READY."""
-        if self.replica_kind is not ReplicaKind.BORROWED:
-            raise ValueError("borrowed server validation is BORROWED-only")
+        """Verify one first-release server/engine for ADD or native RESTORE."""
         if self.nnodes != 1 or len(self.servers) != 1:
-            raise RuntimeError("first release borrowed runtime requires exactly one server")
-        if not self.placement_claims:
-            raise RuntimeError("borrowed runtime has no placement claims")
+            raise RuntimeError("first release runtime validation requires exactly one server")
 
         health = await self.servers[0].runtime_health.remote()
         if not isinstance(health, dict):
             raise TypeError("server runtime health returned a non-dict result")
-        expected_node = self.placement_claims[0]["node_id"]
-        if health.get("node_id") != expected_node:
-            raise RuntimeError("borrowed server landed on unexpected node")
         if health.get("replica_rank") != self.replica_rank:
-            raise RuntimeError("borrowed server replica_rank mismatch")
-        if health.get("node_rank") != 0 or health.get("nnodes") != 1:
-            raise RuntimeError("borrowed server topology mismatch")
-        if not health.get("engine_ready"):
-            raise RuntimeError("borrowed vLLM engine is not healthy")
+            raise RuntimeError("server replica_rank mismatch")
         if not health.get("server_address") or not health.get("server_port"):
-            raise RuntimeError("borrowed HTTP server address is incomplete")
+            raise RuntimeError("HTTP server address is incomplete")
         if self._server_handle is not self.servers[0]:
-            raise RuntimeError("borrowed primary server handle is inconsistent")
+            raise RuntimeError("primary server handle is inconsistent")
         if not self._server_address:
-            raise RuntimeError("borrowed primary server address is missing")
+            raise RuntimeError("primary server address is missing")
 
-        self.borrowed_server_health = dict(health)
-        return self.borrowed_server_health
+        if self.replica_kind is ReplicaKind.BORROWED:
+            if not self.placement_claims:
+                raise RuntimeError("borrowed runtime has no placement claims")
+            expected_node = self.placement_claims[0]["node_id"]
+            if health.get("node_id") != expected_node:
+                raise RuntimeError("borrowed server landed on unexpected node")
+            return dict(health)
+
+        if self.replica_kind is not ReplicaKind.NATIVE:
+            raise ValueError("unsupported replica kind for runtime validation")
+        workers = tuple(getattr(self, "workers", ()) or ())
+        if not workers:
+            raise RuntimeError("native runtime has no CE workers for health validation")
+        placements = await self.worker_placements()
+        worker_nodes = {placement.get("node_id") for placement in placements}
+        if len(worker_nodes) != 1 or health.get("node_id") not in worker_nodes:
+            raise RuntimeError("native server/worker node placement mismatch")
+        return dict(health)
 
     async def _shutdown_servers_verified(self) -> None:
         servers = list(getattr(self, "servers", []) or [])
@@ -434,9 +357,10 @@ class MultiTaskvLLMReplica(vLLMReplica):
         self._server_address = None
 
     async def cleanup_borrowed_runtime(self) -> None:
-        """Destroy locally owned borrower server/workers without touching donor PGs."""
+        """Destroy borrower-owned actors and own the cleanup proof flag."""
         if self.replica_kind is not ReplicaKind.BORROWED:
             raise ValueError("borrowed cleanup is BORROWED-only")
+        self.borrowed_cleanup_verified = False
         errors = []
         try:
             await self._shutdown_servers_verified()
@@ -452,6 +376,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
         self.workers = []
         if errors:
             raise RuntimeError("borrowed runtime cleanup is unverified") from errors[0]
+        self.borrowed_cleanup_verified = True
 
     async def init_from_lease(
         self,
@@ -460,24 +385,22 @@ class MultiTaskvLLMReplica(vLLMReplica):
     ) -> dict:
         """Build and validate a hidden borrower runtime on existing donor PGs.
 
-        This method is a low-level transaction primitive. Manager does not call
-        it yet; target-only weight bootstrap and service publication remain a
-        separate unimplemented gate.
+        Manager calls this low-level transaction for hidden creation only;
+        target-only bootstrap and service publication remain separate gates.
         """
-        self.validate_placement(spec)
+        # _create_workers_from_claims() validates the normalized Lease
+        # before its first Ray side effect.
         self.rollout_mode = RolloutMode.STANDALONE
         self.nnodes = 1
         self.gpus_per_replica_node = self.world_size
-        self.borrowed_runtime_state = "CREATING"
         self.borrowed_cleanup_verified = False
 
         try:
             await self._create_workers_from_claims(spec, pg_by_id)
             await self.launch_servers()
             health = await self.validate_server_runtime()
-            self.borrowed_runtime_state = "RUNTIME_READY"
             return {
-                "state": self.borrowed_runtime_state,
+                "state": "RUNTIME_READY",
                 "replica_rank": self.replica_rank,
                 "worker_names": tuple(self.borrowed_worker_names),
                 "server_names": tuple(self.borrowed_server_names),
@@ -487,64 +410,39 @@ class MultiTaskvLLMReplica(vLLMReplica):
         except BaseException as exc:
             try:
                 await self.cleanup_borrowed_runtime()
-                self.borrowed_cleanup_verified = True
             except BaseException as cleanup_exc:
-                self.borrowed_cleanup_verified = False
-                self.borrowed_runtime_state = "FAILED"
                 raise RuntimeError(
                     "borrowed runtime creation failed and cleanup is unverified"
                 ) from cleanup_exc
-            self.borrowed_runtime_state = "FAILED"
             raise exc
 
-    def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
-        return RayClassWithInitArgs(
-            cls=ray.remote(MultiTaskCheckpointEngineWorker),
-            rollout_config=self.config,
-            model_config=self.model_config,
-            replica_rank=self.replica_rank,
-        )
+    async def sleep(self):
+        """Deep-sleep the retained native TP=1 runtime."""
+        if self.replica_kind is not ReplicaKind.NATIVE:
+            raise ValueError("sleep is valid only for retained NATIVE replicas")
+        if len(self.servers) != 1:
+            raise RuntimeError("current verified native runtime requires one server")
+        receipt = await self.servers[0].sleep.remote()
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("sleep_level") != 2
+            or receipt.get("sleeping") is not True
+        ):
+            raise RuntimeError("native server did not confirm level-2 sleep")
+        return (receipt,)
 
-    def prepare_create(self) -> dict:
-        raise NotImplementedError(
-            "replica creation requires verified native runtime backend"
-        )
+    async def wake_up(self, tags: list[str] | None = None):
+        """Wake the retained native TP=1 server and verify its residency."""
+        if self.replica_kind is not ReplicaKind.NATIVE:
+            raise ValueError("wake_up is valid only for retained NATIVE replicas")
+        if len(self.servers) != 1:
+            raise RuntimeError("current verified native runtime requires one server")
+        receipt = await self.servers[0].wake_up.remote(tags=tags)
+        if not isinstance(receipt, dict):
+            raise TypeError("native server wake returned a non-dict receipt")
+        expected = (True, False) if tags == ["weights"] else (False, True)
+        if (receipt.get("sleeping"), receipt.get("fully_awake")) != expected:
+            raise RuntimeError("native server wake residency is inconsistent")
+        return (receipt,)
 
-    def mark_weight_ready(self, operation_id: str):
-        raise NotImplementedError(
-            "weight readiness requires verified replay/bootstrap backend"
-        )
 
-    async def sleep(self, *args, **kwargs):
-        """Do not expose vLLM STANDALONE's silent sleep no-op as success."""
-        raise NotImplementedError(
-            "native replica sleep requires a verified STANDALONE release backend"
-        )
-
-    async def wake_up(self, *args, **kwargs):
-        """Do not expose vLLM STANDALONE's silent wake-up no-op as success."""
-        raise NotImplementedError(
-            "native replica wake_up requires a verified STANDALONE restore backend"
-        )
-
-    def prepare_exit(self, operation_id: str):
-        raise NotImplementedError(
-            "exit readiness requires verified vLLM sleep/drain backend"
-        )
-
-    def release_gpu(self, operation_id: str, gpu_uuids):
-        raise NotImplementedError(
-            "GPU release evidence requires verified runtime destroy backend"
-        )
-
-    def _setup_env_cuda_visible_devices(self, *args, **kwargs):
-        if self.replica_kind is ReplicaKind.BORROWED:
-            raise NotImplementedError(
-                "borrowed replica requires a verified lease-aware GPU binding backend"
-            )
-        return super()._setup_env_cuda_visible_devices(*args, **kwargs)
-
-    def abort_target(self, request_ids):
-        raise NotImplementedError(
-            "targeted abort requires verified FORCE_VERIFIED backend"
-        )
