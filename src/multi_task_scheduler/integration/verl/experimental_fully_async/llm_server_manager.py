@@ -411,7 +411,11 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         matches = [
             record
             for record in self.borrowed_operations.values()
-            if record.get("replica_key") == key
+            if ReplicaKey(
+                record["resolved_spec"]["borrower_task_id"],
+                record["resolved_spec"]["borrower_replica_id"],
+                record["resolved_spec"]["placement_epoch"],
+            ) == key
         ]
         if len(matches) != 1:
             raise KeyError(f"expected one borrowed operation for {key!r}")
@@ -464,7 +468,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 state=ReplicaState.CREATING,
             )
             record = {
-                "replica_key": replica_key,
                 "result": None,
                 "error": None,
                 # Manager-local replay fence and resolved placement. Retries
@@ -496,7 +499,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
 
             async with self.replica_operation_lock:
                 current = self.borrowed_operations[lease_id]
-                replica_key = current["replica_key"]
                 current["error"] = None
                 current["result"] = {
                     "operation_id": current["resolved_spec"]["operation_id"],
