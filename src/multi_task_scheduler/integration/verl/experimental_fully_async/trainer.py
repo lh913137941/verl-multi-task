@@ -208,12 +208,6 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
                     f"expected WEIGHT_READY, got {weight_evidence.type.value}"
                 )
 
-            await lease.guard(
-                self.checkpoint_manager.commit_pending,
-                target,
-                weight_evidence,
-                loaded_version=self.current_param_version,
-            )
             service_evidence = await lease.guard(
                 self.rollouter.commit_service_change.remote,
                 operation,
@@ -226,6 +220,17 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
                 raise ValueError(
                     f"expected SERVICE_COMMITTED, got {service_evidence.type.value}"
                 )
+
+            # R/C/M are now committed while G is still held.  Only now promote
+            # the already-proven current-Vpub receiver into effective E; a
+            # definite pre-route rollback therefore leaves E pending/DORMANT
+            # instead of falsely effective.
+            await lease.guard(
+                self.checkpoint_manager.commit_pending,
+                target,
+                weight_evidence,
+                loaded_version=self.current_param_version,
+            )
             return service_evidence
         except BaseException as exc:
             if mutated:
