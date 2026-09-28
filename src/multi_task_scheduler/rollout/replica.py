@@ -516,16 +516,38 @@ class MultiTaskvLLMReplica(vLLMReplica):
         )
 
     async def sleep(self, *args, **kwargs):
-        """Do not expose vLLM STANDALONE's silent sleep no-op as success."""
-        raise NotImplementedError(
-            "native replica sleep requires a verified STANDALONE release backend"
+        """Deep-sleep the retained native runtime through verified server receipts."""
+        if self.replica_kind is not ReplicaKind.NATIVE:
+            raise ValueError("sleep is valid only for retained NATIVE replicas")
+        servers = tuple(getattr(self, "servers", ()) or ())
+        if not servers:
+            raise RuntimeError("native replica has no rollout servers to sleep")
+        receipts = await asyncio.gather(
+            *[server.sleep.remote() for server in servers]
         )
+        for receipt in receipts:
+            if not isinstance(receipt, dict):
+                raise TypeError("native server sleep returned a non-dict receipt")
+            if receipt.get("sleep_level") != 2 or receipt.get("sleeping") is not True:
+                raise RuntimeError("native server did not confirm level-2 sleep")
+        return tuple(receipts)
 
     async def wake_up(self, *args, **kwargs):
-        """Do not expose vLLM STANDALONE's silent wake-up no-op as success."""
-        raise NotImplementedError(
-            "native replica wake_up requires a verified STANDALONE restore backend"
+        """Fully wake a retained native runtime after current weights are installed."""
+        if self.replica_kind is not ReplicaKind.NATIVE:
+            raise ValueError("wake_up is valid only for retained NATIVE replicas")
+        servers = tuple(getattr(self, "servers", ()) or ())
+        if not servers:
+            raise RuntimeError("native replica has no rollout servers to wake")
+        receipts = await asyncio.gather(
+            *[server.wake_up.remote(*args, **kwargs) for server in servers]
         )
+        for receipt in receipts:
+            if not isinstance(receipt, dict):
+                raise TypeError("native server wake returned a non-dict receipt")
+            if receipt.get("fully_awake") is not True or receipt.get("sleeping") is not False:
+                raise RuntimeError("native server did not confirm full wake")
+        return tuple(receipts)
 
     def prepare_exit(self, operation_id: str):
         raise NotImplementedError(
