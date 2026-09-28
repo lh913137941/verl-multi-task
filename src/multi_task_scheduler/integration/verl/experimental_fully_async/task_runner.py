@@ -73,7 +73,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             raise ValueError("operation lease snapshot does not match command.lease_id")
 
         # Donor/source rank metadata is not borrower topology.
-        selected_slots = [
+        claims = [
             dict(claim, rank=rank, node_rank=0, local_rank=rank)
             for rank, claim in enumerate(lease.claims)
         ]
@@ -84,8 +84,8 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             "borrower_task_id": command.target.task_session,
             "borrower_replica_id": command.target.replica_id,
             "replica_rank": None,
-            "selected_slots": selected_slots,
-            "world_size": len(selected_slots),
+            "claims": claims,
+            "world_size": len(claims),
             "max_colocate_count": FIRST_RELEASE_MAX_COLOCATE_COUNT,
             "expires_at": lease.expires_at,
             "placement_epoch": command.target.runtime_epoch,
