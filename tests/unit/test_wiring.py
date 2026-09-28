@@ -2159,7 +2159,7 @@ def test_ce_target_bootstrap_syncs_only_pending_target_and_is_idempotent():
             return object()
 
         async def release_kv_cache(self):
-            raise AssertionError("native RESTORE already has KV released after weights-only wake")
+            calls.append(("release-kv",))
 
         async def resume_kv_cache(self):
             calls.append(("resume-kv",))
@@ -2186,6 +2186,9 @@ def test_ce_target_bootstrap_syncs_only_pending_target_and_is_idempotent():
     assert key not in ce.effective_replicas
     assert ce.replicas == ["native"]
     assert ce.build_calls and ce.build_calls[0].workers == ["worker-0"]
+    assert calls.index(("release-kv",)) < calls.index(("target-update", 7))
+    assert calls.index(("target-update", 7)) < calls.index(("resume-kv",))
+    assert calls.index(("resume-kv",)) < calls.index(("health",))
     assert ("actor-update", 7, "nccl") in calls
     assert ("target-update", 7) in calls
     assert ("health",) in calls
