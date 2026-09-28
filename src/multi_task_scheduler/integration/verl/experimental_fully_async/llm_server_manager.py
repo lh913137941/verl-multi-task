@@ -252,96 +252,62 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         normalized["expires_at"] = lease.expires_at
         return normalized
 
-    @staticmethod
-    def _same_borrowed_create_request(record: dict, incoming: dict) -> bool:
-        resolved = dict(record["resolved_spec"])
-        resolved.pop("replica_rank", None)
-        return resolved == incoming
-
     def _resolve_placement_groups(self, claims) -> dict[str, object]:
-        """Resolve verified PG handles from serialized claim metadata.
-
-        The wire contract carries IDs, not Ray handles. The Ray PG table is
-        keyed by pg.id.hex() and records the stable PG name; resolving by name
-        avoids constructing private PlacementGroupID objects from strings.
-        """
+        """Resolve the verified single-claim donor PG without private Ray IDs."""
         claims = tuple(claims)
-        if not claims:
-            raise ValueError("placement resolution requires nonempty claims")
-
-        table = ray.util.placement_group_table()
+        if len(claims) != 1:
+            raise ValueError("current borrowed runtime requires exactly one claim")
+        claim = claims[0]
+        pg_id = claim["pg_id"]
         namespace = ray.get_runtime_context().namespace
-        resolved = {}
+        expected_namespace = claim.get("pg_namespace")
+        if expected_namespace is not None:
+            if not isinstance(expected_namespace, str) or not expected_namespace:
+                raise ValueError("pg_namespace must be a nonempty string when provided")
+            if expected_namespace != namespace:
+                raise ValueError("claim placement group belongs to another Ray namespace")
 
-        for claim in claims:
-            pg_id = claim["pg_id"]
-            expected_namespace = claim.get("pg_namespace")
-            if expected_namespace is not None:
-                if not isinstance(expected_namespace, str) or not expected_namespace:
-                    raise ValueError("pg_namespace must be a nonempty string when provided")
-                if expected_namespace != namespace:
-                    raise ValueError("claim placement group belongs to another Ray namespace")
-
-            info = table.get(pg_id)
-            if info is None:
-                raise ValueError(f"placement group {pg_id!r} is not present in Ray")
-            if info.get("state") != "CREATED":
-                raise ValueError(
-                    f"placement group {pg_id!r} is not CREATED: {info.get('state')!r}"
-                )
-
-            bundle_index = claim["bundle_index"]
-            bundles = info.get("bundles") or {}
-            bundle = bundles.get(bundle_index, bundles.get(str(bundle_index)))
-            if bundle is None:
-                raise ValueError(
-                    f"placement group {pg_id!r} has no bundle {bundle_index}"
-                )
-
-            bundle_nodes = info.get("bundles_to_node_id") or {}
-            actual_node_id = bundle_nodes.get(
-                bundle_index,
-                bundle_nodes.get(str(bundle_index)),
+        info = ray.util.placement_group_table().get(pg_id)
+        if info is None:
+            raise ValueError(f"placement group {pg_id!r} is not present in Ray")
+        if info.get("state") != "CREATED":
+            raise ValueError(
+                f"placement group {pg_id!r} is not CREATED: {info.get('state')!r}"
             )
-            if not actual_node_id:
-                raise ValueError(
-                    f"placement group {pg_id!r} bundle {bundle_index} has no node assignment"
-                )
-            if actual_node_id != claim["node_id"]:
-                raise ValueError(
-                    f"claim node_id does not match Ray placement for {pg_id!r}/{bundle_index}"
-                )
 
-            name = info.get("name")
-            if not isinstance(name, str) or not name:
-                raise ValueError(
-                    f"placement group {pg_id!r} must be named for safe handle recovery"
-                )
-            pg = ray.util.get_placement_group(name)
-            actual_pg_id = pg.id.hex()
-            if actual_pg_id != pg_id:
-                raise ValueError(
-                    f"resolved placement group id mismatch: expected {pg_id!r}, got {actual_pg_id!r}"
-                )
-            if bundle_index >= pg.bundle_count:
-                raise ValueError(
-                    f"resolved placement group {pg_id!r} lacks bundle {bundle_index}"
-                )
-            resolved[pg_id] = pg
+        bundle_index = claim["bundle_index"]
+        bundles = info.get("bundles") or {}
+        if bundles.get(bundle_index, bundles.get(str(bundle_index))) is None:
+            raise ValueError(f"placement group {pg_id!r} has no bundle {bundle_index}")
 
-        return resolved
+        bundle_nodes = info.get("bundles_to_node_id") or {}
+        actual_node_id = bundle_nodes.get(bundle_index, bundle_nodes.get(str(bundle_index)))
+        if not actual_node_id:
+            raise ValueError(
+                f"placement group {pg_id!r} bundle {bundle_index} has no node assignment"
+            )
+        if actual_node_id != claim["node_id"]:
+            raise ValueError(
+                f"claim node_id does not match Ray placement for {pg_id!r}/{bundle_index}"
+            )
 
-    def _new_borrowed_runtime(self, resolved_spec: dict):
-        return self.rollout_replica_class(
-            replica_rank=resolved_spec["replica_rank"],
-            config=self.rollout_config,
-            model_config=self.model_config,
-            gpus_per_node=self.rollout_config.n_gpus_per_node,
-            replica_kind=ReplicaKind.BORROWED,
-            placement_claims=resolved_spec["claims"],
-            runtime_epoch=resolved_spec["placement_epoch"],
-            max_colocate_count=FIRST_RELEASE_MAX_COLOCATE_COUNT,
-        )
+        name = info.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError(
+                f"placement group {pg_id!r} must be named for safe handle recovery"
+            )
+        pg = ray.util.get_placement_group(name)
+        actual_pg_id = pg.id.hex()
+        if actual_pg_id != pg_id:
+            raise ValueError(
+                f"resolved placement group id mismatch: expected {pg_id!r}, got {actual_pg_id!r}"
+            )
+        if bundle_index >= pg.bundle_count:
+            raise ValueError(
+                f"resolved placement group {pg_id!r} lacks bundle {bundle_index}"
+            )
+        return {pg_id: pg}
+
 
     def _borrowed_record_for_key(self, key: ReplicaKey) -> dict:
         matches = [
@@ -370,10 +336,9 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         async with self.replica_operation_lock:
             existing = self.borrowed_operations.get(lease_id)
             if existing is not None:
-                if (
-                    existing["resolved_spec"]["operation_id"] != normalized["operation_id"]
-                    or not self._same_borrowed_create_request(existing, normalized)
-                ):
+                replay_spec = dict(existing["resolved_spec"])
+                replay_spec.pop("replica_rank", None)
+                if replay_spec != normalized:
                     raise ValueError("conflicting borrowed create replay")
                 if existing.get("error") is not None:
                     error = existing["error"]
@@ -418,7 +383,16 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
 
             # Keep ownership of the runtime before any awaited initialization so
             # a failing init can still report/perform verified cleanup.
-            runtime = self._new_borrowed_runtime(resolved_spec)
+            runtime = self.rollout_replica_class(
+                replica_rank=resolved_spec["replica_rank"],
+                config=self.rollout_config,
+                model_config=self.model_config,
+                gpus_per_node=self.rollout_config.n_gpus_per_node,
+                replica_kind=ReplicaKind.BORROWED,
+                placement_claims=resolved_spec["claims"],
+                runtime_epoch=resolved_spec["placement_epoch"],
+                max_colocate_count=FIRST_RELEASE_MAX_COLOCATE_COUNT,
+            )
             runtime_receipt = await runtime.init_from_lease(
                 resolved_spec,
                 pg_by_id,
