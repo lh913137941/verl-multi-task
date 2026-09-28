@@ -91,12 +91,105 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
         finally:
             await lease.release()
 
-    async def bootstrap_and_publish(self, operation: OperationRecord):
+    async def bootstrap_and_publish(self, operation: OperationRecord) -> OperationEvidence:
+        """Bootstrap one hidden borrowed target at current Vpub, then publish it."""
         if not isinstance(operation, OperationRecord):
             raise TypeError("bootstrap_and_publish requires OperationRecord")
-        raise NotImplementedError(
-            "bootstrap_and_publish requires verified target-only parameter bootstrap"
-        )
+        if self.rollouter is None or self.checkpoint_manager is None:
+            raise RuntimeError("Trainer owner dependencies are not initialized")
+        if type(self.current_param_version) is not int or self.current_param_version < 0:
+            raise RuntimeError("current parameter version is unavailable for ADD")
+
+        gate = self.replica_sync_gate
+        lease = await gate.acquire(operation.operation_id, GateKind.ADD)
+        pending_registered = False
+        e_committed = False
+        try:
+            target = await self.rollouter.get_pending_target.remote(operation.operation_id)
+            replicas = tuple(
+                await self.rollouter.get_pending_replicas.remote(operation.operation_id)
+            )
+            if not replicas:
+                raise RuntimeError("ADD target has no prepared runtime")
+            if {
+                getattr(replica, "replica_kind", None)
+                for replica in replicas
+            } != {ReplicaKind.BORROWED}:
+                raise ValueError("ADD requires a prepared BORROWED runtime")
+
+            await lease.guard(
+                self.checkpoint_manager.register_pending,
+                target,
+                replicas,
+                operation_id=operation.operation_id,
+            )
+            pending_registered = True
+
+            weight_evidence = await lease.guard(
+                self.checkpoint_manager.bootstrap_target,
+                target,
+                operation_id=operation.operation_id,
+                loaded_version=self.current_param_version,
+            )
+            _require_evidence(
+                weight_evidence,
+                operation.operation_id,
+                EvidenceType.WEIGHT_READY,
+                "ADD bootstrap",
+            )
+
+            await lease.guard(
+                self.checkpoint_manager.commit_pending,
+                target,
+                weight_evidence,
+                loaded_version=self.current_param_version,
+            )
+            e_committed = True
+
+            service_evidence = await lease.guard(
+                self.rollouter.commit_service_change.remote,
+                operation,
+            )
+            return _require_evidence(
+                service_evidence,
+                operation.operation_id,
+                EvidenceType.SERVICE_COMMITTED,
+                "ADD service commit",
+            )
+        except BaseException as exc:
+            if not e_committed:
+                cleanup_error = None
+                if pending_registered:
+                    try:
+                        await lease.guard(
+                            self.checkpoint_manager.discard_pending,
+                            target,
+                        )
+                    except BaseException as discard_exc:
+                        cleanup_error = discard_exc
+                try:
+                    await lease.guard(
+                        self.rollouter.finalize_release.remote,
+                        operation,
+                    )
+                except BaseException as release_exc:
+                    cleanup_error = release_exc
+                if cleanup_error is not None:
+                    gate.block(
+                        lease.owner,
+                        f"ADD rollback outcome unknown: {type(cleanup_error).__name__}",
+                    )
+                    raise RuntimeError(
+                        "ADD bootstrap failed and prepared runtime cleanup is unverified"
+                    ) from cleanup_error
+            else:
+                gate.block(
+                    lease.owner,
+                    f"ADD publish outcome unknown: {type(exc).__name__}",
+                )
+            raise
+        finally:
+            await lease.release()
 
     async def remove_and_commit(self, operation: OperationRecord) -> OperationEvidence:
         """Remove E and commit R/C while holding the same gate as native sync."""
