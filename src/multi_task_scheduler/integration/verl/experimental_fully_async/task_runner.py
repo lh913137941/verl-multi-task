@@ -232,6 +232,23 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                     )
                 )
                 evidence = ray.get(trainer.bootstrap_and_publish.remote(operation))
+                if (
+                    isinstance(evidence, OperationEvidence)
+                    and evidence.type is EvidenceType.RELEASED
+                ):
+                    rollback_evidence = self._require_evidence(
+                        evidence,
+                        operation_id=operation_id,
+                        expected=EvidenceType.RELEASED,
+                    )
+                    self._advance_lease(command, rollback_evidence)
+                    with self._journal_lock:
+                        self._operation_journal.finish(
+                            operation_id,
+                            OperationStatus.FAILED,
+                            "ADD bootstrap failed; hidden runtime was verified RELEASED",
+                        )
+                    return
                 final_evidence = self._require_evidence(
                     evidence,
                     operation_id=operation_id,
