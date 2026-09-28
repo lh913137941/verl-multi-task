@@ -7,6 +7,17 @@ from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
 
 class MultiTaskvLLMHttpServer(vLLMHttpServer):
+    async def _wait_admission_barrier(self, *, timeout_s: float = 10.0) -> None:
+        """Wait until requests that already crossed the local gate reach vLLM."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while getattr(self, "_admitting", 0) > 0:
+            if loop.time() >= deadline:
+                raise RuntimeError(
+                    f"local admission barrier timed out with {self._admitting} request(s)"
+                )
+            await asyncio.sleep(0.01)
+
     async def runtime_health(self) -> dict:
         """Return first-release server/engine health facts or raise if unhealthy."""
         if self.nnodes != 1 or self.node_rank != 0:
@@ -48,6 +59,7 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
 
         self._submission_paused = True
         self._resume_event.clear()
+        await self._wait_admission_barrier()
 
         engine = getattr(self, "engine", None)
         if engine is not None:
@@ -132,6 +144,7 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
 
         self._submission_paused = True
         self._resume_event.clear()
+        await self._wait_admission_barrier()
 
         # Normal DONATE has already drained at R. Close the local gate and wait
         # again at the runtime boundary; with no requests left, vLLM's portable
