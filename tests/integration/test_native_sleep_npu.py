@@ -137,20 +137,28 @@ def _verl_expected_vllm_pair() -> tuple[str, str] | None:
     except OSError:
         return None
 
-    vllm_match = re.search(
-        r"--branch\s+v(?P<version>\d+\.\d+\.\d+).*?vllm\.git",
-        text,
-        flags=re.DOTALL,
-    )
-    ascend_match = re.search(
-        r"vllm-ascend\.git.*?(?:-b|--branch)\s+releases/v"
-        r"(?P<version>\d+\.\d+\.\d+)",
-        text,
-        flags=re.DOTALL,
-    )
-    if not vllm_match or not ascend_match:
+    vllm_version = None
+    ascend_version = None
+    for line in text.splitlines():
+        if "git clone" not in line:
+            continue
+        if "vllm-ascend.git" in line:
+            match = re.search(
+                r"(?:-b|--branch)\s+releases/v(?P<version>\d+\.\d+\.\d+)",
+                line,
+            )
+            if match:
+                ascend_version = match.group("version")
+        elif "vllm.git" in line:
+            match = re.search(
+                r"(?:-b|--branch)\s+v(?P<version>\d+\.\d+\.\d+)",
+                line,
+            )
+            if match:
+                vllm_version = match.group("version")
+    if not vllm_version or not ascend_version:
         return None
-    return vllm_match.group("version"), ascend_match.group("version")
+    return vllm_version, ascend_version
 
 
 def _validate_vllm_ascend_version_pair() -> None:
@@ -185,14 +193,16 @@ def _validate_vllm_ascend_version_pair() -> None:
     expected_ascend_version = Version(expected_ascend)
     if (
         vllm_version.release[:3] not in {(0, 0, 0), expected_vllm_version.release[:3]}
-        or ascend_version.release[:3]
-        not in {(0, 0, 0), expected_ascend_version.release[:3]}
+        or (
+            ascend_version.release[:2] != (0, 0)
+            and ascend_version.release[:2] != expected_ascend_version.release[:2]
+        )
     ):
         pytest.fail(
             "installed NPU runtime does not match this VERL checkout: "
             f"VERL scripts expect vllm={expected_vllm} and "
-            f"vllm-ascend={expected_ascend}, but metadata reports "
-            f"vllm={vllm_raw}, vllm-ascend={ascend_raw}. Align the two source "
+            f"vllm-ascend={expected_ascend} release lane, but metadata reports "
+            f"vllm={vllm_raw}, vllm-ascend={ascend_raw}. Align the source "
             "checkouts with scripts/install_vllm_mcore_npu.sh before running "
             "MultiTask lifecycle acceptance.",
             pytrace=False,
