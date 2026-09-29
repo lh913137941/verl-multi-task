@@ -14,6 +14,7 @@ from verl.trainer.ppo.utils import Role
 
 from verl.single_controller.ray.base import _unwrap_ray_remote
 from multi_task_scheduler.orchestration.contracts import (
+    CONTROL_RPC_TIMEOUT_S,
     EvidenceType,
     Lease,
     OperationCommand,
@@ -21,6 +22,7 @@ from multi_task_scheduler.orchestration.contracts import (
     OperationKind,
     OperationRecord,
     OperationStatus,
+    require_evidence,
 )
 from multi_task_scheduler.orchestration.operation_journal import OperationJournal
 from multi_task_scheduler.scheduler.discovery import get_or_create_group_scheduler
@@ -82,22 +84,34 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             "placement_epoch": command.target.runtime_epoch,
         }
 
-    @staticmethod
-    def _require_evidence(
-        value,
-        *,
+    def _close_rolled_back(
+        self,
+        command: OperationCommand,
         operation_id: str,
-        expected: EvidenceType,
-    ) -> OperationEvidence:
-        if not isinstance(value, OperationEvidence):
-            raise TypeError(f"expected OperationEvidence({expected.value})")
-        if value.operation_id != operation_id:
-            raise ValueError("operation evidence belongs to another operation")
-        if value.type is not expected:
-            raise ValueError(
-                f"expected {expected.value} evidence, got {value.type.value}"
+        evidence,
+        label: str,
+        result: str,
+    ) -> None:
+        """Close an operation whose owner-side commit was verifiably rolled back.
+
+        The owner answered RELEASED instead of SERVICE_COMMITTED, which is the
+        documented proof that no hidden/native runtime survived the attempt. GS
+        records the same RELEASED receipt as a rollback, so the lease is advanced
+        -- not abandoned -- before the journal closes FAILED.
+        """
+        rollback_evidence = require_evidence(
+            evidence,
+            operation_id,
+            EvidenceType.RELEASED,
+            label,
+        )
+        self._advance_lease(command, rollback_evidence)
+        with self._journal_lock:
+            self._operation_journal.finish(
+                operation_id,
+                OperationStatus.FAILED,
+                result,
             )
-        return value
 
     def _advance_lease(
         self,
@@ -115,7 +129,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                         command.lease_id,
                         evidence,
                     ),
-                    timeout=30,
+                    timeout=CONTROL_RPC_TIMEOUT_S,
                 )
                 return
             except Exception as exc:
@@ -259,41 +273,32 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                     isinstance(prepare_result, OperationEvidence)
                     and prepare_result.type is EvidenceType.RELEASED
                 ):
-                    rollback_evidence = self._require_evidence(
+                    self._close_rolled_back(
+                        command,
+                        operation_id,
                         prepare_result,
-                        operation_id=operation_id,
-                        expected=EvidenceType.RELEASED,
+                        "prepare_replica",
+                        "ADD prepare failed; no borrower runtime remains",
                     )
-                    self._advance_lease(command, rollback_evidence)
-                    with self._journal_lock:
-                        self._operation_journal.finish(
-                            operation_id,
-                            OperationStatus.FAILED,
-                            "ADD prepare failed; no borrower runtime remains",
-                        )
                     return
                 evidence = ray.get(trainer.bootstrap_and_publish.remote(operation))
                 if (
                     isinstance(evidence, OperationEvidence)
                     and evidence.type is EvidenceType.RELEASED
                 ):
-                    rollback_evidence = self._require_evidence(
+                    self._close_rolled_back(
+                        command,
+                        operation_id,
                         evidence,
-                        operation_id=operation_id,
-                        expected=EvidenceType.RELEASED,
+                        "bootstrap_and_publish",
+                        "ADD bootstrap failed; hidden runtime was verified RELEASED",
                     )
-                    self._advance_lease(command, rollback_evidence)
-                    with self._journal_lock:
-                        self._operation_journal.finish(
-                            operation_id,
-                            OperationStatus.FAILED,
-                            "ADD bootstrap failed; hidden runtime was verified RELEASED",
-                        )
                     return
-                final_evidence = self._require_evidence(
+                final_evidence = require_evidence(
                     evidence,
-                    operation_id=operation_id,
-                    expected=EvidenceType.SERVICE_COMMITTED,
+                    operation_id,
+                    EvidenceType.SERVICE_COMMITTED,
+                    "bootstrap_and_publish",
                 )
 
             elif command.kind in {OperationKind.DONATE, OperationKind.REMOVE}:
@@ -309,10 +314,11 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                         )
                     )
                     if prior_release is not None:
-                        final_evidence = self._require_evidence(
+                        final_evidence = require_evidence(
                             prior_release,
-                            operation_id=operation_id,
-                            expected=EvidenceType.RELEASED,
+                            operation_id,
+                            EvidenceType.RELEASED,
+                            "query_release_operation",
                         )
                         self._advance_lease(command, final_evidence)
                         with self._journal_lock:
@@ -360,26 +366,29 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                                 )
                             return
                         raise
-                    self._require_evidence(
+                    require_evidence(
                         exit_evidence,
-                        operation_id=operation_id,
-                        expected=EvidenceType.EXIT_READY,
+                        operation_id,
+                        EvidenceType.EXIT_READY,
+                        "prepare_exit",
                     )
                     service_evidence = ray.get(
                         trainer.remove_and_commit.remote(operation)
                     )
 
-                self._require_evidence(
+                require_evidence(
                     service_evidence,
-                    operation_id=operation_id,
-                    expected=EvidenceType.SERVICE_COMMITTED,
+                    operation_id,
+                    EvidenceType.SERVICE_COMMITTED,
+                    "exit service commit",
                 )
 
                 release_evidence = ray.get(rollouter.finalize_release.remote(operation))
-                final_evidence = self._require_evidence(
+                final_evidence = require_evidence(
                     release_evidence,
-                    operation_id=operation_id,
-                    expected=EvidenceType.RELEASED,
+                    operation_id,
+                    EvidenceType.RELEASED,
+                    "finalize_release",
                 )
                 self._advance_lease(command, final_evidence)
 
@@ -396,23 +405,19 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                     isinstance(evidence, OperationEvidence)
                     and evidence.type is EvidenceType.RELEASED
                 ):
-                    rollback_evidence = self._require_evidence(
+                    self._close_rolled_back(
+                        command,
+                        operation_id,
                         evidence,
-                        operation_id=operation_id,
-                        expected=EvidenceType.RELEASED,
+                        "restore_and_publish",
+                        "RESTORE bootstrap failed; native runtime was verified re-slept",
                     )
-                    self._advance_lease(command, rollback_evidence)
-                    with self._journal_lock:
-                        self._operation_journal.finish(
-                            operation_id,
-                            OperationStatus.FAILED,
-                            "RESTORE bootstrap failed; native runtime was verified re-slept",
-                        )
                     return
-                final_evidence = self._require_evidence(
+                final_evidence = require_evidence(
                     evidence,
-                    operation_id=operation_id,
-                    expected=EvidenceType.SERVICE_COMMITTED,
+                    operation_id,
+                    EvidenceType.SERVICE_COMMITTED,
+                    "restore_and_publish",
                 )
                 self._advance_lease(command, final_evidence)
 
@@ -465,7 +470,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                 try:
                     ray.get(
                         self.group_scheduler.detach_task.remote(self.task_session),
-                        timeout=30,
+                        timeout=CONTROL_RPC_TIMEOUT_S,
                     )
                 except Exception:
                     logger.warning(
@@ -478,7 +483,10 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
     def _replace_message_queue(self, config) -> None:
         """Swap the native empty startup queue for the queue-owned idempotent variant."""
         old_queue = self.components["message_queue"]
-        old_size = ray.get(old_queue.get_queue_size.remote(), timeout=30)
+        old_size = ray.get(
+            old_queue.get_queue_size.remote(),
+            timeout=CONTROL_RPC_TIMEOUT_S,
+        )
         if old_size != 0:
             raise RuntimeError(
                 "cannot replace native MessageQueue after samples have been enqueued"
@@ -486,7 +494,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
 
         max_queue_size = ray.get(
             self.components["rollouter"].get_max_queue_size.remote(),
-            timeout=30,
+            timeout=CONTROL_RPC_TIMEOUT_S,
         )
         ray.kill(old_queue, no_restart=True)
 
@@ -516,7 +524,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                 self.task_session,
                 ray.get_runtime_context().current_actor,
             ),
-            timeout=30,
+            timeout=CONTROL_RPC_TIMEOUT_S,
         )
         self._attached_to_gs = True
         with self._journal_lock:

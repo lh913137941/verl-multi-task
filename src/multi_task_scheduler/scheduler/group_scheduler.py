@@ -8,15 +8,16 @@ import ray
 from ray.actor import ActorHandle
 
 from multi_task_scheduler.orchestration.contracts import (
+    CONTROL_RPC_TIMEOUT_S,
     EvidenceType,
     Lease,
     OperationCommand,
     OperationEvidence,
     OperationKind,
     OperationRecord,
-    OperationStatus,
     ReplicaKey,
     ReplicaKind,
+    native_replica_key,
 )
 
 RUNTIME_KIND = "verl-multi-task:experimental_fully_async_standalone:092203-r2"
@@ -68,9 +69,6 @@ class GroupScheduler:
             raise ValueError("task_id must be a nonempty string")
         self.task_runners.pop(task_id, None)
         self.idle_reports.pop(task_id, None)
-
-    def get_task_runners(self) -> dict[str, ActorHandle]:
-        return dict(self.task_runners)
 
     def submit_idle_report(self, report):
         if not isinstance(report, dict):
@@ -227,32 +225,30 @@ class GroupScheduler:
                 for gpu_uuid in lease.gpu_uuids:
                     self.active_gpu_owner[gpu_uuid] = command.lease_id
 
-        try:
-            result = ray.get(
-                task_runner.submit_operation.remote(command, lease=lease),
-                timeout=30,
-            )
-            if not isinstance(result, OperationRecord):
-                raise TypeError("TaskRunner returned a non-OperationRecord")
-            if result.operation_id != command.operation_id:
-                raise ValueError("TaskRunner returned a record for another operation")
-            return result
-        except BaseException:
-            # A missing TaskRunner journal record is itself an UNKNOWN delivery
-            # observation: the submit RPC may have crossed the actor boundary
-            # before its reply was lost. Preserve GS intent/reservations and
-            # require an exact-command replay or later evidence to reconcile it.
-            # Never infer "definitely unaccepted" from UNKNOWN + empty result.
-            raise
+        # A failed submit RPC is itself an UNKNOWN delivery observation: it may
+        # have crossed the actor boundary before its reply was lost. Any
+        # exception therefore propagates unchanged, with the staged intent and
+        # reservations above left in place, and must be reconciled by an exact
+        # command replay or later evidence. Never infer "definitely unaccepted"
+        # from UNKNOWN + empty result.
+        result = ray.get(
+            task_runner.submit_operation.remote(command, lease=lease),
+            timeout=CONTROL_RPC_TIMEOUT_S,
+        )
+        if not isinstance(result, OperationRecord):
+            raise TypeError("TaskRunner returned a non-OperationRecord")
+        if result.operation_id != command.operation_id:
+            raise ValueError("TaskRunner returned a record for another operation")
+        return result
 
     @staticmethod
     def _target_matches_donor(target: ReplicaKey, lease: Lease) -> bool:
         """Match first-release donor identity without trusting a handle from GS."""
         claim = lease.claims[0]
-        rank = claim["donor_replica_rank"]
-        # Manager and Trainer both register native owner identity as
-        # ReplicaKey(task_session, f"native-{replica_rank}", epoch=0).
-        return target.replica_id == f"native-{rank}" and target.runtime_epoch == 0
+        return target == native_replica_key(
+            target.task_session,
+            claim["donor_replica_rank"],
+        )
 
     def open_lease(self, lease: Lease) -> Lease:
         """GS-internal ledger action; scheduler policy calls this before command issue."""

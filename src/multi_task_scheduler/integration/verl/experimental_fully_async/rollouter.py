@@ -21,17 +21,10 @@ from multi_task_scheduler.orchestration.contracts import (
     ReplicaKey,
     ReplicaKind,
     ReplicaState,
+    require_evidence,
 )
 
 from .llm_server_manager import MultiTaskLLMServerManager
-
-
-def _require_evidence(value, operation_id: str, expected: EvidenceType, label: str):
-    if not isinstance(value, OperationEvidence):
-        raise TypeError(f"{label} did not return OperationEvidence")
-    if value.operation_id != operation_id or value.type is not expected:
-        raise ValueError(f"{label} evidence does not match {operation_id}/{expected.value}")
-    return value
 
 
 def _continuation_prefix_digest(prompt_ids, token_ids) -> str:
@@ -410,6 +403,20 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                 )
         return True
 
+    async def _begin_drain_once(self, replica_key: ReplicaKey, operation_id: str):
+        """Start R-side drain with exactly one exact replay.
+
+        begin_drain is idempotent for the same operation, so a single retry
+        reconciles the common case where R committed but its reply was lost. A
+        second failure leaves the drain outcome unverified and propagates, which
+        is what keeps the caller on the conservative DRAINING projection.
+        """
+        lb = self.llm_server_manager.global_load_balancer
+        try:
+            return await lb.begin_drain.remote(replica_key, operation_id)
+        except BaseException:
+            return await lb.begin_drain.remote(replica_key, operation_id)
+
     async def prepare_exit(
         self,
         replica_key: ReplicaKey,
@@ -467,14 +474,9 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                 self._pending_operation_targets[operation_id] = replica_key
 
             try:
-                try:
-                    drained_server = await lb.begin_drain.remote(
-                        replica_key, operation_id
-                    )
-                except BaseException:
-                    drained_server = await lb.begin_drain.remote(
-                        replica_key, operation_id
-                    )
+                drained_server = await self._begin_drain_once(
+                    replica_key, operation_id
+                )
                 if drained_server != server_id:
                     raise RuntimeError("FORCE drain bound a different server")
 
@@ -556,13 +558,7 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         self._pending_operation_targets[operation_id] = replica_key
 
         try:
-            try:
-                server_id = await lb.begin_drain.remote(replica_key, operation_id)
-            except BaseException:
-                # begin_drain is idempotent for the same operation. One retry
-                # reconciles the common case where R committed but the reply was
-                # lost; a second failure leaves the drain outcome unverified.
-                server_id = await lb.begin_drain.remote(replica_key, operation_id)
+            server_id = await self._begin_drain_once(replica_key, operation_id)
 
             loop = asyncio.get_running_loop()
             if self._natural_drain_timeout_s <= 0:
@@ -649,7 +645,7 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                     "service publication remains unknown during reconciliation"
                 ) from exc
             if reconciled is not None:
-                evidence = _require_evidence(
+                evidence = require_evidence(
                     reconciled,
                     operation.operation_id,
                     EvidenceType.SERVICE_COMMITTED,
@@ -690,13 +686,13 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                         server_handle,
                         operation.operation_id,
                     )
-                    _require_evidence(
+                    require_evidence(
                         evidence,
                         operation.operation_id,
                         EvidenceType.SERVICE_COMMITTED,
                         "ADD routing commit",
                     )
-                except BaseException as commit_exc:
+                except BaseException:
                     try:
                         reconciled = await lb.query_ready_operation.remote(
                             operation.operation_id
@@ -706,7 +702,7 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                             "ADD routing commit outcome is unknown"
                         ) from reconcile_exc
                     if reconciled is not None:
-                        evidence = _require_evidence(
+                        evidence = require_evidence(
                             reconciled,
                             operation.operation_id,
                             EvidenceType.SERVICE_COMMITTED,
@@ -773,13 +769,13 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                         server_handle,
                         operation.operation_id,
                     )
-                    _require_evidence(
+                    require_evidence(
                         evidence,
                         operation.operation_id,
                         EvidenceType.SERVICE_COMMITTED,
                         "RESTORE routing commit",
                     )
-                except BaseException as commit_exc:
+                except BaseException:
                     try:
                         reconciled = await lb.query_ready_operation.remote(
                             operation.operation_id
@@ -793,7 +789,7 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
 
                     if reconciled is not None:
                         try:
-                            evidence = _require_evidence(
+                            evidence = require_evidence(
                                 reconciled,
                                 operation.operation_id,
                                 EvidenceType.SERVICE_COMMITTED,
@@ -835,19 +831,16 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                 f"service exit commit requires DRAINING replica, got {state.value}"
             )
 
-        try:
-            server_id = await lb.server_for_replica.remote(target)
-            if server_id is not None and await lb.has_unsettled_requests.remote(server_id):
-                raise ValueError("cannot commit service exit while requests remain unsettled")
-            await lb.finish_remove.remote(target)
-            manager.deactivate_service(target)
-            self._update_max_concurrent_samples()
-        except BaseException:
-            # E was already removed by Trainer under G. Keep the conservative
-            # DRAINING projection so the same operation can reconcile R/C under
-            # the BLOCKED gate. Physical release still quarantines separately
-            # when it cannot be proved.
-            raise
+        # Any failure here propagates unchanged. E was already removed by Trainer
+        # under G, so the conservative DRAINING projection must survive: the same
+        # operation then reconciles R/C under the BLOCKED gate, and physical
+        # release still quarantines separately when it cannot be proved.
+        server_id = await lb.server_for_replica.remote(target)
+        if server_id is not None and await lb.has_unsettled_requests.remote(server_id):
+            raise ValueError("cannot commit service exit while requests remain unsettled")
+        await lb.finish_remove.remote(target)
+        manager.deactivate_service(target)
+        self._update_max_concurrent_samples()
 
         return OperationEvidence.now(
             operation.operation_id,
@@ -887,7 +880,7 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                 )
                 target_state = ReplicaState.RELEASED
 
-            _require_evidence(
+            require_evidence(
                 evidence,
                 operation.operation_id,
                 EvidenceType.RELEASED,

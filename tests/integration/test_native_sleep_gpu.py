@@ -109,7 +109,6 @@ def _exercise_same_gpu_borrower(
     )
     from multi_task_scheduler.orchestration.contracts import (
         EvidenceType,
-        FIRST_RELEASE_MAX_COLOCATE_COUNT,
         FIRST_RELEASE_RAY_GPU_FRACTION,
         ReplicaKey,
         ReplicaState,
