@@ -282,6 +282,21 @@ def _require_plain_acceptance_model(path: Path) -> None:
             "outside this lifecycle acceptance."
         )
 
+    # Ask the installed backend itself. vLLM-Ascend 0.23+ auto-detects
+    # quantization during platform config; mirroring that exact decision here
+    # prevents lifecycle tests from silently entering a quantized loader path.
+    try:
+        from vllm_ascend.quantization.utils import detect_quantization_method
+    except (ImportError, AttributeError):
+        return
+    detected = detect_quantization_method(str(path))
+    if detected is not None:
+        pytest.skip(
+            "NPU lifecycle acceptance requires a plain BF16/FP16 model; "
+            f"the installed vLLM-Ascend backend auto-detected quantization "
+            f"method {detected!r}. Validate that loader separately first."
+        )
+
 
 def _require_model_path() -> str:
     value = os.environ.get(MODEL_ENV)
@@ -338,7 +353,6 @@ def _runtime_env() -> dict:
         "HCCL_HOST_SOCKET_PORT_RANGE": "60000-60050",
         "HCCL_NPU_SOCKET_PORT_RANGE": "61000-61050",
         "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
-        "VLLM_ASCEND_AUTO_DETECT_QUANTIZATION": "0",
         "VLLM_LOGGING_LEVEL": "INFO",
         "VLLM_USE_V1": "1",
     }
