@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from multi_task_scheduler.orchestration.contracts import (
+    CONTROL_RPC_TIMEOUT_S,
     EvidenceType,
     AttemptState,
     FIRST_RELEASE_MAX_COLOCATE_COUNT,
@@ -20,6 +21,7 @@ from multi_task_scheduler.orchestration.contracts import (
     ReplicaKey,
     ReplicaKind,
     ReplicaState,
+    native_replica_key,
 )
 from multi_task_scheduler.orchestration.operation_journal import OperationJournal
 from multi_task_scheduler.orchestration.replica_sync_gate import GateKind, ReplicaSyncGate
@@ -113,6 +115,7 @@ def taskrunner_class():
         threading=threading,
         ray=FakeRay,
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
+        CONTROL_RPC_TIMEOUT_S=CONTROL_RPC_TIMEOUT_S,
         logger=type("Logger", (), {"exception": lambda *args, **kwargs: None})(),
     )
 
@@ -133,6 +136,7 @@ def trainer_class():
         EvidenceType=EvidenceType,
         ReplicaKey=ReplicaKey,
         ReplicaKind=ReplicaKind,
+        native_replica_key=native_replica_key,
         GateKind=GateKind,
         ReplicaSyncGate=ReplicaSyncGate,
         _require_evidence=_test_require_evidence,
@@ -3358,6 +3362,7 @@ def native_manager_class():
         ReplicaState=ReplicaState,
         EvidenceType=EvidenceType,
         OperationEvidence=OperationEvidence,
+        native_replica_key=native_replica_key,
         asyncio=asyncio,
     )
 
@@ -3933,6 +3938,8 @@ def _isolated_group_scheduler_class():
         "EvidenceType": EvidenceType,
         "_RELEASE_KINDS": {OperationKind.DONATE, OperationKind.REMOVE},
         "_IDLE_REPORT_MAX_AGE_S": 10.0,
+        "CONTROL_RPC_TIMEOUT_S": CONTROL_RPC_TIMEOUT_S,
+        "native_replica_key": native_replica_key,
         "time": time,
         "ray": FakeRay,
     }
@@ -4199,6 +4206,8 @@ def test_group_scheduler_binds_donate_to_lease_donor_rank():
         "EvidenceType": EvidenceType,
         "_RELEASE_KINDS": {OperationKind.DONATE, OperationKind.REMOVE},
         "_IDLE_REPORT_MAX_AGE_S": 10.0,
+        "CONTROL_RPC_TIMEOUT_S": CONTROL_RPC_TIMEOUT_S,
+        "native_replica_key": native_replica_key,
         "time": time,
         "ray": type("Ray", (), {"remote": staticmethod(lambda **kwargs: (lambda cls: cls))}),
     }
@@ -4247,6 +4256,8 @@ def test_group_scheduler_restore_requires_original_donor_and_returned_claims():
         "EvidenceType": EvidenceType,
         "_RELEASE_KINDS": {OperationKind.DONATE, OperationKind.REMOVE},
         "_IDLE_REPORT_MAX_AGE_S": 10.0,
+        "CONTROL_RPC_TIMEOUT_S": CONTROL_RPC_TIMEOUT_S,
+        "native_replica_key": native_replica_key,
         "time": time,
         "ray": FakeRay,
     }

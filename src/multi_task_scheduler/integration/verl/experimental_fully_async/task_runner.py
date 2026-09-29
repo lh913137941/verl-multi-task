@@ -14,6 +14,7 @@ from verl.trainer.ppo.utils import Role
 
 from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
 from multi_task_scheduler.orchestration.contracts import (
+    CONTROL_RPC_TIMEOUT_S,
     EvidenceType,
     Lease,
     OperationCommand,
@@ -115,7 +116,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                         command.lease_id,
                         evidence,
                     ),
-                    timeout=30,
+                    timeout=CONTROL_RPC_TIMEOUT_S,
                 )
                 return
             except Exception as exc:
@@ -458,7 +459,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                 try:
                     ray.get(
                         self.group_scheduler.detach_task.remote(self.task_session),
-                        timeout=30,
+                        timeout=CONTROL_RPC_TIMEOUT_S,
                     )
                 except Exception:
                     logger.warning(
@@ -471,7 +472,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
     def _replace_message_queue(self, config) -> None:
         """Swap the native empty startup queue for the queue-owned idempotent variant."""
         old_queue = self.components["message_queue"]
-        old_size = ray.get(old_queue.get_queue_size.remote(), timeout=30)
+        old_size = ray.get(old_queue.get_queue_size.remote(), timeout=CONTROL_RPC_TIMEOUT_S)
         if old_size != 0:
             raise RuntimeError(
                 "cannot replace native MessageQueue after samples have been enqueued"
@@ -479,7 +480,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
 
         max_queue_size = ray.get(
             self.components["rollouter"].get_max_queue_size.remote(),
-            timeout=30,
+            timeout=CONTROL_RPC_TIMEOUT_S,
         )
         ray.kill(old_queue, no_restart=True)
 
@@ -509,7 +510,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                 self.task_session,
                 ray.get_runtime_context().current_actor,
             ),
-            timeout=30,
+            timeout=CONTROL_RPC_TIMEOUT_S,
         )
         self._attached_to_gs = True
         with self._journal_lock:

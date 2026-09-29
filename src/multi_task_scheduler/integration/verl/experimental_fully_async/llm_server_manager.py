@@ -16,6 +16,7 @@ from multi_task_scheduler.orchestration.contracts import (
     ReplicaKey,
     ReplicaKind,
     ReplicaState,
+    native_replica_key,
 )
 from multi_task_scheduler.rollout.load_balancer import MultiTaskGlobalRequestLoadBalancer
 from multi_task_scheduler.rollout.replica import MultiTaskvLLMReplica
@@ -66,15 +67,13 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             raise RuntimeError("Manager requires task_session before replica initialization")
         for index, replica in enumerate(self.rollout_replicas):
             rank = getattr(replica, "replica_rank", index)
-            key = ReplicaKey(self.task_session, f"native-{rank}", 0)
+            key = native_replica_key(self.task_session, rank)
             self.register_replica(
                 key,
                 ReplicaKind.NATIVE,
                 state=ReplicaState.ACTIVE,
                 runtime=replica,
             )
-            if type(rank) is not int or rank < 0:
-                raise ValueError("native replica_rank must be a nonnegative integer")
             self.next_replica_rank = max(self.next_replica_rank, rank + 1)
 
     async def _init_global_load_balancer(self) -> None:

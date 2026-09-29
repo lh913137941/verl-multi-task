@@ -8,6 +8,7 @@ import ray
 from ray.actor import ActorHandle
 
 from multi_task_scheduler.orchestration.contracts import (
+    CONTROL_RPC_TIMEOUT_S,
     EvidenceType,
     Lease,
     OperationCommand,
@@ -17,6 +18,7 @@ from multi_task_scheduler.orchestration.contracts import (
     OperationStatus,
     ReplicaKey,
     ReplicaKind,
+    native_replica_key,
 )
 
 RUNTIME_KIND = "verl-multi-task:experimental_fully_async_standalone:092203-r2"
@@ -230,7 +232,7 @@ class GroupScheduler:
         try:
             result = ray.get(
                 task_runner.submit_operation.remote(command, lease=lease),
-                timeout=30,
+                timeout=CONTROL_RPC_TIMEOUT_S,
             )
             if not isinstance(result, OperationRecord):
                 raise TypeError("TaskRunner returned a non-OperationRecord")
@@ -249,10 +251,10 @@ class GroupScheduler:
     def _target_matches_donor(target: ReplicaKey, lease: Lease) -> bool:
         """Match first-release donor identity without trusting a handle from GS."""
         claim = lease.claims[0]
-        rank = claim["donor_replica_rank"]
-        # Manager and Trainer both register native owner identity as
-        # ReplicaKey(task_session, f"native-{replica_rank}", epoch=0).
-        return target.replica_id == f"native-{rank}" and target.runtime_epoch == 0
+        return target == native_replica_key(
+            target.task_session,
+            claim["donor_replica_rank"],
+        )
 
     def open_lease(self, lease: Lease) -> Lease:
         """GS-internal ledger action; scheduler policy calls this before command issue."""

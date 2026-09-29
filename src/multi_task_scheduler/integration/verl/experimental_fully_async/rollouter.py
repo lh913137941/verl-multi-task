@@ -374,6 +374,18 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         # reconciled by the existing service path rather than overwritten here.
         return False
 
+    async def _begin_drain_once(
+        self,
+        replica_key: ReplicaKey,
+        operation_id: str,
+    ):
+        """Start R drain with one exact replay for lost-reply reconciliation."""
+        lb = self.llm_server_manager.global_load_balancer
+        try:
+            return await lb.begin_drain.remote(replica_key, operation_id)
+        except BaseException:
+            return await lb.begin_drain.remote(replica_key, operation_id)
+
     async def prepare_exit(
         self,
         replica_key: ReplicaKey,
@@ -431,14 +443,9 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                 self._pending_operation_targets[operation_id] = replica_key
 
             try:
-                try:
-                    drained_server = await lb.begin_drain.remote(
-                        replica_key, operation_id
-                    )
-                except BaseException:
-                    drained_server = await lb.begin_drain.remote(
-                        replica_key, operation_id
-                    )
+                drained_server = await self._begin_drain_once(
+                    replica_key, operation_id
+                )
                 if drained_server != server_id:
                     raise RuntimeError("FORCE drain bound a different server")
 
@@ -528,13 +535,7 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         self._pending_operation_targets[operation_id] = replica_key
 
         try:
-            try:
-                server_id = await lb.begin_drain.remote(replica_key, operation_id)
-            except BaseException:
-                # begin_drain is idempotent for the same operation. One retry
-                # reconciles the common case where R committed but the reply was
-                # lost; a second failure leaves the drain outcome unverified.
-                server_id = await lb.begin_drain.remote(replica_key, operation_id)
+            server_id = await self._begin_drain_once(replica_key, operation_id)
 
             loop = asyncio.get_running_loop()
             if self._natural_drain_timeout_s <= 0:

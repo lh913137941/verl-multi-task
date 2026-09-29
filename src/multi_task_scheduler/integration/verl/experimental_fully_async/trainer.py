@@ -18,6 +18,7 @@ from multi_task_scheduler.orchestration.contracts import (
     ReplicaKey,
     require_operation_evidence as _require_evidence,
     ReplicaKind,
+    native_replica_key,
 )
 from multi_task_scheduler.orchestration.replica_sync_gate import GateKind, ReplicaSyncGate
 
@@ -45,7 +46,7 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
 
         for index, replica in enumerate(replicas):
             rank = getattr(replica, "replica_rank", index)
-            key = ReplicaKey(self.task_session, f"native-{rank}", 0)
+            key = native_replica_key(self.task_session, rank)
             self.checkpoint_manager.add_effective(
                 key,
                 [replica],
@@ -117,6 +118,13 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
         finally:
             await lease.release()
 
+    @staticmethod
+    def _gate_fences(gate: ReplicaSyncGate, operation_id: str) -> bool:
+        return (
+            gate.health == "BLOCKED"
+            and gate.blocked_operation_id == operation_id
+        )
+
     async def _reconcile_blocked_publish(
         self,
         operation: OperationRecord,
@@ -125,10 +133,7 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
     ) -> OperationEvidence | None:
         """Resolve a BLOCKED ADD/RESTORE publication from owner facts under G."""
         gate = self.replica_sync_gate
-        if (
-            gate.health != "BLOCKED"
-            or gate.blocked_operation_id != operation.operation_id
-        ):
+        if not self._gate_fences(gate, operation.operation_id):
             return None
 
         target = await self.rollouter.get_pending_target.remote(operation.operation_id)
@@ -347,10 +352,7 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
     ) -> OperationEvidence | None:
         """Resolve a BLOCKED DONATE/REMOVE service commit from owner facts under G."""
         gate = self.replica_sync_gate
-        if (
-            gate.health != "BLOCKED"
-            or gate.blocked_operation_id != operation.operation_id
-        ):
+        if not self._gate_fences(gate, operation.operation_id):
             return None
 
         target = await self.rollouter.get_pending_target.remote(operation.operation_id)

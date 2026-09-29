@@ -19,6 +19,10 @@ from typing import Any, Mapping
 FIRST_RELEASE_MAX_COLOCATE_COUNT = 2
 FIRST_RELEASE_RAY_GPU_FRACTION = 1.0 / FIRST_RELEASE_MAX_COLOCATE_COUNT
 
+# Delivery budget for synchronous control-plane RPC replies. This bounds
+# caller wait only; it is never lifecycle failure/release evidence.
+CONTROL_RPC_TIMEOUT_S = 30.0
+
 
 class ReplicaKind(str, Enum):
     NATIVE = "NATIVE"
@@ -77,6 +81,17 @@ class ReplicaKey:
             raise ValueError("replica_id must be a nonempty string")
         if type(self.runtime_epoch) is not int or self.runtime_epoch < 0:
             raise ValueError("runtime_epoch must be a nonnegative integer")
+
+
+def native_replica_key(
+    task_session: str,
+    replica_rank: int,
+    runtime_epoch: int = 0,
+) -> ReplicaKey:
+    """Single source for the retained-native replica identity convention."""
+    if type(replica_rank) is not int or replica_rank < 0:
+        raise ValueError("native replica_rank must be a nonnegative integer")
+    return ReplicaKey(task_session, f"native-{replica_rank}", runtime_epoch)
 
 
 @dataclass(frozen=True)
