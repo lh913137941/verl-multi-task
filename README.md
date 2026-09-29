@@ -51,7 +51,7 @@ experimental_fully_async_standalone
 截至当前分支最近一轮验证：
 
 ```text
-unit:             332 passed
+unit:             336 passed
 ray_integration:    6 passed
 native_unit:        8 passed
 ```
