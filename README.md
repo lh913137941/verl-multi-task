@@ -337,7 +337,11 @@ export VERL_MULTITASK_RAY_TMPDIR=/path/to/large/local/filesystem/ray_tmp
 # 0) 不启动 Ray/vLLM；检查版本配对、Git HEAD、NPU、模型量化判定和临时盘。
 python scripts/e2e/diagnose_npu_runtime.py
 
-# 1) 不经过 MultiTask subclass，只验证 upstream load + generate。
+# 1) 不经过 MultiTask subclass，分层验证 backend：
+#    A. direct vLLM-Ascend default executor（单卡默认 uni）
+#    B. direct vLLM-Ascend distributed_executor_backend=mp
+#    C. VERL vLLMReplica 但禁用 worker_extension_cls
+#    D. 原生 VERL vLLMReplica
 python -m pytest -q -s \
   -m npu_backend_smoke \
   tests/integration/test_native_sleep_npu.py
