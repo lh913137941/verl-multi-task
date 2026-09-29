@@ -161,6 +161,27 @@ def _verl_expected_vllm_pair() -> tuple[str, str] | None:
     return vllm_version, ascend_version
 
 
+def _verl_expected_transformers() -> str | None:
+    """Read the final transformers pin from the installed VERL NPU installer."""
+    try:
+        import verl
+    except Exception:
+        return None
+    repo_root = Path(verl.__file__).resolve().parent.parent
+    install_script = repo_root / "scripts" / "install_vllm_mcore_npu.sh"
+    if not install_script.exists():
+        return None
+    try:
+        text = install_script.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    matches = re.findall(
+        r"transformers==(?P<version>\d+\.\d+\.\d+)",
+        text,
+    )
+    return matches[-1] if matches else None
+
+
 def _validate_vllm_ascend_version_pair() -> None:
     """Fail fast before model load when the NPU runtime sources are unpaired."""
     vllm_raw = metadata.version("vllm")
@@ -212,6 +233,20 @@ def _validate_vllm_ascend_version_pair() -> None:
 def _print_npu_runtime_diagnostics() -> None:
     _validate_vllm_ascend_version_pair()
 
+    expected_transformers = _verl_expected_transformers()
+    actual_transformers = metadata.version("transformers")
+    if (
+        expected_transformers is not None
+        and actual_transformers != expected_transformers
+    ):
+        pytest.fail(
+            "installed transformers does not match this VERL NPU checkout: "
+            f"expected {expected_transformers}, got {actual_transformers}. "
+            "Align the environment with scripts/install_vllm_mcore_npu.sh "
+            "before running NPU backend/lifecycle acceptance.",
+            pytrace=False,
+        )
+
     def version(name: str) -> str:
         try:
             return metadata.version(name)
@@ -237,6 +272,8 @@ def _print_npu_runtime_diagnostics() -> None:
             "vllm_ascend_git_head": _source_git_head(vllm_ascend.__file__),
             "ascend_rl_config": _ascend_supports_rl_config(),
             "verl_expected_vllm_pair": _verl_expected_vllm_pair(),
+            "verl_expected_transformers": expected_transformers,
+            "transformers": actual_transformers,
             "verl_device": get_device_name(),
             "ray_resource": get_resource_name(),
             "VERL_PLATFORM": os.environ.get("VERL_PLATFORM"),
