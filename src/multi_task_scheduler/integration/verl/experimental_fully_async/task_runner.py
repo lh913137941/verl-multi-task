@@ -22,6 +22,7 @@ from multi_task_scheduler.orchestration.contracts import (
     OperationKind,
     OperationRecord,
     OperationStatus,
+    require_operation_evidence as _require_evidence,
 )
 from multi_task_scheduler.orchestration.operation_journal import OperationJournal
 from multi_task_scheduler.scheduler.discovery import get_or_create_group_scheduler
@@ -83,23 +84,6 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             "placement_epoch": command.target.runtime_epoch,
         }
 
-    @staticmethod
-    def _require_evidence(
-        value,
-        *,
-        operation_id: str,
-        expected: EvidenceType,
-    ) -> OperationEvidence:
-        if not isinstance(value, OperationEvidence):
-            raise TypeError(f"expected OperationEvidence({expected.value})")
-        if value.operation_id != operation_id:
-            raise ValueError("operation evidence belongs to another operation")
-        if value.type is not expected:
-            raise ValueError(
-                f"expected {expected.value} evidence, got {value.type.value}"
-            )
-        return value
-
     def _advance_lease(
         self,
         command: OperationCommand,
@@ -143,7 +127,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             and evidence.type is EvidenceType.RELEASED
         ):
             return False
-        released = self._require_evidence(
+        released = _require_evidence(
             evidence,
             operation_id=command.operation_id,
             expected=EvidenceType.RELEASED,
