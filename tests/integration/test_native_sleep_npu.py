@@ -20,9 +20,10 @@ pytestmark = [pytest.mark.native, pytest.mark.npu_integration]
 
 
 @pytest.fixture(autouse=True)
-def _pin_verl_npu_platform(monkeypatch):
-    """Pin only executing NPU tests; collection must not poison CUDA tests."""
+def _preflight_npu_acceptance(monkeypatch):
+    """Pin the platform and reject undersized Ray temp filesystems up front."""
     monkeypatch.setenv("VERL_PLATFORM", "huawei")
+    _ray_temp_dir()
 
 MODEL_ENV = "VERL_MULTITASK_NPU_MODEL_PATH"
 
@@ -31,8 +32,8 @@ RAY_TMPDIR_ENV = "VERL_MULTITASK_RAY_TMPDIR"
 MIN_RAY_TMP_FREE_GIB = 4
 
 
-def _ray_init_kwargs(num_cpus: int) -> dict:
-    """Select and preflight a Ray temp directory for real-device acceptance."""
+def _ray_temp_dir() -> Path:
+    """Return one preflighted Ray temp directory shared by all NPU tests."""
     raw = os.environ.get(RAY_TMPDIR_ENV)
     temp_dir = Path(raw).expanduser().resolve() if raw else Path("/tmp").resolve()
     if not temp_dir.exists():
@@ -46,10 +47,14 @@ def _ray_init_kwargs(num_cpus: int) -> dict:
             f"set {RAY_TMPDIR_ENV} to a filesystem with at least "
             f"{MIN_RAY_TMP_FREE_GIB} GiB free"
         )
+    return temp_dir
 
+
+def _ray_init_kwargs(num_cpus: int) -> dict:
+    """Build Ray init args after the common NPU acceptance preflight."""
     return {
         "num_cpus": num_cpus,
-        "_temp_dir": str(temp_dir),
+        "_temp_dir": str(_ray_temp_dir()),
         "runtime_env": _runtime_env(),
         "ignore_reinit_error": True,
     }
