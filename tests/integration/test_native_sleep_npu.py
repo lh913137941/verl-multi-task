@@ -11,11 +11,13 @@ import json
 from importlib import metadata
 import os
 import shutil
+import subprocess
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from omegaconf import open_dict
+from packaging.version import InvalidVersion, Version
 
 pytestmark = [pytest.mark.native, pytest.mark.npu_integration]
 
@@ -68,30 +70,32 @@ def _ray_init_kwargs(num_cpus: int) -> dict:
     }
 
 
-def _ascend_rl_engine_kwargs() -> dict:
-    """Select the vLLM-Ascend RL config shape supported by this environment."""
+def _ascend_supports_rl_config() -> bool:
     try:
         from vllm_ascend import ascend_config
 
         ascend_cls = getattr(ascend_config, "AscendConfig", None)
         dataclass_fields = getattr(ascend_cls, "__dataclass_fields__", {}) or {}
         model_fields = getattr(ascend_cls, "model_fields", {}) or {}
-        if (
+        return bool(
             hasattr(ascend_config, "RlConfig")
             or "rl_config" in dataclass_fields
             or "rl_config" in model_fields
-        ):
-            additional_config = {
-                "rl_config": {
-                    "enabled": True,
-                }
-            }
-        else:
-            # Older vLLM-Ascend releases used the top-level NZ switch.
-            additional_config = {"weight_nz_mode": 0}
+        )
     except Exception:
-        # Keep the fallback compatible with pre-rl_config releases. Any real
-        # backend incompatibility remains visible during server startup.
+        return False
+
+
+def _ascend_rl_engine_kwargs() -> dict:
+    """Select exactly one Ascend RL configuration contract."""
+    if _ascend_supports_rl_config():
+        additional_config = {
+            "rl_config": {
+                "enabled": True,
+            }
+        }
+    else:
+        # Pre-rl_config releases used the top-level ND/NZ switch.
         additional_config = {"weight_nz_mode": 0}
 
     return {
@@ -101,7 +105,51 @@ def _ascend_rl_engine_kwargs() -> dict:
     }
 
 
+def _source_git_head(module_file: str) -> str | None:
+    path = Path(module_file).resolve()
+    for parent in (path.parent, *path.parents):
+        if (parent / ".git").exists():
+            try:
+                return subprocess.check_output(
+                    ["git", "-C", str(parent), "rev-parse", "HEAD"],
+                    text=True,
+                    timeout=5,
+                ).strip()
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                return None
+    return None
+
+
+def _validate_vllm_ascend_version_pair() -> None:
+    """Fail fast for release lanes that cannot be a supported pair."""
+    vllm_raw = metadata.version("vllm")
+    ascend_raw = metadata.version("vllm-ascend")
+    try:
+        vllm_version = Version(vllm_raw)
+        ascend_version = Version(ascend_raw)
+    except InvalidVersion:
+        return
+
+    # vLLM-Ascend release numbering follows the paired vLLM lane. rc/post
+    # suffixes may differ, but major/minor must match.
+    if (
+        vllm_version.release[:2] != (0, 0)
+        and ascend_version.release[:2] != (0, 0)
+        and vllm_version.release[:2] != ascend_version.release[:2]
+    ):
+        pytest.fail(
+            "unsupported vLLM/vLLM-Ascend release pair: "
+            f"vllm={vllm_raw}, vllm-ascend={ascend_raw}. Install matching "
+            "release lanes (for example vLLM-Ascend 0.23.x with vLLM 0.23.x), "
+            "or align source checkouts to the verified vLLM commit for the "
+            "chosen vLLM-Ascend branch.",
+            pytrace=False,
+        )
+
+
 def _print_npu_runtime_diagnostics() -> None:
+    _validate_vllm_ascend_version_pair()
+
     def version(name: str) -> str:
         try:
             return metadata.version(name)
@@ -122,7 +170,10 @@ def _print_npu_runtime_diagnostics() -> None:
             "vllm": version("vllm"),
             "vllm_ascend": version("vllm-ascend"),
             "vllm_path": str(Path(vllm.__file__).resolve()),
+            "vllm_git_head": _source_git_head(vllm.__file__),
             "vllm_ascend_path": str(Path(vllm_ascend.__file__).resolve()),
+            "vllm_ascend_git_head": _source_git_head(vllm_ascend.__file__),
+            "ascend_rl_config": _ascend_supports_rl_config(),
             "verl_device": get_device_name(),
             "ray_resource": get_resource_name(),
             "VERL_PLATFORM": os.environ.get("VERL_PLATFORM"),
@@ -224,23 +275,23 @@ def _visible_npu_devices() -> str:
 
 
 def _runtime_env() -> dict:
-    return {
-        "env_vars": {
-            "VERL_PLATFORM": "huawei",
-            "ASCEND_RT_VISIBLE_DEVICES": _visible_npu_devices(),
-            "TOKENIZERS_PARALLELISM": "true",
-            "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-            "VLLM_SERVER_DEV_MODE": "1",
-            "VLLM_ASCEND_ENABLE_NZ": "0",
-            "HCCL_CONNECT_TIMEOUT": "1500",
-            "HCCL_HOST_SOCKET_PORT_RANGE": "60000-60050",
-            "HCCL_NPU_SOCKET_PORT_RANGE": "61000-61050",
-            "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
-            "VLLM_ASCEND_AUTO_DETECT_QUANTIZATION": "0",
-            "VLLM_LOGGING_LEVEL": "INFO",
-            "VLLM_USE_V1": "1",
-        }
+    env_vars = {
+        "VERL_PLATFORM": "huawei",
+        "ASCEND_RT_VISIBLE_DEVICES": _visible_npu_devices(),
+        "TOKENIZERS_PARALLELISM": "true",
+        "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+        "VLLM_SERVER_DEV_MODE": "1",
+        "HCCL_CONNECT_TIMEOUT": "1500",
+        "HCCL_HOST_SOCKET_PORT_RANGE": "60000-60050",
+        "HCCL_NPU_SOCKET_PORT_RANGE": "61000-61050",
+        "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
+        "VLLM_ASCEND_AUTO_DETECT_QUANTIZATION": "0",
+        "VLLM_LOGGING_LEVEL": "INFO",
+        "VLLM_USE_V1": "1",
     }
+    if not _ascend_supports_rl_config():
+        env_vars["VLLM_ASCEND_ENABLE_NZ"] = "0"
+    return {"env_vars": env_vars}
 
 
 def _dump_recent_vllm_worker_logs() -> str:
