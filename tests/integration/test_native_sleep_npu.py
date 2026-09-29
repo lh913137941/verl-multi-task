@@ -289,6 +289,31 @@ def _print_npu_runtime_diagnostics() -> None:
     )
 
 
+def _checkpoint_weight_keys(path: Path) -> list[str]:
+    index = _load_json_if_present(path / "model.safetensors.index.json")
+    if isinstance(index, dict):
+        weight_map = index.get("weight_map")
+        if isinstance(weight_map, dict):
+            return sorted(str(key) for key in weight_map.keys())
+
+    files = sorted(path.glob("*.safetensors"))
+    if not files:
+        return []
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        return []
+
+    keys: list[str] = []
+    for file_path in files[:2]:
+        try:
+            with safe_open(file_path, framework="pt", device="cpu") as handle:
+                keys.extend(handle.keys())
+        except Exception:
+            continue
+    return sorted(set(keys))
+
+
 def _load_json_if_present(path: Path) -> dict | None:
     if not path.exists():
         return None
@@ -302,11 +327,26 @@ def _load_json_if_present(path: Path) -> dict | None:
 
 
 def _require_plain_acceptance_model(path: Path) -> None:
-    """Keep lifecycle acceptance independent from Ascend quantization patches."""
+    """Keep lifecycle acceptance independent from backend/model-layout drift."""
     config = _load_json_if_present(path / "config.json") or {}
     quant_description = _load_json_if_present(
         path / "quant_model_description.json"
     )
+
+    checkpoint_keys = _checkpoint_weight_keys(path)
+    if checkpoint_keys:
+        has_model_prefix = any(
+            key.startswith("model.layers.") for key in checkpoint_keys
+        )
+        has_bare_layers = any(key.startswith("layers.") for key in checkpoint_keys)
+        if has_bare_layers and not has_model_prefix:
+            pytest.fail(
+                "Qwen3 checkpoint uses bare 'layers.*' weight keys instead of "
+                "the upstream Hugging Face/vLLM 'model.layers.*' layout. Use "
+                "an original plain Qwen3 BF16/FP16 checkpoint for NPU backend "
+                "and lifecycle acceptance.",
+                pytrace=False,
+            )
 
     quantization_config = config.get("quantization_config")
     if quantization_config:
