@@ -3,7 +3,10 @@
 import ast
 import asyncio
 import hashlib
+import os
 import pickle
+import sqlite3
+import tempfile
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,6 +74,9 @@ def queue_class():
         "Parent": Parent,
         "asyncio": asyncio,
         "hashlib": hashlib,
+        "os": os,
+        "sqlite3": sqlite3,
+        "tempfile": tempfile,
         "dataclass": dataclass,
         "ray": SimpleNamespace(cloudpickle=pickle),
     }
@@ -136,3 +142,35 @@ def test_new_completion_preserves_native_drop_oldest_fact():
     assert queue.total_produced == 2
     assert queue.dropped_samples == 1
     assert len(queue.queue) == 1
+
+
+def test_completion_ledger_is_disk_backed_and_exact_after_many_samples():
+    Queue, DuplicateCompletionError = queue_class()
+    queue = Queue({}, max_queue_size=8, task_session="task-a")
+    first_payload = pickle.dumps(Sample("sample-0", (0,)))
+
+    first = asyncio.run(queue.put_sample_once(first_payload))
+    for index in range(1, 128):
+        asyncio.run(
+            queue.put_sample_once(
+                pickle.dumps(Sample(f"sample-{index}", (index,)))
+            )
+        )
+
+    assert not hasattr(queue, "_completion_evidence")
+    count = queue._completion_db.execute(
+        "SELECT COUNT(*) FROM completion_evidence"
+    ).fetchone()[0]
+    assert count == 128
+
+    replay = asyncio.run(queue.put_sample_once(bytes(first_payload)))
+    assert replay == first
+
+    with pytest.raises(DuplicateCompletionError, match="conflicting payload digest"):
+        asyncio.run(
+            queue.put_sample_once(
+                pickle.dumps(Sample("sample-0", (999,)))
+            )
+        )
+
+    assert queue.total_produced == 128
