@@ -102,6 +102,7 @@ def _config(model_path: str):
 def _exercise_same_npu_borrower(
     *,
     donor_replica,
+    donor_key,
     placement: dict,
     rollout_config,
     model_config,
@@ -152,7 +153,7 @@ def _exercise_same_npu_borrower(
             {
                 "claim_id": f"{token}-claim",
                 "source_lease_id": f"{token}-source-lease",
-                "donor_task_id": "npu-donor",
+                "donor_task_id": donor_key.task_session,
                 "donor_replica_rank": 0,
                 "pg_id": pg.id.hex(),
                 "bundle_index": 0,
@@ -194,10 +195,6 @@ def _exercise_same_npu_borrower(
     )
     assert getattr(output, "token_ids", None)
 
-    borrower_manager.transition_replica(
-        borrowed_key,
-        ReplicaState.DRAINING,
-    )
     destroy_evidence = asyncio.run(
         borrower_manager.destroy(
             borrowed_key,
@@ -312,6 +309,7 @@ def test_real_npu_sleep_releases_same_slot_to_borrower():
 
         destroy_evidence = _exercise_same_npu_borrower(
             donor_replica=replica,
+            donor_key=key,
             placement=placement,
             rollout_config=rollout_config,
             model_config=model_config,
@@ -530,8 +528,6 @@ def _training_sender_class():
                 bucket_size=bucket_size,
                 **engine_kwargs,
             )
-
-        from verl.single_controller.base.decorator import Dispatch, register
 
         @register(dispatch_mode=Dispatch.ONE_TO_ALL)
         def zero_output_weights_for_restore_acceptance(self):
