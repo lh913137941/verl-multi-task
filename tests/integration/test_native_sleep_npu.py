@@ -473,6 +473,60 @@ async def _init_standalone_with_diagnostics(replica) -> None:
         raise exc
 
 
+def _run_direct_vllm_ascend_smoke(model_path: str) -> None:
+    """Validate vLLM-Ascend directly, without VERL, Ray, or worker extensions."""
+    env = os.environ.copy()
+    visible = env.get("ASCEND_RT_VISIBLE_DEVICES")
+    if visible:
+        env["ASCEND_RT_VISIBLE_DEVICES"] = visible.split(",", 1)[0].strip()
+    else:
+        env["ASCEND_RT_VISIBLE_DEVICES"] = "0"
+    env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+    env["VLLM_USE_V1"] = "1"
+
+    script = r"""
+from vllm import LLM, SamplingParams
+import vllm_ascend  # noqa: F401
+
+model = __import__("os").environ["VERL_MULTITASK_DIRECT_SMOKE_MODEL"]
+llm = LLM(
+    model=model,
+    dtype="bfloat16",
+    tensor_parallel_size=1,
+    gpu_memory_utilization=0.4,
+    max_model_len=512,
+    max_num_seqs=1,
+    enforce_eager=True,
+    trust_remote_code=True,
+)
+outputs = llm.generate(
+    ["Hello from direct vLLM-Ascend smoke."],
+    SamplingParams(temperature=0.0, max_tokens=4),
+)
+assert outputs and outputs[0].outputs and outputs[0].outputs[0].token_ids
+print("DIRECT_VLLM_ASCEND_SMOKE_PASS", flush=True)
+"""
+    env["VERL_MULTITASK_DIRECT_SMOKE_MODEL"] = model_path
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=240,
+    )
+    if result.stdout:
+        print("\nDIRECT_VLLM_ASCEND_STDOUT\n" + result.stdout, flush=True)
+    if result.stderr:
+        print("\nDIRECT_VLLM_ASCEND_STDERR\n" + result.stderr, flush=True)
+    if result.returncode != 0:
+        pytest.fail(
+            "direct vLLM-Ascend Qwen3 load+generate failed before VERL/Ray "
+            f"integration (exit={result.returncode}); inspect "
+            "DIRECT_VLLM_ASCEND_STDOUT/STDERR above.",
+            pytrace=False,
+        )
+
+
 def _require_ray_npus(ray, min_devices: int) -> None:
     resources = ray.cluster_resources()
     count = float(resources.get("NPU", 0.0))
@@ -630,11 +684,15 @@ def _exercise_same_npu_borrower(
 
 @pytest.mark.npu_backend_smoke
 def test_real_npu_backend_smoke_loads_and_generates_plain_model():
-    """Prove the vanilla VERL/vLLM-Ascend stack before MultiTask lifecycle tests."""
+    """Separate direct vLLM-Ascend from the vanilla VERL rollout bootstrap."""
 
     model_path = _require_model_path()
     _require_npu(1)
     _print_npu_runtime_diagnostics()
+
+    # Stage 0: no VERL vLLMReplica, no Ray actor, no worker_extension_cls,
+    # and eager mode to remove graph compilation from the equation.
+    _run_direct_vllm_ascend_smoke(model_path)
 
     import ray
     from transformers import AutoTokenizer
