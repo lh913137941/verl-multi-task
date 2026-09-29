@@ -741,6 +741,7 @@ def test_real_npu_restore_reinstalls_current_vpub_and_generates_again():
 
         destroy_evidence = _exercise_same_npu_borrower(
             donor_replica=replica,
+            donor_key=key,
             placement=placement,
             rollout_config=rollout_config,
             model_config=model_config,
