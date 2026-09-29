@@ -13,12 +13,13 @@ from uuid import uuid4
 
 import pytest
 
-# transfer_to_npu may monkey-patch torch.cuda globally.  Pin VERL to its
-# native Ascend platform before any VERL module can initialize/cached-detect
-# the accelerator; NPU acceptance must never infer hardware from torch.cuda.
-os.environ["VERL_PLATFORM"] = "huawei"
-
 pytestmark = [pytest.mark.native, pytest.mark.npu_integration]
+
+
+@pytest.fixture(autouse=True)
+def _pin_verl_npu_platform(monkeypatch):
+    """Pin only executing NPU tests; collection must not poison CUDA tests."""
+    monkeypatch.setenv("VERL_PLATFORM", "huawei")
 
 MODEL_ENV = "VERL_MULTITASK_NPU_MODEL_PATH"
 
