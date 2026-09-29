@@ -121,6 +121,9 @@ def _print_npu_runtime_diagnostics() -> None:
             "verl_device": get_device_name(),
             "ray_resource": get_resource_name(),
             "VERL_PLATFORM": os.environ.get("VERL_PLATFORM"),
+            "ASCEND_RT_VISIBLE_DEVICES": os.environ.get(
+                "ASCEND_RT_VISIBLE_DEVICES"
+            ),
             "VLLM_WORKER_MULTIPROC_METHOD": os.environ.get(
                 "VLLM_WORKER_MULTIPROC_METHOD"
             ),
@@ -159,10 +162,24 @@ def _require_npu(min_devices: int) -> None:
         pytest.skip("VERL platform did not resolve to the Ascend NPU backend")
 
 
+def _visible_npu_devices() -> str:
+    configured = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+    if configured:
+        return configured
+
+    import torch
+
+    count = torch.npu.device_count()
+    if count <= 0:
+        raise RuntimeError("torch.npu reports no visible Ascend devices")
+    return ",".join(str(index) for index in range(count))
+
+
 def _runtime_env() -> dict:
     return {
         "env_vars": {
             "VERL_PLATFORM": "huawei",
+            "ASCEND_RT_VISIBLE_DEVICES": _visible_npu_devices(),
             "TOKENIZERS_PARALLELISM": "true",
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
             "VLLM_SERVER_DEV_MODE": "1",
