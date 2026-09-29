@@ -483,7 +483,7 @@ def _require_ray_npus(ray, min_devices: int) -> None:
         )
 
 
-def _config(model_path: str):
+def _config(model_path: str, *, enable_sleep_mode: bool = True):
     from hydra import compose, initialize_config_dir
 
     import verl
@@ -507,11 +507,13 @@ def _config(model_path: str):
         config.actor_rollout_ref.rollout.tensor_model_parallel_size = 1
         config.actor_rollout_ref.rollout.data_parallel_size = 1
         config.actor_rollout_ref.rollout.pipeline_model_parallel_size = 1
-        config.actor_rollout_ref.rollout.enable_sleep_mode = True
-        config.actor_rollout_ref.rollout.free_cache_engine = True
+        config.actor_rollout_ref.rollout.enable_sleep_mode = enable_sleep_mode
+        config.actor_rollout_ref.rollout.free_cache_engine = enable_sleep_mode
         config.actor_rollout_ref.rollout.load_format = "auto"
         config.actor_rollout_ref.rollout.skip_tokenizer_init = False
-        config.actor_rollout_ref.rollout.engine_kwargs = _ascend_rl_engine_kwargs()
+        config.actor_rollout_ref.rollout.engine_kwargs = (
+            _ascend_rl_engine_kwargs() if enable_sleep_mode else {}
+        )
     return config
 
 
@@ -640,7 +642,7 @@ def test_real_npu_backend_smoke_loads_and_generates_plain_model():
     from verl.utils.tokenizer import normalize_token_ids
     from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
-    config = _config(model_path)
+    config = _config(model_path, enable_sleep_mode=False)
     rollout_config = config.actor_rollout_ref.rollout
     model_config = config.actor_rollout_ref.model
 
