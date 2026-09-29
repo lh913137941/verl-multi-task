@@ -473,7 +473,11 @@ async def _init_standalone_with_diagnostics(replica) -> None:
         raise exc
 
 
-def _run_direct_vllm_ascend_smoke(model_path: str) -> None:
+def _run_direct_vllm_ascend_smoke(
+    model_path: str,
+    *,
+    distributed_executor_backend: str | None,
+) -> None:
     """Validate vLLM-Ascend directly, without VERL, Ray, or worker extensions."""
     env = os.environ.copy()
     visible = env.get("ASCEND_RT_VISIBLE_DEVICES")
@@ -483,12 +487,28 @@ def _run_direct_vllm_ascend_smoke(model_path: str) -> None:
         env["ASCEND_RT_VISIBLE_DEVICES"] = "0"
     env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     env["VLLM_USE_V1"] = "1"
+    env["VERL_MULTITASK_DIRECT_SMOKE_MODEL"] = model_path
+    env["VERL_MULTITASK_DIRECT_SMOKE_BACKEND"] = (
+        distributed_executor_backend or ""
+    )
 
     script = r"""
+import os
+
 from vllm import LLM, SamplingParams
 import vllm_ascend  # noqa: F401
 
-model = __import__("os").environ["VERL_MULTITASK_DIRECT_SMOKE_MODEL"]
+model = os.environ["VERL_MULTITASK_DIRECT_SMOKE_MODEL"]
+backend = os.environ["VERL_MULTITASK_DIRECT_SMOKE_BACKEND"]
+kwargs = {}
+if backend:
+    kwargs["distributed_executor_backend"] = backend
+
+print(
+    "DIRECT_VLLM_ASCEND_CONFIG",
+    {"backend": backend or "default", "model": model},
+    flush=True,
+)
 llm = LLM(
     model=model,
     dtype="bfloat16",
@@ -498,15 +518,20 @@ llm = LLM(
     max_num_seqs=1,
     enforce_eager=True,
     trust_remote_code=True,
+    **kwargs,
 )
 outputs = llm.generate(
     ["Hello from direct vLLM-Ascend smoke."],
     SamplingParams(temperature=0.0, max_tokens=4),
 )
 assert outputs and outputs[0].outputs and outputs[0].outputs[0].token_ids
-print("DIRECT_VLLM_ASCEND_SMOKE_PASS", flush=True)
+print(
+    "DIRECT_VLLM_ASCEND_SMOKE_PASS",
+    {"backend": backend or "default"},
+    flush=True,
+)
 """
-    env["VERL_MULTITASK_DIRECT_SMOKE_MODEL"] = model_path
+    label = distributed_executor_backend or "default"
     result = subprocess.run(
         [sys.executable, "-c", script],
         env=env,
@@ -515,14 +540,20 @@ print("DIRECT_VLLM_ASCEND_SMOKE_PASS", flush=True)
         timeout=240,
     )
     if result.stdout:
-        print("\nDIRECT_VLLM_ASCEND_STDOUT\n" + result.stdout, flush=True)
+        print(
+            f"\nDIRECT_VLLM_ASCEND_STDOUT[{label}]\n" + result.stdout,
+            flush=True,
+        )
     if result.stderr:
-        print("\nDIRECT_VLLM_ASCEND_STDERR\n" + result.stderr, flush=True)
+        print(
+            f"\nDIRECT_VLLM_ASCEND_STDERR[{label}]\n" + result.stderr,
+            flush=True,
+        )
     if result.returncode != 0:
         pytest.fail(
             "direct vLLM-Ascend Qwen3 load+generate failed before VERL/Ray "
-            f"integration (exit={result.returncode}); inspect "
-            "DIRECT_VLLM_ASCEND_STDOUT/STDERR above.",
+            f"integration for backend={label!r} (exit={result.returncode}); "
+            f"inspect DIRECT_VLLM_ASCEND_STDOUT[{label}] / STDERR above.",
             pytrace=False,
         )
 
@@ -692,7 +723,14 @@ def test_real_npu_backend_smoke_loads_and_generates_plain_model():
 
     # Stage 0: no VERL vLLMReplica, no Ray actor, no worker_extension_cls,
     # and eager mode to remove graph compilation from the equation.
-    _run_direct_vllm_ascend_smoke(model_path)
+    _run_direct_vllm_ascend_smoke(
+        model_path,
+        distributed_executor_backend=None,
+    )
+    _run_direct_vllm_ascend_smoke(
+        model_path,
+        distributed_executor_backend="mp",
+    )
 
     import ray
     from transformers import AutoTokenizer
