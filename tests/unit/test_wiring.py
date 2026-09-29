@@ -2870,6 +2870,7 @@ def checkpoint_manager_class(**extra_scope):
         "hashlib": __import__("hashlib"),
         "json": __import__("json"),
         "os": __import__("os"),
+        "get_device_name": lambda: "cuda",
         **extra_scope,
     }
     return isolated(
@@ -3463,6 +3464,7 @@ def runtime_replica_class():
         Lease=Lease,
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
         MultiTaskCheckpointEngineWorker=object,
+        get_resource_name=lambda: "GPU",
     )
 
 
