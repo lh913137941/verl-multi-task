@@ -632,6 +632,14 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
 
         return OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
 
+    def clear_operation_binding(self, operation_id: str) -> bool:
+        """Drop terminal-operation replay state; UNKNOWN operations are never sent here."""
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("operation_id must be a nonempty string")
+        removed = self._pending_operation_targets.pop(operation_id, None)
+        self._force_exit_recovery.pop(operation_id, None)
+        return removed is not None
+
     def get_pending_target(self, operation_id: str) -> ReplicaKey:
         if not isinstance(operation_id, str) or not operation_id:
             raise ValueError("operation_id must be a nonempty string")
