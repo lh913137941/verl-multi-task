@@ -239,12 +239,12 @@ def _runtime_env() -> dict:
     }
 
 
-def _dump_recent_vllm_worker_logs() -> None:
-    """Print recent Ray log tails that contain the hidden vLLM worker root cause."""
+def _dump_recent_vllm_worker_logs() -> str:
+    """Print recent Ray log tails and return them for failure classification."""
     temp_dir = _ray_temp_dir()
     logs_dir = temp_dir / "session_latest" / "logs"
     if not logs_dir.exists():
-        return
+        return ""
 
     candidates = []
     for pattern in ("*.out", "*.err"):
@@ -252,6 +252,7 @@ def _dump_recent_vllm_worker_logs() -> None:
     candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
 
     emitted = 0
+    captured = []
     for log_path in candidates:
         if emitted >= 6:
             break
@@ -271,19 +272,36 @@ def _dump_recent_vllm_worker_logs() -> None:
         ):
             continue
         tail = "\n".join(text.splitlines()[-160:])
+        captured.append(tail)
         print(
             f"\nNPU_VLLM_WORKER_LOG {log_path}\n{tail}\n",
             flush=True,
         )
         emitted += 1
+    return "\n".join(captured)
 
 
 async def _init_standalone_with_diagnostics(replica) -> None:
     try:
         await replica.init_standalone()
-    except BaseException:
-        _dump_recent_vllm_worker_logs()
-        raise
+    except BaseException as exc:
+        logs = _dump_recent_vllm_worker_logs()
+        if (
+            "patch_gqa_c8" in logs
+            and "gate_up_proj.weight" in logs
+            and "KeyError" in logs
+        ):
+            pytest.fail(
+                "vLLM-Ascend Qwen3 weight-loader incompatibility detected: "
+                "the installed patch_gqa_c8 path expects fused gate_up_proj "
+                "parameters that are absent from the instantiated model. Use a "
+                "plain BF16/FP16 Qwen3 acceptance model and align the vLLM / "
+                "vLLM-Ascend source versions before running MultiTask lifecycle "
+                "acceptance. This failure occurs before MultiTask sleep/FORCE/"
+                "RESTORE logic.",
+                pytrace=False,
+            )
+        raise exc
 
 
 def _require_ray_npus(ray, min_devices: int) -> None:
