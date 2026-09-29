@@ -66,6 +66,9 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         if not self.task_session:
             raise RuntimeError("Manager requires task_session before replica initialization")
         for index, replica in enumerate(self.rollout_replicas):
+            # Borrowed replicas validate in init_from_lease(); native replicas
+            # must prove the same runtime API surface before entering M=ACTIVE.
+            await replica.validate_server_runtime()
             rank = getattr(replica, "replica_rank", index)
             key = native_replica_key(self.task_session, rank)
             self.register_replica(
