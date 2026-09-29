@@ -19,6 +19,7 @@ include = ["multi_task_scheduler*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/unit"]
+pythonpath = ["src"]
 addopts = "-ra --strict-markers"
 markers = [
   "native: imports the actual verl and backend dependencies",
