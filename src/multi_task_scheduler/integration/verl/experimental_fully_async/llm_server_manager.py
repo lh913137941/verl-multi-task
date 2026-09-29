@@ -16,6 +16,7 @@ from multi_task_scheduler.orchestration.contracts import (
     ReplicaKey,
     ReplicaKind,
     ReplicaState,
+    native_replica_key,
 )
 from multi_task_scheduler.rollout.load_balancer import MultiTaskGlobalRequestLoadBalancer
 from multi_task_scheduler.rollout.replica import MultiTaskvLLMReplica
@@ -72,15 +73,13 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             # must prove the same runtime API surface before entering M=ACTIVE.
             await replica.validate_server_runtime()
             rank = getattr(replica, "replica_rank", index)
-            key = ReplicaKey(self.task_session, f"native-{rank}", 0)
+            key = native_replica_key(self.task_session, rank)
             self.register_replica(
                 key,
                 ReplicaKind.NATIVE,
                 state=ReplicaState.ACTIVE,
                 runtime=replica,
             )
-            if type(rank) is not int or rank < 0:
-                raise ValueError("native replica_rank must be a nonnegative integer")
             self.next_replica_rank = max(self.next_replica_rank, rank + 1)
 
     async def _init_global_load_balancer(self) -> None:
@@ -202,18 +201,30 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             return evidence
         return None
 
+    def _server_slot(self, runtime) -> int | None:
+        """Locate one runtime's slot in the native address/handle inventory.
+
+        Activation and deactivation must agree on which slot belongs to a
+        runtime. The two native lists are parallel, so a length or handle
+        mismatch means the inventory is half-updated; that is a hard error, not
+        something to repair silently, because the caller would then route
+        traffic to the wrong server.
+        """
+        address = getattr(runtime, "_server_address", None)
+        handle = getattr(runtime, "_server_handle", None)
+        if address not in self.server_addresses:
+            return None
+        index = self.server_addresses.index(address)
+        if index >= len(self.server_handles) or self.server_handles[index] != handle:
+            raise RuntimeError("native service address/handle inventory is inconsistent")
+        return index
+
     def deactivate_service(self, key: ReplicaKey):
         """Remove one runtime from native active-service lists without destroying it."""
         runtime = self._runtime_inventory.get(key)
         if runtime is None:
             raise KeyError(key)
-        address = getattr(runtime, "_server_address", None)
-        handle = getattr(runtime, "_server_handle", None)
-        index = None
-        if address in self.server_addresses:
-            index = self.server_addresses.index(address)
-            if index >= len(self.server_handles) or self.server_handles[index] != handle:
-                raise RuntimeError("native service address/handle inventory is inconsistent")
+        index = self._server_slot(runtime)
 
         if runtime in self.rollout_replicas:
             self.rollout_replicas.remove(runtime)
@@ -231,14 +242,7 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         handle = getattr(runtime, "_server_handle", None)
         if not isinstance(address, str) or not address or handle is None:
             raise RuntimeError("native runtime lacks a routable server identity")
-        existing_index = None
-        if address in self.server_addresses:
-            existing_index = self.server_addresses.index(address)
-            if (
-                existing_index >= len(self.server_handles)
-                or self.server_handles[existing_index] != handle
-            ):
-                raise RuntimeError("native service address/handle inventory is inconsistent")
+        existing_index = self._server_slot(runtime)
 
         if runtime not in self.rollout_replicas:
             self.rollout_replicas.append(runtime)
@@ -368,7 +372,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 f"resolved placement group {pg_id!r} lacks bundle {bundle_index}"
             )
         return {pg_id: pg}
-
 
     def _borrowed_record_for_key(self, key: ReplicaKey) -> dict:
         matches = [

@@ -19,6 +19,14 @@ from typing import Any, Mapping
 FIRST_RELEASE_MAX_COLOCATE_COUNT = 2
 FIRST_RELEASE_RAY_GPU_FRACTION = 1.0 / FIRST_RELEASE_MAX_COLOCATE_COUNT
 
+# Delivery budget for short control-plane RPCs (actor discovery, journal-handoff
+# submits, lease ACKs, detach). These calls are synchronous and bounded by
+# design; the budget only bounds how long a caller waits for a reply. It is not
+# a lifecycle deadline: the detailed design gives no time-based authority to
+# release a replica, so exceeding this budget must never be read as failure or
+# as proof that the remote side never acted.
+CONTROL_RPC_TIMEOUT_S = 30.0
+
 
 class ReplicaKind(str, Enum):
     NATIVE = "NATIVE"
@@ -77,6 +85,22 @@ class ReplicaKey:
             raise ValueError("replica_id must be a nonempty string")
         if type(self.runtime_epoch) is not int or self.runtime_epoch < 0:
             raise ValueError("runtime_epoch must be a nonnegative integer")
+
+
+def native_replica_key(
+    task_session: str,
+    replica_rank: int,
+    runtime_epoch: int = 0,
+) -> ReplicaKey:
+    """Single source for the retained-native replica identity convention.
+
+    Manager/CE register native owners under this key and GroupScheduler matches
+    a DONATE/RESTORE target against the lease donor with it. Keeping one factory
+    prevents a silent mismatch if either producer ever changes the spelling.
+    """
+    if type(replica_rank) is not int or replica_rank < 0:
+        raise ValueError("native replica_rank must be a nonnegative integer")
+    return ReplicaKey(task_session, f"native-{replica_rank}", runtime_epoch)
 
 
 @dataclass(frozen=True)
@@ -263,12 +287,6 @@ class Lease:
         return tuple(str(claim["claim_id"]) for claim in self.claims)
 
     @property
-    def source_lease_ids(self) -> tuple[str, ...]:
-        return tuple(
-            dict.fromkeys(str(claim["source_lease_id"]) for claim in self.claims)
-        )
-
-    @property
     def bundle_keys(self) -> tuple[tuple[str, int], ...]:
         return tuple(
             (str(claim["pg_id"]), int(claim["bundle_index"]))
@@ -278,3 +296,19 @@ class Lease:
     @property
     def gpu_uuids(self) -> tuple[str, ...]:
         return tuple(str(claim["gpu_uuid"]) for claim in self.claims)
+
+
+def require_evidence(
+    value,
+    operation_id: str,
+    expected: EvidenceType,
+    label: str,
+) -> OperationEvidence:
+    """Validate one cross-owner evidence receipt against its expected stage."""
+    if not isinstance(value, OperationEvidence):
+        raise TypeError(f"{label} did not return OperationEvidence")
+    if value.operation_id != operation_id:
+        raise ValueError(f"{label} evidence belongs to another operation")
+    if value.type is not expected:
+        raise ValueError(f"expected {expected.value}, got {value.type.value}")
+    return value
