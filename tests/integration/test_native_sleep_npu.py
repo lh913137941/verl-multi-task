@@ -12,6 +12,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from omegaconf import open_dict
 
 pytestmark = [pytest.mark.native, pytest.mark.npu_integration]
 
@@ -89,20 +90,25 @@ def _config(model_path: str):
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):
         config = compose(config_name="ppo_trainer")
 
-    config.trainer.nnodes = 1
-    config.trainer.n_gpus_per_node = 1
-    config.actor_rollout_ref.model.path = model_path
-    config.actor_rollout_ref.rollout.name = "vllm"
-    config.actor_rollout_ref.rollout.mode = "async"
-    config.actor_rollout_ref.rollout.nnodes = 1
-    config.actor_rollout_ref.rollout.n_gpus_per_node = 1
-    config.actor_rollout_ref.rollout.tensor_model_parallel_size = 1
-    config.actor_rollout_ref.rollout.data_parallel_size = 1
-    config.actor_rollout_ref.rollout.pipeline_model_parallel_size = 1
-    config.actor_rollout_ref.rollout.enable_sleep_mode = True
-    config.actor_rollout_ref.rollout.free_cache_engine = True
-    config.actor_rollout_ref.rollout.load_format = "auto"
-    config.actor_rollout_ref.rollout.skip_tokenizer_init = False
+    # The Hydra rollout node is struct-locked and may lag newer RolloutConfig
+    # dataclass fields (notably enable_sleep_mode). Acceptance tests need to
+    # exercise the real runtime capability, so extend only this test config
+    # explicitly instead of mutating VERL's production schema.
+    with open_dict(config):
+        config.trainer.nnodes = 1
+        config.trainer.n_gpus_per_node = 1
+        config.actor_rollout_ref.model.path = model_path
+        config.actor_rollout_ref.rollout.name = "vllm"
+        config.actor_rollout_ref.rollout.mode = "async"
+        config.actor_rollout_ref.rollout.nnodes = 1
+        config.actor_rollout_ref.rollout.n_gpus_per_node = 1
+        config.actor_rollout_ref.rollout.tensor_model_parallel_size = 1
+        config.actor_rollout_ref.rollout.data_parallel_size = 1
+        config.actor_rollout_ref.rollout.pipeline_model_parallel_size = 1
+        config.actor_rollout_ref.rollout.enable_sleep_mode = True
+        config.actor_rollout_ref.rollout.free_cache_engine = True
+        config.actor_rollout_ref.rollout.load_format = "auto"
+        config.actor_rollout_ref.rollout.skip_tokenizer_init = False
     return config
 
 
@@ -335,7 +341,7 @@ def test_real_npu_force_remove_continues_on_another_replica():
     _require_npu(2)
 
     import ray
-    from omegaconf import OmegaConf, open_dict
+    from omegaconf import OmegaConf
     from transformers import AutoTokenizer
 
     from multi_task_scheduler.integration.verl.experimental_fully_async.rollouter import (
