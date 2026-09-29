@@ -309,6 +309,7 @@ def main() -> int:
             print("model_type:", config.get("model_type"))
             print("architectures:", config.get("architectures"))
             print("torch_dtype:", config.get("torch_dtype"))
+            print("num_hidden_layers:", config.get("num_hidden_layers"))
             print("quantization_config:", config.get("quantization_config"))
             print(
                 "quant_model_description:",
@@ -336,6 +337,27 @@ def main() -> int:
                         "checkpoint appears converted or stripped and is not a "
                         "valid plain upstream Qwen3 acceptance model"
                     )
+                layer_indices = []
+                for key in checkpoint_keys:
+                    match = re.match(r"model\.layers\.(\d+)\.", key)
+                    if match:
+                        layer_indices.append(int(match.group(1)))
+                checkpoint_layers = (
+                    max(layer_indices) + 1 if layer_indices else None
+                )
+                print("checkpoint hidden layers:", checkpoint_layers)
+                config_layers = config.get("num_hidden_layers")
+                if (
+                    isinstance(config_layers, int)
+                    and checkpoint_layers is not None
+                    and config_layers != checkpoint_layers
+                ):
+                    failures.append(
+                        "Qwen3 config/checkpoint layer-count mismatch: "
+                        f"config num_hidden_layers={config_layers}, "
+                        f"checkpoint layers={checkpoint_layers}"
+                    )
+
                 for required in (
                     "model.layers.0.mlp.gate_proj.weight",
                     "model.layers.0.mlp.up_proj.weight",
