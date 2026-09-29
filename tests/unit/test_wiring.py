@@ -2165,23 +2165,13 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     assert manager.replica_state[quarantined_key] is ReplicaState.QUARANTINED
     assert quarantined_record["error"] is not None
 
-
-def test_manager_allows_active_to_quarantined_for_verified_runtime_loss():
-    cls = manager_class()
-    manager = cls(object(), object(), task_session="task-a")
-    key = ReplicaKey("task-a", "native-0")
-    manager.register_replica(
-        key,
-        ReplicaKind.NATIVE,
-        state=ReplicaState.ACTIVE,
-        runtime=object(),
-    )
-
+    # A separately proved permanent runtime loss may quarantine an ACTIVE
+    # projection directly; ordinary lifecycle exit still uses DRAINING.
+    manager.replica_state[key] = ReplicaState.ACTIVE
     assert (
         manager.transition_replica(key, ReplicaState.QUARANTINED)
         is ReplicaState.QUARANTINED
     )
-    assert manager.replica_state[key] is ReplicaState.QUARANTINED
 
 
 def test_http_server_health_and_shutdown_use_real_engine_boundaries():
@@ -3349,11 +3339,21 @@ def http_server_class():
 
 
 def runtime_replica_class():
+    fake_ray = type(
+        "ReplicaRay",
+        (),
+        {
+            "get_runtime_context": staticmethod(
+                lambda: type("RuntimeContext", (), {"namespace": "verl-test"})()
+            )
+        },
+    )
     return isolated(
         "rollout/replica.py",
         "MultiTaskvLLMReplica",
         object,
         asyncio=asyncio,
+        ray=fake_ray,
         ReplicaKind=ReplicaKind,
         Lease=Lease,
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
