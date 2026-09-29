@@ -10,6 +10,7 @@ import asyncio
 import json
 from importlib import metadata
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -120,8 +121,40 @@ def _source_git_head(module_file: str) -> str | None:
     return None
 
 
+def _verl_expected_vllm_pair() -> tuple[str, str] | None:
+    """Read the NPU runtime pair from the installed VERL source checkout."""
+    try:
+        import verl
+    except Exception:
+        return None
+
+    repo_root = Path(verl.__file__).resolve().parent.parent
+    install_script = repo_root / "scripts" / "install_vllm_mcore_npu.sh"
+    if not install_script.exists():
+        return None
+    try:
+        text = install_script.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    vllm_match = re.search(
+        r"--branch\s+v(?P<version>\d+\.\d+\.\d+).*?vllm\.git",
+        text,
+        flags=re.DOTALL,
+    )
+    ascend_match = re.search(
+        r"vllm-ascend\.git.*?(?:-b|--branch)\s+releases/v"
+        r"(?P<version>\d+\.\d+\.\d+)",
+        text,
+        flags=re.DOTALL,
+    )
+    if not vllm_match or not ascend_match:
+        return None
+    return vllm_match.group("version"), ascend_match.group("version")
+
+
 def _validate_vllm_ascend_version_pair() -> None:
-    """Fail fast for release lanes that cannot be a supported pair."""
+    """Fail fast before model load when the NPU runtime sources are unpaired."""
     vllm_raw = metadata.version("vllm")
     ascend_raw = metadata.version("vllm-ascend")
     try:
@@ -140,9 +173,28 @@ def _validate_vllm_ascend_version_pair() -> None:
         pytest.fail(
             "unsupported vLLM/vLLM-Ascend release pair: "
             f"vllm={vllm_raw}, vllm-ascend={ascend_raw}. Install matching "
-            "release lanes (for example vLLM-Ascend 0.23.x with vLLM 0.23.x), "
-            "or align source checkouts to the verified vLLM commit for the "
-            "chosen vLLM-Ascend branch.",
+            "release lanes before MultiTask NPU acceptance.",
+            pytrace=False,
+        )
+
+    expected = _verl_expected_vllm_pair()
+    if expected is None:
+        return
+    expected_vllm, expected_ascend = expected
+    expected_vllm_version = Version(expected_vllm)
+    expected_ascend_version = Version(expected_ascend)
+    if (
+        vllm_version.release[:3] not in {(0, 0, 0), expected_vllm_version.release[:3]}
+        or ascend_version.release[:3]
+        not in {(0, 0, 0), expected_ascend_version.release[:3]}
+    ):
+        pytest.fail(
+            "installed NPU runtime does not match this VERL checkout: "
+            f"VERL scripts expect vllm={expected_vllm} and "
+            f"vllm-ascend={expected_ascend}, but metadata reports "
+            f"vllm={vllm_raw}, vllm-ascend={ascend_raw}. Align the two source "
+            "checkouts with scripts/install_vllm_mcore_npu.sh before running "
+            "MultiTask lifecycle acceptance.",
             pytrace=False,
         )
 
@@ -174,6 +226,7 @@ def _print_npu_runtime_diagnostics() -> None:
             "vllm_ascend_path": str(Path(vllm_ascend.__file__).resolve()),
             "vllm_ascend_git_head": _source_git_head(vllm_ascend.__file__),
             "ascend_rl_config": _ascend_supports_rl_config(),
+            "verl_expected_vllm_pair": _verl_expected_vllm_pair(),
             "verl_device": get_device_name(),
             "ray_resource": get_resource_name(),
             "VERL_PLATFORM": os.environ.get("VERL_PLATFORM"),
