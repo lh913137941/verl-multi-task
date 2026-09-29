@@ -166,6 +166,44 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             self._effective_replica_map[key] = (replicas, loaded_version)
 
     @staticmethod
+    def _validate_manifest(manifest: dict) -> None:
+        """Reject missing/partial audit data before comparing receiver digests."""
+        if not isinstance(manifest, dict) or manifest.get("complete") is not True:
+            raise RuntimeError("parameter manifest is incomplete")
+        entries = manifest.get("parameters")
+        if not isinstance(entries, list) or not entries:
+            raise RuntimeError("parameter manifest must contain parameters")
+        names = set()
+        total_numel = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise RuntimeError("parameter manifest entry must be a mapping")
+            name = entry.get("name")
+            if not isinstance(name, str) or not name or name in names:
+                raise RuntimeError("parameter manifest names must be nonempty and unique")
+            names.add(name)
+            if any(not isinstance(entry.get(field), str) or not entry[field]
+                   for field in ("dtype", "sha256")):
+                raise RuntimeError("parameter manifest entry lacks dtype or sha256")
+            shape = entry.get("shape")
+            numel = entry.get("numel")
+            if (not isinstance(shape, (list, tuple))
+                    or any(type(size) is not int or size < 0 for size in shape)
+                    or type(numel) is not int or numel < 0):
+                raise RuntimeError("parameter manifest entry has invalid shape/numel")
+            expected_numel = 1
+            for size in shape:
+                expected_numel *= size
+            if numel != expected_numel:
+                raise RuntimeError("parameter manifest shape/numel mismatch")
+            total_numel += numel
+        if (type(manifest.get("parameter_count")) is not int
+                or manifest["parameter_count"] != len(entries)
+                or type(manifest.get("total_numel")) is not int
+                or manifest["total_numel"] != total_numel):
+            raise RuntimeError("parameter manifest counts do not match its entries")
+
+    @staticmethod
     def _manifest_digest(manifest: dict) -> str:
         entries = manifest.get("parameters", [])
         canonical = [
@@ -241,11 +279,12 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         source_manifest: dict | None = None,
     ) -> dict:
         """Validate receiver manifests without moving tensor payloads to Trainer."""
-        workers = [
-            worker
-            for replica in replicas
-            for worker in getattr(replica, "workers", [])
-        ]
+        workers = []
+        for replica in replicas:
+            replica_workers = list(getattr(replica, "workers", ()) or ())
+            if not replica_workers:
+                raise RuntimeError("parameter validation requires a CE Worker for every replica")
+            workers.extend(replica_workers)
         if not workers:
             raise RuntimeError(
                 "parameter validation requires at least one CE Worker"
@@ -253,14 +292,10 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         manifests = ray.get(
             [worker.get_parameter_manifest.remote() for worker in workers]
         )
-        if not manifests or any(
-            not isinstance(manifest, dict)
-            or not manifest.get("complete", False)
-            for manifest in manifests
-        ):
-            raise RuntimeError(
-                f"CE parameter manifest is incomplete: {manifests}"
-            )
+        if len(manifests) != len(workers):
+            raise RuntimeError("CE parameter manifest does not cover every worker")
+        for manifest in manifests:
+            self._validate_manifest(manifest)
         if expected_version is not None:
             mismatched_versions = [
                 manifest.get("global_steps")
@@ -275,10 +310,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                 )
 
         if source_manifest is not None:
-            if not source_manifest.get("complete", False):
-                raise RuntimeError(
-                    f"actor source manifest is incomplete: {source_manifest}"
-                )
+            self._validate_manifest(source_manifest)
             if (
                 expected_version is not None
                 and source_manifest.get("global_steps") != expected_version

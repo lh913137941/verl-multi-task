@@ -124,3 +124,48 @@ def test_parameter_source_mismatch_fails_closed():
                 source_manifest=source,
             )
         )
+
+
+@pytest.mark.parametrize("case", ["empty", "duplicate", "count", "numel", "missing_hash"])
+def test_invalid_manifest_cannot_prove_parameter_sync(case):
+    manifest = _manifest()
+    if case == "empty":
+        manifest.update(parameters=[], parameter_count=0, total_numel=0)
+    elif case == "duplicate":
+        manifest["parameters"] *= 2
+        manifest.update(parameter_count=2, total_numel=4)
+    elif case == "count":
+        manifest["parameter_count"] = 2
+    elif case == "numel":
+        manifest["total_numel"] = 100
+    else:
+        del manifest["parameters"][0]["sha256"]
+    worker = SimpleNamespace(get_parameter_manifest=_Remote(manifest))
+    manager = _manager_class(SimpleNamespace(get=lambda refs: refs))()
+    with pytest.raises(RuntimeError, match="manifest"):
+        asyncio.run(manager.validate_parameter_sync(
+            [SimpleNamespace(workers=[worker])], expected_version=3,
+            source_manifest=manifest,
+        ))
+
+
+def test_validation_must_cover_every_requested_replica():
+    worker = SimpleNamespace(get_parameter_manifest=_Remote(_manifest()))
+    manager = _manager_class(SimpleNamespace(get=lambda refs: refs))()
+    with pytest.raises(RuntimeError, match="CE Worker"):
+        asyncio.run(manager.validate_parameter_sync(
+            [SimpleNamespace(workers=[worker]), SimpleNamespace(workers=[])],
+            expected_version=3,
+        ))
+
+
+def test_valid_receivers_do_not_hide_invalid_source_manifest():
+    worker = SimpleNamespace(get_parameter_manifest=_Remote(_manifest()))
+    manager = _manager_class(SimpleNamespace(get=lambda refs: refs))()
+    source = _manifest()
+    source["parameter_count"] = 2
+    with pytest.raises(RuntimeError, match="manifest counts"):
+        asyncio.run(manager.validate_parameter_sync(
+            [SimpleNamespace(workers=[worker])], expected_version=3,
+            source_manifest=source,
+        ))

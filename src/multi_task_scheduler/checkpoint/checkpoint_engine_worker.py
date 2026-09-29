@@ -60,15 +60,19 @@ class MultiTaskCheckpointEngineWorker(CheckpointEngineWorker):
             "parameter_count": 0,
             "total_numel": 0,
         }
+        # Publish this attempt before any await: cancellation or a failed receive
+        # must not leave the previous transfer advertised as complete.
+        self._last_parameter_manifest = manifest
         if wire_format != "named_tensors":
-            self._last_parameter_manifest = manifest
             raise NotImplementedError(
                 f"per-parameter validation currently requires wire_format='named_tensors', got {wire_format!r}"
             )
 
         received = self.checkpoint_engine.receive_weights(global_steps=global_steps)
+        stream_consumed = False
 
         async def audited_weights():
+            nonlocal stream_consumed
             async for name, tensor in ensure_async_iterator(received):
                 manifest["parameters"].append(
                     {
@@ -82,18 +86,16 @@ class MultiTaskCheckpointEngineWorker(CheckpointEngineWorker):
                 manifest["parameter_count"] += 1
                 manifest["total_numel"] += int(tensor.numel())
                 yield name, tensor
+            stream_consumed = True
 
-        try:
-            await self.server_adapter.update_weights(
-                audited_weights(),
-                global_steps=global_steps,
-                wire_format=wire_format,
-            )
-            manifest["complete"] = True
-            self._last_parameter_manifest = manifest
-        except Exception:
-            self._last_parameter_manifest = manifest
-            raise
+        await self.server_adapter.update_weights(
+            audited_weights(),
+            global_steps=global_steps,
+            wire_format=wire_format,
+        )
+        if not stream_consumed or not manifest["parameters"]:
+            raise RuntimeError("parameter manifest requires a fully consumed nonempty weight stream")
+        manifest["complete"] = True
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_parameter_manifest(self) -> dict:

@@ -39,11 +39,6 @@ class MultiTaskHCCLCheckpointEngine(HCCLCheckpointEngine):
         """Reuse native HCCL transfer and audit the rank-0 source stream."""
         if not self.source_validation_enabled:
             return await super().send_weights(weights, global_steps=global_steps)
-        # HCCL trainer ranks other than rank 0 only consume the stream to stay
-        # synchronized.  The rank-0 stream is the canonical actor source.
-        if self.rank != 0:
-            return await super().send_weights(weights, global_steps=global_steps)
-
         manifest = {
             "complete": False,
             "global_steps": global_steps,
@@ -52,8 +47,17 @@ class MultiTaskHCCLCheckpointEngine(HCCLCheckpointEngine):
             "parameter_count": 0,
             "total_numel": 0,
         }
+        # Invalidate the previous audit even if this transfer is cancelled or
+        # this rank no longer owns the canonical source after a group rebuild.
+        self._source_manifest = manifest
+        # HCCL trainer ranks other than rank 0 only consume the stream to stay
+        # synchronized. The rank-0 stream is the canonical actor source.
+        if self.rank != 0:
+            return await super().send_weights(weights, global_steps=global_steps)
+        stream_consumed = False
 
         async def audited_weights():
+            nonlocal stream_consumed
             async for name, tensor in ensure_async_iterator(weights):
                 manifest["parameters"].append(
                     {
@@ -67,15 +71,13 @@ class MultiTaskHCCLCheckpointEngine(HCCLCheckpointEngine):
                 manifest["parameter_count"] += 1
                 manifest["total_numel"] += int(tensor.numel())
                 yield name, tensor
+            stream_consumed = True
 
-        try:
-            result = await super().send_weights(audited_weights(), global_steps=global_steps)
-            manifest["complete"] = True
-            self._source_manifest = manifest
-            return result
-        except Exception:
-            self._source_manifest = manifest
-            raise
+        result = await super().send_weights(audited_weights(), global_steps=global_steps)
+        if not stream_consumed or not manifest["parameters"]:
+            raise RuntimeError("source manifest requires a fully consumed nonempty weight stream")
+        manifest["complete"] = True
+        return result
 
     def get_source_manifest(self) -> dict:
         """Return source metadata from the most recent rank-0 send."""

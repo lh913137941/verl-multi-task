@@ -158,7 +158,24 @@ MULTITASK_FORCE_HANDOFF {"operation_id": "...", "admitted_count": 1,
  "abort_ack_known": true, "aborted_count": 1, "confirmed_count": 1}
 ```
 
-当 `MT_E2E_REQUIRE_INFLIGHT_FORCE=1` 时，`admitted_count=0` 只能算 BLOCKED，不能证明 continuation。
+当 `MT_E2E_REQUIRE_INFLIGHT_FORCE=1` 时，校验器从本次 `result.json` 取得 FORCE REMOVE
+的 `operation_id`，只检查同一操作的 receipt。每条 receipt 独立核验计数，不能拼接不同操作的日志。
+已收到 abort ACK 时，必须有 `aborted_count > 0`，且
+`aborted_count <= confirmed_count <= admitted_count`；如果 abort ACK 丢失，则必须
+`aborted_count=null`，且本次全部 ADMITTED requests 都有 continuation proof。
+没有命中本次操作，或没有真实在途续推时返回 BLOCKED；计数矛盾或证明不完整返回 FAIL。
+
+## 可选参数清单审计
+
+`MULTITASK_PARAMETER_VALIDATION=1` 开启 CE receiver 清单审计。每次传输开始即使旧清单失效；
+只有非空权重流被完整消费且加载调用成功后，清单才标为 complete。取消、异常或提前返回都保留
+本次未完成状态。Manager 检查每个目标都有 CE Worker，以及清单非空、参数名唯一、字段完整、
+shape/numel 与汇总计数一致，再检查版本和各 receiver 的摘要。
+
+receiver 摘要相同只证明接收清单一致。`MULTITASK_SOURCE_VALIDATION=1` 还要求 backend
+提供真实 source manifest；本分支的源端审计实现位于可选 `multitask_hccl` 扩展，原生 NCCL
+没有 `get_source_manifest` 接口。首版 CUDA/NCCL profile 仍不支持 HCCL，这次修复没有增加
+NCCL 源端审计或扩大设备支持范围；没有 source manifest 就不能声称源端到接收端校验通过。
 
 ## 综合验收
 

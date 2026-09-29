@@ -5,6 +5,7 @@ Real communicator destruction/recreation must be validated by D3_test.sh.
 """
 
 import importlib.util
+import asyncio
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -151,3 +152,56 @@ def test_plugin_registers_separate_backend_and_inherits_transfer(backend):
     for method in ("prepare", "init_process_group", "receive_weights"):
         assert getattr(type(engine), method) is getattr(native, method)
     assert getattr(type(engine), "send_weights") is not getattr(native, "send_weights")
+
+
+@pytest.mark.parametrize("outcome", ["cancelled", "partial", "empty", "send_failed", "complete"])
+def test_source_manifest_cannot_reuse_previous_transfer(backend, monkeypatch, outcome):
+    engine, _, _, _, native = backend
+    engine.rank = 0
+    engine.source_validation_enabled = True
+    engine._source_manifest = {"complete": True, "global_steps": 3}
+    engine._tensor_sha256 = lambda tensor: "abc"
+    weights = [] if outcome == "empty" else [
+        ("weight", SimpleNamespace(shape=(2,), dtype="float32", numel=lambda: 2))
+    ]
+
+    async def send_weights(self, stream, **kwargs):
+        if outcome == "cancelled":
+            raise asyncio.CancelledError()
+        if outcome == "partial":
+            await anext(stream)
+            return
+        async for _ in stream:
+            pass
+        if outcome == "send_failed":
+            raise RuntimeError("send failed after consuming weights")
+
+    monkeypatch.setattr(native, "send_weights", send_weights)
+    if outcome == "complete":
+        asyncio.run(engine.send_weights(weights, global_steps=4))
+    else:
+        error = asyncio.CancelledError if outcome == "cancelled" else RuntimeError
+        with pytest.raises(error):
+            asyncio.run(engine.send_weights(weights, global_steps=4))
+    manifest = engine.get_source_manifest()
+    assert manifest["global_steps"] == 4
+    assert manifest["complete"] is (outcome == "complete")
+
+
+def test_non_source_rank_clears_previous_canonical_manifest(backend, monkeypatch):
+    engine, _, _, _, native = backend
+    engine.rank = -1
+    engine.source_validation_enabled = True
+    engine._source_manifest = {"complete": True, "global_steps": 3}
+    weights = [("weight", object())]
+    consumed = []
+
+    async def send_weights(self, stream, **kwargs):
+        # The native non-source path consumes a synchronous iterator.
+        consumed.extend(stream)
+
+    monkeypatch.setattr(native, "send_weights", send_weights)
+    asyncio.run(engine.send_weights(weights, global_steps=4))
+    assert consumed == weights
+    assert engine.get_source_manifest()["global_steps"] == 4
+    assert engine.get_source_manifest()["complete"] is False

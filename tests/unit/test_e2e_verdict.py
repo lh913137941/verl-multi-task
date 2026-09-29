@@ -253,13 +253,14 @@ def test_manifest_may_include_other_native_workers_but_must_cover_them_exactly()
 def test_cli_runs_without_project_imports_and_requires_actual_exit_status(tmp_path):
     log = tmp_path / "native.log"
     log.write_text(_log(_receipt()), encoding="utf-8")
-    command = [sys.executable, "-I", str(MODULE_PATH), str(log), "basic"]
-    passed = subprocess.run(command + ["--process-exit-code", "0"], capture_output=True, text=True)
+    # -I ignores PYTHONUTF8; pin both sides of the pipe for Unicode Windows paths.
+    command = [sys.executable, "-I", "-X", "utf8", str(MODULE_PATH), str(log), "basic"]
+    passed = subprocess.run(command + ["--process-exit-code", "0"], capture_output=True, encoding="utf-8")
     assert passed.returncode == 0, passed.stderr
     assert "E2E PASS: basic" in passed.stdout
     assert verdict.RESULT_MARKER not in passed.stdout
-    failed = subprocess.run(command + ["--process-exit-code", "137"], capture_output=True, text=True)
+    failed = subprocess.run(command + ["--process-exit-code", "137"], capture_output=True, encoding="utf-8")
     assert failed.returncode == 1
     assert "exit status" in failed.stderr
-    missing = subprocess.run(command, capture_output=True, text=True)
+    missing = subprocess.run(command, capture_output=True, encoding="utf-8")
     assert missing.returncode != 0
