@@ -116,6 +116,27 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
         with self._journal_lock:
             self._operation_journal.finish(operation_id, status, result)
 
+        if status not in {OperationStatus.SUCCEEDED, OperationStatus.FAILED}:
+            return
+        rollouter = self.components.get("rollouter")
+        if rollouter is None:
+            return
+        last_error = None
+        for _attempt in range(2):
+            try:
+                ray.get(
+                    rollouter.clear_operation_binding.remote(operation_id),
+                    timeout=CONTROL_RPC_TIMEOUT_S,
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+        logger.warning(
+            "Could not clear terminal Rollouter binding for operation %s: %s",
+            operation_id,
+            last_error,
+        )
+
     def _finish_failed_release(
         self,
         command: OperationCommand,
