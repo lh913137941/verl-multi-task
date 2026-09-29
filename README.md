@@ -243,6 +243,10 @@ data.train_batch_size=0
 data.gen_batch_size=1
 ```
 
+`trainer.device` 不需要为 MultiTask 手工写死。VERL 的 `auto_set_device()` 会在
+profile 选择前把它归一化为当前平台的 `cuda` 或 `npu`；MultiTask profile
+接受这两种 accelerator device，并继续拒绝 CPU-only 生命周期。
+
 `multitask.enabled=false` 或未配置时继续使用原生 Fully Async TaskRunner。
 
 显式启用后，如果 profile、拓扑、依赖或 runtime capability 不满足要求，会直接失败，
@@ -324,8 +328,14 @@ CUDA acceptance 若检测到 `transfer_to_npu` 已加载则直接 skip，避免�
 ```bash
 export VERL_MULTITASK_NPU_MODEL_PATH=/path/to/local/model
 
-python -m pytest -q -s   -m npu_integration   tests/integration/test_native_sleep_npu.py
+# /tmp 空间不足时，把 Ray session/object-spill 临时目录放到大盘。
+export VERL_MULTITASK_RAY_TMPDIR=/path/to/large/local/filesystem/ray_tmp
+
+python -m pytest -q -s -m npu_integration tests/integration/test_native_sleep_npu.py
 ```
+
+NPU acceptance 在启动 Ray 前会检查临时文件系统的剩余空间；空间不足时会
+直接报告环境阻断，避免等到 vLLM EngineCore 初始化后才出现模糊的 WorkerProc 错误。
 
 三条设备级验收：
 
@@ -383,8 +393,9 @@ python -m pytest -q -s   -m gpu_integration   tests/integration/test_native_slee
 
 ```bash
 export VERL_MULTITASK_NPU_MODEL_PATH=/path/to/model
+export VERL_MULTITASK_RAY_TMPDIR=/path/to/large/local/filesystem/ray_tmp
 
-python -m pytest -q -s   -m npu_integration   tests/integration/test_native_sleep_npu.py
+python -m pytest -q -s -m npu_integration tests/integration/test_native_sleep_npu.py
 ```
 
 pytest marker 定义见 `pyproject.toml`。
