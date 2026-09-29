@@ -3392,7 +3392,7 @@ def test_multitask_client_waits_for_same_request_release_before_reacquire():
                     "async_training": type(
                         "Async",
                         (),
-                        {"partial_rollout": True},
+                        {"partial_rollout": False},
                     )()
                 },
             )()
