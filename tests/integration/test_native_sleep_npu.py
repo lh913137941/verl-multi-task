@@ -742,7 +742,10 @@ def test_real_npu_backend_smoke_loads_and_generates_plain_model():
     from transformers import AutoTokenizer
 
     from verl.utils.tokenizer import normalize_token_ids
-    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
+    from verl.workers.rollout.vllm_rollout.vllm_async_server import (
+        vLLMHttpServer,
+        vLLMReplica,
+    )
 
     config = _config(
         model_path,
@@ -752,42 +755,62 @@ def test_real_npu_backend_smoke_loads_and_generates_plain_model():
     rollout_config = config.actor_rollout_ref.rollout
     model_config = config.actor_rollout_ref.model
 
-    ray.shutdown()
-    ray.init(**_ray_init_kwargs(4))
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+    )
+    prompt_ids = normalize_token_ids(
+        tokenizer.encode(
+            "Hello from the vanilla VERL NPU backend smoke test.",
+            add_special_tokens=True,
+        )
+    )
 
-    try:
-        _require_ray_npus(ray, 1)
+    class NoWorkerExtensionServer(vLLMHttpServer):
+        def _get_worker_extension_cls(self):
+            return None
 
-        replica = vLLMReplica(
-            replica_rank=0,
-            config=rollout_config,
-            model_config=model_config,
-            gpus_per_node=1,
-        )
-        asyncio.run(_init_standalone_with_diagnostics(replica))
+    class NoWorkerExtensionReplica(vLLMReplica):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.server_class = ray.remote(NoWorkerExtensionServer)
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
-            trust_remote_code=True,
-        )
-        prompt_ids = normalize_token_ids(
-            tokenizer.encode(
-                "Hello from the vanilla VERL NPU backend smoke test.",
-                add_special_tokens=True,
-            )
-        )
-        output = ray.get(
-            replica._server_handle.generate.remote(
-                request_id=f"npu-backend-smoke-{uuid4().hex}",
-                prompt_ids=prompt_ids,
-                sampling_params={"temperature": 0.0, "max_tokens": 8},
-                image_data=None,
-            ),
-            timeout=120,
-        )
-        assert getattr(output, "token_ids", None)
-    finally:
+    def run_verl_stage(replica_cls, label: str):
         ray.shutdown()
+        ray.init(**_ray_init_kwargs(4))
+        try:
+            _require_ray_npus(ray, 1)
+            replica = replica_cls(
+                replica_rank=0,
+                config=rollout_config,
+                model_config=model_config,
+                gpus_per_node=1,
+            )
+            asyncio.run(_init_standalone_with_diagnostics(replica))
+            output = ray.get(
+                replica._server_handle.generate.remote(
+                    request_id=f"npu-backend-smoke-{label}-{uuid4().hex}",
+                    prompt_ids=prompt_ids,
+                    sampling_params={"temperature": 0.0, "max_tokens": 8},
+                    image_data=None,
+                ),
+                timeout=120,
+            )
+            assert getattr(output, "token_ids", None)
+            print(
+                "VERL_NPU_BACKEND_SMOKE_PASS",
+                {"stage": label},
+                flush=True,
+            )
+        finally:
+            ray.shutdown()
+
+    # Stage 1: keep VERL server/replica orchestration but remove the colocate
+    # worker extension. This isolates VERL CLI/server args from worker patches.
+    run_verl_stage(NoWorkerExtensionReplica, "no-worker-extension")
+
+    # Stage 2: exact upstream VERL vLLMReplica baseline.
+    run_verl_stage(vLLMReplica, "default-worker-extension")
 
 
 def test_real_npu_sleep_releases_same_slot_to_borrower():
