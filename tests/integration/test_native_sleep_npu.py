@@ -60,6 +60,7 @@ def _runtime_env() -> dict:
         "env_vars": {
             "VERL_PLATFORM": "huawei",
             "TOKENIZERS_PARALLELISM": "true",
+            "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
             "HCCL_CONNECT_TIMEOUT": "1500",
             "HCCL_HOST_SOCKET_PORT_RANGE": "60000-60050",
             "HCCL_NPU_SOCKET_PORT_RANGE": "61000-61050",
@@ -109,6 +110,15 @@ def _config(model_path: str):
         config.actor_rollout_ref.rollout.free_cache_engine = True
         config.actor_rollout_ref.rollout.load_format = "auto"
         config.actor_rollout_ref.rollout.skip_tokenizer_init = False
+        config.actor_rollout_ref.rollout.engine_kwargs = {
+            "vllm": {
+                "additional_config": {
+                    "rl_config": {
+                        "enabled": True,
+                    }
+                }
+            }
+        }
     return config
 
 
@@ -656,6 +666,15 @@ def test_real_npu_restore_reinstalls_current_vpub_and_generates_again():
         skip_tokenizer_init=False,
         enable_sleep_mode=True,
         free_cache_engine=True,
+        engine_kwargs={
+            "vllm": {
+                "additional_config": {
+                    "rl_config": {
+                        "enabled": True,
+                    }
+                }
+            }
+        },
         checkpoint_engine=checkpoint_config,
     )
 
