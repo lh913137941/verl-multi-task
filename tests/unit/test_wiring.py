@@ -2693,7 +2693,7 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
         runtime_epoch=0,
     )
     failed._get_master_addr_port_for_slot = fake_master
-    with pytest.raises(RuntimeError, match="unexpected GPU UUID"):
+    with pytest.raises(RuntimeError, match="unexpected physical accelerator"):
         asyncio.run(failed._create_workers_from_claims(spec, {"pg": "PG"}))
     assert killed
     assert failed.workers == []
