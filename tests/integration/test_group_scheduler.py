@@ -60,7 +60,7 @@ def test_group_scheduler_minimal_lease_and_forwarding():
         command = OperationCommand(
             "op-release",
             OperationKind.DONATE,
-            ReplicaKey("task-a", "r0"),
+            ReplicaKey("task-a", "native-0"),
             "l1",
         )
         assert ray.get(gs.submit_operation.remote(command)).operation_id == "op-release"
@@ -129,7 +129,7 @@ def test_group_scheduler_fences_active_claims_until_verified_release():
         command = OperationCommand(
             "op-release",
             OperationKind.DONATE,
-            ReplicaKey("task-a", "r0"),
+            ReplicaKey("task-a", "native-0"),
             "l1",
         )
         ray.get(gs.submit_operation.remote(command))
