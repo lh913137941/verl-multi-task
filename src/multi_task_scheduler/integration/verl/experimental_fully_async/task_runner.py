@@ -282,7 +282,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                     "ADD bootstrap failed; hidden runtime was verified RELEASED",
                 ):
                     return
-                final_evidence = self._require_evidence(
+                final_evidence = _require_evidence(
                     evidence,
                     operation_id=operation_id,
                     expected=EvidenceType.SERVICE_COMMITTED,
@@ -301,7 +301,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                         )
                     )
                     if prior_release is not None:
-                        final_evidence = self._require_evidence(
+                        final_evidence = _require_evidence(
                             prior_release,
                             operation_id=operation_id,
                             expected=EvidenceType.RELEASED,
@@ -350,7 +350,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                             )
                             return
                         raise
-                    self._require_evidence(
+                    _require_evidence(
                         exit_evidence,
                         operation_id=operation_id,
                         expected=EvidenceType.EXIT_READY,
@@ -359,14 +359,14 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                         trainer.remove_and_commit.remote(operation)
                     )
 
-                self._require_evidence(
+                _require_evidence(
                     service_evidence,
                     operation_id=operation_id,
                     expected=EvidenceType.SERVICE_COMMITTED,
                 )
 
                 release_evidence = ray.get(rollouter.finalize_release.remote(operation))
-                final_evidence = self._require_evidence(
+                final_evidence = _require_evidence(
                     release_evidence,
                     operation_id=operation_id,
                     expected=EvidenceType.RELEASED,
@@ -388,7 +388,7 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                     "RESTORE bootstrap failed; native runtime was verified re-slept",
                 ):
                     return
-                final_evidence = self._require_evidence(
+                final_evidence = _require_evidence(
                     evidence,
                     operation_id=operation_id,
                     expected=EvidenceType.SERVICE_COMMITTED,
