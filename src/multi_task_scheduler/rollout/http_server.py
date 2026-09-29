@@ -1,6 +1,7 @@
 """Native vLLM HTTP server extension; generation behavior remains inherited."""
 
 import asyncio
+import inspect
 
 import ray
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
@@ -18,6 +19,37 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
                 )
             await asyncio.sleep(0.01)
 
+    @staticmethod
+    def _validate_multitask_engine_capabilities(engine) -> None:
+        required = (
+            "check_health",
+            "is_sleeping",
+            "sleep",
+            "wake_up",
+            "wait_for_requests_to_drain",
+            "reset_prefix_cache",
+        )
+        missing = tuple(
+            name for name in required
+            if not callable(getattr(engine, name, None))
+        )
+        if missing:
+            raise RuntimeError(
+                "vLLM engine lacks MultiTask-required API(s): "
+                + ", ".join(missing)
+            )
+        try:
+            sleep_signature = inspect.signature(engine.sleep)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "cannot inspect vLLM engine.sleep signature"
+            ) from exc
+        parameters = sleep_signature.parameters
+        if "level" not in parameters or "mode" not in parameters:
+            raise RuntimeError(
+                "MultiTask requires vLLM engine.sleep(level=..., mode=...)"
+            )
+
     async def runtime_health(self) -> dict:
         """Return first-release server/engine health facts or raise if unhealthy."""
         if self.nnodes != 1 or self.node_rank != 0:
@@ -33,6 +65,7 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         if self._server_port is None:
             raise RuntimeError("HTTP server port is not initialized")
 
+        self._validate_multitask_engine_capabilities(engine)
         await engine.check_health()
         return {
             "node_id": ray.get_runtime_context().get_node_id(),
