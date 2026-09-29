@@ -108,6 +108,33 @@ def verl_expected_transformers() -> str | None:
     return matches[-1] if matches else None
 
 
+def inspect_safetensor_keys(model: Path) -> tuple[list[str], str | None]:
+    """Read checkpoint keys without materializing tensors."""
+    index = read_json(model / "model.safetensors.index.json")
+    if isinstance(index, dict):
+        weight_map = index.get("weight_map")
+        if isinstance(weight_map, dict):
+            keys = sorted(str(key) for key in weight_map.keys())
+            return keys, "model.safetensors.index.json"
+
+    files = sorted(model.glob("*.safetensors"))
+    if not files:
+        return [], None
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        return [], None
+
+    keys: list[str] = []
+    for file_path in files[:2]:
+        try:
+            with safe_open(file_path, framework="pt", device="cpu") as handle:
+                keys.extend(handle.keys())
+        except Exception:
+            continue
+    return sorted(set(keys)), ",".join(path.name for path in files[:2])
+
+
 def read_json(path: Path) -> dict | None:
     if not path.exists():
         return None
@@ -289,6 +316,34 @@ def main() -> int:
             )
             if quant_desc is not None:
                 print("kv_cache_type:", quant_desc.get("kv_cache_type"))
+
+            checkpoint_keys, checkpoint_source = inspect_safetensor_keys(model)
+            print("checkpoint key source:", checkpoint_source)
+            print("checkpoint key sample:", checkpoint_keys[:20])
+            if checkpoint_keys:
+                has_model_prefix = any(
+                    key.startswith("model.layers.") for key in checkpoint_keys
+                )
+                has_bare_layers = any(
+                    key.startswith("layers.") for key in checkpoint_keys
+                )
+                print("checkpoint has model.layers prefix:", has_model_prefix)
+                print("checkpoint has bare layers prefix:", has_bare_layers)
+                if has_bare_layers and not has_model_prefix:
+                    failures.append(
+                        "Qwen3 checkpoint weights use bare 'layers.*' keys instead "
+                        "of the Hugging Face/vLLM 'model.layers.*' layout; this "
+                        "checkpoint appears converted or stripped and is not a "
+                        "valid plain upstream Qwen3 acceptance model"
+                    )
+                for required in (
+                    "model.layers.0.mlp.gate_proj.weight",
+                    "model.layers.0.mlp.up_proj.weight",
+                ):
+                    print(
+                        f"checkpoint contains {required}:",
+                        required in checkpoint_keys,
+                    )
             try:
                 from vllm_ascend.quantization.utils import detect_quantization_method
 
