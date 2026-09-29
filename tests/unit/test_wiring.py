@@ -118,7 +118,14 @@ def taskrunner_class():
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
         CONTROL_RPC_TIMEOUT_S=CONTROL_RPC_TIMEOUT_S,
         _require_evidence=require_operation_evidence,
-        logger=type("Logger", (), {"exception": lambda *args, **kwargs: None})(),
+        logger=type(
+            "Logger",
+            (),
+            {
+                "exception": lambda *args, **kwargs: None,
+                "warning": lambda *args, **kwargs: None,
+            },
+        )(),
     )
 
 
@@ -302,10 +309,17 @@ def test_load_balancer_bounds_settled_request_history():
     for index in range(5):
         request_id = f"request-{index}"
         server_id, _ = lb.acquire_server(request_id)
+        lb.continuation_proofs[request_id] = (
+            "client",
+            f"digest-{index}",
+            "op",
+            OperationEvidence.now("op", EvidenceType.EXIT_READY),
+        )
         lb.release_server(server_id, request_id=request_id)
 
     assert len(lb.attempt_state) <= 2
     assert set(lb.attempt_state) == {"request-3", "request-4"}
+    assert set(lb.continuation_proofs) == {"request-3", "request-4"}
     assert all(state is AttemptState.SETTLED for state in lb.attempt_state.values())
 
 
@@ -460,6 +474,35 @@ def test_taskrunner_minimal_journal_surface_and_replay_does_not_relaunch():
     missing = runner.query_operation("missing")
     assert missing.status is OperationStatus.UNKNOWN
     assert missing.result is None
+
+
+def test_taskrunner_terminal_finish_clears_rollouter_binding_but_unknown_keeps_it():
+    runner = taskrunner_class()()
+    cleared = []
+
+    class Rollouter:
+        clear_operation_binding = RemoteMethod(
+            lambda operation_id: cleared.append(operation_id) or True
+        )
+
+    runner.components["rollouter"] = Rollouter()
+
+    for operation_id, status in (
+        ("op-success", OperationStatus.SUCCEEDED),
+        ("op-failed", OperationStatus.FAILED),
+        ("op-unknown", OperationStatus.UNKNOWN),
+    ):
+        command = OperationCommand(
+            operation_id,
+            OperationKind.REMOVE,
+            ReplicaKey("task-a", "borrowed-0"),
+            "l1",
+        )
+        runner._operation_journal.begin(command)
+        runner._operation_journal.mark_running(operation_id)
+        runner._finish(operation_id, status, status.value)
+
+    assert cleared == ["op-success", "op-failed"]
 
 
 def test_taskrunner_exact_unknown_remove_replay_relaunches_same_operation():
@@ -3427,6 +3470,28 @@ def test_multitask_client_waits_for_same_request_release_before_reacquire():
         assert [call[0] for call in calls] == ["release", "acquire"]
 
     asyncio.run(scenario())
+
+
+def test_rollouter_clear_operation_binding_is_scoped_and_idempotent():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key0 = ReplicaKey("task-a", "borrowed-0")
+    key1 = ReplicaKey("task-a", "borrowed-1")
+    rollouter._pending_operation_targets = {
+        "op-0": key0,
+        "op-1": key1,
+    }
+    rollouter._force_exit_recovery = {
+        "op-0": (("request-0",), 1),
+        "op-1": (("request-1",), 1),
+    }
+
+    assert rollouter.clear_operation_binding("op-0") is True
+    assert "op-0" not in rollouter._pending_operation_targets
+    assert "op-0" not in rollouter._force_exit_recovery
+    assert rollouter._pending_operation_targets["op-1"] == key1
+    assert "op-1" in rollouter._force_exit_recovery
+    assert rollouter.clear_operation_binding("op-0") is False
 
 
 def test_rollouter_idle_detection_treats_unknown_capacity_as_zero():
