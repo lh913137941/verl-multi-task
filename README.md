@@ -323,7 +323,8 @@ Ray cluster resource "NPU"
 NPU 测试会为 driver 和 Ray runtime 显式固定 `VERL_PLATFORM=huawei`；
 CUDA acceptance 若检测到 `transfer_to_npu` 已加载则直接 skip，避免假 CUDA 绿灯。
 
-真实 NPU acceptance：
+真实 NPU acceptance 建议使用 plain BF16/FP16 模型；C8/ModelSlim/其它量化模型应先单独验证
+vLLM-Ascend loader 兼容性，不要把量化 backend 失败混入生命周期验收。
 
 ```bash
 export VERL_MULTITASK_NPU_MODEL_PATH=/path/to/local/model
