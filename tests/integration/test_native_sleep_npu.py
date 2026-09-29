@@ -195,6 +195,53 @@ def _runtime_env() -> dict:
     }
 
 
+def _dump_recent_vllm_worker_logs() -> None:
+    """Print recent Ray log tails that contain the hidden vLLM worker root cause."""
+    temp_dir = _ray_temp_dir()
+    logs_dir = temp_dir / "session_latest" / "logs"
+    if not logs_dir.exists():
+        return
+
+    candidates = []
+    for pattern in ("*.out", "*.err"):
+        candidates.extend(logs_dir.glob(pattern))
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+
+    emitted = 0
+    for log_path in candidates:
+        if emitted >= 6:
+            break
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if not any(
+            marker in text
+            for marker in (
+                "VllmWorker",
+                "WorkerProc failed",
+                "WorkerProc initialization failed",
+                "EngineCore failed",
+                "Traceback (most recent call last)",
+            )
+        ):
+            continue
+        tail = "\n".join(text.splitlines()[-160:])
+        print(
+            f"\nNPU_VLLM_WORKER_LOG {log_path}\n{tail}\n",
+            flush=True,
+        )
+        emitted += 1
+
+
+async def _init_standalone_with_diagnostics(replica) -> None:
+    try:
+        await replica.init_standalone()
+    except BaseException:
+        _dump_recent_vllm_worker_logs()
+        raise
+
+
 def _require_ray_npus(ray, min_devices: int) -> None:
     resources = ray.cluster_resources()
     count = float(resources.get("NPU", 0.0))
@@ -392,7 +439,7 @@ def test_real_npu_sleep_releases_same_slot_to_borrower():
             gpus_per_node=1,
             replica_kind=ReplicaKind.NATIVE,
         )
-        asyncio.run(replica.init_standalone())
+        asyncio.run(_init_standalone_with_diagnostics(replica))
         placement = asyncio.run(replica.worker_placements())[0]
         assert placement["resource_name"] == "NPU"
         assert placement["gpu_uuid"].startswith("NPU:")
@@ -515,8 +562,8 @@ def test_real_npu_force_remove_continues_on_another_replica():
 
         async def init_replicas():
             await asyncio.gather(
-                target.init_standalone(),
-                alternate.init_standalone(),
+                _init_standalone_with_diagnostics(target),
+                _init_standalone_with_diagnostics(alternate),
             )
 
         asyncio.run(init_replicas())
