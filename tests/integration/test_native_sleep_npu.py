@@ -568,7 +568,12 @@ def _require_ray_npus(ray, min_devices: int) -> None:
         )
 
 
-def _config(model_path: str, *, enable_sleep_mode: bool = True):
+def _config(
+    model_path: str,
+    *,
+    enable_sleep_mode: bool = True,
+    enforce_eager: bool = False,
+):
     from hydra import compose, initialize_config_dir
 
     import verl
@@ -594,6 +599,7 @@ def _config(model_path: str, *, enable_sleep_mode: bool = True):
         config.actor_rollout_ref.rollout.pipeline_model_parallel_size = 1
         config.actor_rollout_ref.rollout.enable_sleep_mode = enable_sleep_mode
         config.actor_rollout_ref.rollout.free_cache_engine = enable_sleep_mode
+        config.actor_rollout_ref.rollout.enforce_eager = enforce_eager
         config.actor_rollout_ref.rollout.load_format = "auto"
         config.actor_rollout_ref.rollout.skip_tokenizer_init = False
         config.actor_rollout_ref.rollout.engine_kwargs = (
@@ -738,7 +744,11 @@ def test_real_npu_backend_smoke_loads_and_generates_plain_model():
     from verl.utils.tokenizer import normalize_token_ids
     from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
-    config = _config(model_path, enable_sleep_mode=False)
+    config = _config(
+        model_path,
+        enable_sleep_mode=False,
+        enforce_eager=True,
+    )
     rollout_config = config.actor_rollout_ref.rollout
     model_config = config.actor_rollout_ref.model
 
