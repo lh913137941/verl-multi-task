@@ -307,6 +307,7 @@ def test_real_standalone_level2_sleep_releases_device_memory_and_weights_wake_st
         manager.replica_kind = {key: ReplicaKind.NATIVE}
         manager.replica_state = {key: ReplicaState.DRAINING}
         manager._runtime_inventory = {key: replica}
+        manager._native_release_evidence = {}
 
         before_mib = _gpu_memory_used_mib(gpu_uuid)
         release = asyncio.run(
@@ -766,6 +767,7 @@ def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
         manager.replica_kind = {key: ReplicaKind.NATIVE}
         manager.replica_state = {key: ReplicaState.DRAINING}
         manager._runtime_inventory = {key: replica}
+        manager._native_release_evidence = {}
 
         release = asyncio.run(
             manager.sleep(key, operation_id="gpu-restore-donate")
