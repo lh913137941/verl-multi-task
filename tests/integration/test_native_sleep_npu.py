@@ -513,6 +513,111 @@ async def _init_standalone_with_diagnostics(replica) -> None:
         raise exc
 
 
+def _run_direct_qwen3_layout_probe(model_path: str) -> None:
+    """Inspect the constructed Qwen3 parameter layout before loading weights."""
+    env = os.environ.copy()
+    visible = env.get("ASCEND_RT_VISIBLE_DEVICES")
+    if visible:
+        env["ASCEND_RT_VISIBLE_DEVICES"] = visible.split(",", 1)[0].strip()
+    else:
+        env["ASCEND_RT_VISIBLE_DEVICES"] = "0"
+    env["VLLM_USE_V1"] = "1"
+    env["VERL_MULTITASK_DIRECT_SMOKE_MODEL"] = model_path
+
+    script = r"""
+import os
+
+from vllm import LLM
+import vllm_ascend  # noqa: F401
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+
+class _LayoutProbeComplete(RuntimeError):
+    pass
+
+_original_load_weights = DefaultModelLoader.load_weights
+
+def _probe(self, model, model_config):
+    params = dict(model.named_parameters(remove_duplicate=False))
+    layer10 = sorted(
+        name for name in params
+        if "layers.10.mlp." in name
+    )
+    modules = dict(model.named_modules())
+    gate_name = "model.layers.10.mlp.gate_up_proj"
+    gate = modules.get(gate_name)
+    print(
+        "DIRECT_QWEN3_PRELOAD_LAYOUT",
+        {
+            "model_type": type(model).__module__ + "." + type(model).__qualname__,
+            "parameter_count": len(params),
+            "layer10_mlp_params": layer10,
+            "gate_up_module_found": gate is not None,
+            "gate_up_proj_type": (
+                None
+                if gate is None
+                else type(gate).__module__ + "." + type(gate).__qualname__
+            ),
+            "gate_up_named_parameters": (
+                []
+                if gate is None
+                else [
+                    name
+                    for name, _ in gate.named_parameters(
+                        recurse=True,
+                        remove_duplicate=False,
+                    )
+                ]
+            ),
+            "quant_config_type": (
+                None
+                if getattr(model, "quant_config", None) is None
+                else (
+                    type(model.quant_config).__module__
+                    + "."
+                    + type(model.quant_config).__qualname__
+                )
+            ),
+        },
+        flush=True,
+    )
+    raise _LayoutProbeComplete("layout probe complete")
+
+DefaultModelLoader.load_weights = _probe
+
+model = os.environ["VERL_MULTITASK_DIRECT_SMOKE_MODEL"]
+try:
+    LLM(
+        model=model,
+        dtype="bfloat16",
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.4,
+        max_model_len=512,
+        max_num_seqs=1,
+        enforce_eager=True,
+        trust_remote_code=True,
+    )
+except _LayoutProbeComplete:
+    print("DIRECT_QWEN3_PRELOAD_LAYOUT_PASS", flush=True)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=180,
+    )
+    if result.stdout:
+        print("\nDIRECT_QWEN3_LAYOUT_STDOUT\n" + result.stdout, flush=True)
+    if result.stderr:
+        print("\nDIRECT_QWEN3_LAYOUT_STDERR\n" + result.stderr, flush=True)
+    if "DIRECT_QWEN3_PRELOAD_LAYOUT" not in result.stdout:
+        pytest.fail(
+            "Qwen3 preload layout probe did not reach model construction; "
+            "inspect DIRECT_QWEN3_LAYOUT_STDOUT/STDERR above.",
+            pytrace=False,
+        )
+
+
 def _run_direct_vllm_ascend_smoke(
     model_path: str,
     *,
@@ -808,6 +913,10 @@ def test_real_npu_backend_smoke_loads_and_generates_plain_model():
     model_path = _require_model_path()
     _require_npu(1)
     _print_npu_runtime_diagnostics()
+
+    # Stage -1: inspect the actual instantiated parameter layout before
+    # checkpoint loading. This distinguishes model construction from loader bugs.
+    _run_direct_qwen3_layout_probe(model_path)
 
     # Stage 0: no VERL vLLMReplica, no Ray actor, no worker_extension_cls,
     # and eager mode to remove graph compilation from the equation.
