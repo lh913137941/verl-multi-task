@@ -95,8 +95,44 @@ class _MultiTaskFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         self._continuation_enabled = bool(
             getattr(async_training, "partial_rollout", False)
         )
+        self._release_fences: dict[str, object] = {}
+
+    async def _clear_release_fence(self, request_id: str, release_ref) -> None:
+        try:
+            await release_ref
+        finally:
+            if self._release_fences.get(request_id) is release_ref:
+                self._release_fences.pop(request_id, None)
+
+    def _release_server(self, server_id: str, request_id: str | None = None) -> None:
+        # Preserve VERL's fire-and-forget finally path, but retain the Ray
+        # ObjectRef so a same-request retry cannot overtake its own release.
+        pool = {"request_id": request_id}
+        fields = {
+            name: pool[name]
+            for name in self._lb_require_release_fields
+            if name in pool
+        }
+        release_ref = self._load_balancer.release_server.remote(
+            server_id=server_id,
+            **fields,
+        )
+        if not request_id:
+            return
+        self._release_fences[request_id] = release_ref
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._clear_release_fence(request_id, release_ref))
 
     async def _acquire_server(self, request_id: str, **extra):
+        release_ref = self._release_fences.get(request_id)
+        if release_ref is not None:
+            await release_ref
+            if self._release_fences.get(request_id) is release_ref:
+                self._release_fences.pop(request_id, None)
+
         server_id, server = await super()._acquire_server(request_id, **extra)
         if not self._continuation_enabled:
             return server_id, server
@@ -147,6 +183,20 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             processor=processor,
             device_name=device_name,
         )
+
+    async def _read_rpc(self, remote_method, *args, attempts: int = 3):
+        """Retry read-only owner queries; never retry lifecycle mutations here."""
+        if attempts <= 0:
+            raise ValueError("read RPC attempts must be positive")
+        delay = 0.05
+        for attempt in range(attempts):
+            try:
+                return await remote_method.remote(*args)
+            except Exception:
+                if attempt + 1 >= attempts:
+                    raise
+                await asyncio.sleep(delay)
+                delay *= 2
 
     async def _init_async_rollout_manager(self):
         enable_agent_reward_loop = (
@@ -427,10 +477,10 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             if not bool(getattr(async_training, "partial_rollout", False)):
                 raise ValueError("FORCE REMOVE requires async_training.partial_rollout=true")
 
-            server_id = await lb.server_for_replica.remote(replica_key)
+            server_id = await self._read_rpc(lb.server_for_replica, replica_key)
             if not isinstance(server_id, str) or not server_id:
                 raise RuntimeError("FORCE target has no active route")
-            active_servers = tuple(await lb.get_all_servers.remote())
+            active_servers = tuple(await self._read_rpc(lb.get_all_servers))
             if not any(candidate != server_id for candidate in active_servers):
                 raise RuntimeError("FORCE REMOVE requires another active rollout server")
 
@@ -452,9 +502,9 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                 recovery = self._force_exit_recovery.get(operation_id)
                 if recovery is None:
                     admitted_list = []
-                    for request_id in await lb.requests_for_server.remote(server_id):
+                    for request_id in await self._read_rpc(lb.requests_for_server, server_id):
                         if (
-                            await lb.query_attempt.remote(request_id)
+                            await self._read_rpc(lb.query_attempt, request_id)
                             is AttemptState.ADMITTED
                         ):
                             admitted_list.append(request_id)
@@ -485,9 +535,15 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                 deadline = loop.time() + self._force_handoff_timeout_s
                 while True:
                     handoffs = set(
-                        await lb.continuation_handoff_requests.remote(operation_id)
+                        await self._read_rpc(
+                            lb.continuation_handoff_requests,
+                            operation_id,
+                        )
                     )
-                    unsettled = await lb.has_unsettled_requests.remote(server_id)
+                    unsettled = await self._read_rpc(
+                        lb.has_unsettled_requests,
+                        server_id,
+                    )
                     confirmed = len(handoffs.intersection(admitted))
                     if aborted_count is None:
                         # The abort ACK itself was lost. Do not repeat abort.
@@ -542,7 +598,7 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                 raise ValueError("multitask.drain_timeout_s must be positive")
             deadline = loop.time() + self._natural_drain_timeout_s
             next_log = loop.time() + 10.0
-            while await lb.has_unsettled_requests.remote(server_id):
+            while await self._read_rpc(lb.has_unsettled_requests, server_id):
                 now = loop.time()
                 if now >= deadline:
                     raise TimeoutError(
@@ -645,7 +701,7 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             )
         except BaseException:
             try:
-                reconciled = await lb.query_ready_operation.remote(operation_id)
+                reconciled = await self._read_rpc(lb.query_ready_operation, operation_id)
             except BaseException as exc:
                 raise RuntimeError(
                     f"{label} routing commit outcome is unknown"
@@ -675,8 +731,9 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             # operation is an ADD/RESTORE publication whose R outcome was
             # ambiguous. Query R; never infer success from local M/C.
             try:
-                reconciled = await lb.query_ready_operation.remote(
-                    operation.operation_id
+                reconciled = await self._read_rpc(
+                    lb.query_ready_operation,
+                    operation.operation_id,
                 )
             except BaseException as exc:
                 raise RuntimeError(
@@ -769,8 +826,8 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             )
 
         try:
-            server_id = await lb.server_for_replica.remote(target)
-            if server_id is not None and await lb.has_unsettled_requests.remote(server_id):
+            server_id = await self._read_rpc(lb.server_for_replica, target)
+            if server_id is not None and await self._read_rpc(lb.has_unsettled_requests, server_id):
                 raise ValueError("cannot commit service exit while requests remain unsettled")
             await lb.finish_remove.remote(target)
             manager.deactivate_service(target)
