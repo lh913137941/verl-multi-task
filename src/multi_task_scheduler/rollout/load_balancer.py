@@ -1,335 +1,248 @@
-"""Native routing subclass plus the simplified R-view commit protocol.
-
-Dynamic service commits use full ReplicaKey identity and typed RouteEntry state.
-LB owns IdleCandidateReport sequencing; a candidate itself deliberately carries
-no report-level source_seq/TTL or detailed owner observations.
-"""
+"""VERL router extension owning the simplified R view."""
 
 from __future__ import annotations
 
-import hashlib
-import uuid
-
-import ray
-from verl.workers.rollout.llm_server import DEFAULT_ROUTING_CACHE_SIZE, GlobalRequestLoadBalancer
+from verl.workers.rollout.router import DEFAULT_ROUTING_CACHE_SIZE, GlobalRequestLoadBalancer
 
 from multi_task_scheduler.orchestration.contracts import (
-    IdleCandidateReport,
-    RouteEntry,
-    RouteState,
-    ServiceAction,
+    AttemptState,
+    EvidenceType,
+    OperationEvidence,
+    ReplicaKey,
 )
-from multi_task_scheduler.orchestration.production_window import (
-    ProductionWindow,
-    select_idle_candidates,
-)
-from multi_task_scheduler.orchestration.receipts import (
-    Ack,
-    CommitOwner,
-    CommitReceipt,
-    DrainTicket,
-    EvidenceHeader,
-)
-
-
-def _digest(*parts: object) -> str:
-    data = "|".join(repr(part) for part in parts).encode("utf-8")
-    return hashlib.sha256(data).hexdigest()
 
 
 class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
-    """LB owns R, its attempt ledger, and idle-candidate report sequencing."""
+    """Reuse native routing/counters and add exact request lifecycle facts."""
 
-    def __init__(
-        self,
-        servers,
-        max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
-        full_determinism=False,
-        *,
-        group_scheduler=None,
-    ):
-        self.group_scheduler = group_scheduler
-        super().__init__(servers, max_cache_size=max_cache_size, full_determinism=full_determinism)
-        self.lb_revision = 0
-        self.sync_epoch = 0
-        self.routes: dict[object, RouteEntry] = {}
-        self.draining = {}
-        self.attempts = {}
-        self._commit_receipts = {}
-        self._idle_source_seq = -1
-        self._last_idle_report = None
+    def __init__(self, servers, max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
+                 full_determinism=False, *, initial_routes=None):
+        super().__init__(servers, max_cache_size=max_cache_size,
+                         full_determinism=full_determinism)
+        self.routes: dict[ReplicaKey, str] = {}
+        self.active_request_server: dict[str, str] = {}
+        self.attempt_state: dict[str, AttemptState] = {}
+        self.draining_operations: dict[str, str] = {}
+        self.ready_operations: dict[str, tuple[ReplicaKey, str, OperationEvidence]] = {}
+        # request_id -> (client_id, prefix_digest, operation_id, evidence).
+        # This remains LB-internal request truth: exact retries are idempotent,
+        # while a different client/prefix cannot overwrite an accepted handoff.
+        self.continuation_proofs: dict[
+            str, tuple[str, str, str, OperationEvidence]
+        ] = {}
+        # operation_id -> logical request ids whose aborted prefix was observed
+        # by the continuation-aware FullyAsync client. Unlike per-attempt proof,
+        # this survives immediate re-admission on another server until removal
+        # commits, so FORCE can verify handoff even after the retry has started.
+        self.continuation_handoffs: dict[str, set[str]] = {}
+        # Keep enough SETTLED history for ACK-loss queries without allowing
+        # request facts to grow for the entire task lifetime.
+        self._settled_retention = 10_000
+        for key, server_id in dict(initial_routes or {}).items():
+            if not isinstance(key, ReplicaKey):
+                raise TypeError("initial route key must be ReplicaKey")
+            if server_id not in self._servers:
+                raise ValueError("initial route references an unknown server")
+            self.routes[key] = server_id
 
-    @property
-    def last_idle_report(self) -> IdleCandidateReport | None:
-        return self._last_idle_report
+    def require_release_fields(self) -> list[str]:
+        return ["request_id"]
 
-    def _next_route_epoch(self, key) -> int:
-        existing = self.routes.get(key)
-        return 1 if existing is None else existing.replica_route_epoch + 1
+    def _gc_settled_requests(self) -> None:
+        overflow = len(self.attempt_state) - self._settled_retention
+        if overflow <= 0:
+            return
+        for request_id, state in tuple(self.attempt_state.items()):
+            if overflow <= 0:
+                break
+            if (
+                state is AttemptState.SETTLED
+                and request_id not in self.active_request_server
+            ):
+                self.attempt_state.pop(request_id, None)
+                self.continuation_proofs.pop(request_id, None)
+                overflow -= 1
 
-    def build_idle_candidate_report(
-        self,
-        window: ProductionWindow,
-        replicas,
-        *,
-        gs_epoch: str,
-        lb_session: str,
-        valid_for_ms: int,
-        observations_fresh: bool,
-        min_active_gpus: int,
-        current_active_gpus: int,
-        routable_count: int,
-    ) -> IdleCandidateReport:
-        """Freeze one new complete candidate observation with an LB-owned seq."""
-        if not isinstance(window, ProductionWindow):
-            raise TypeError("idle reporting requires ProductionWindow")
-        source_seq = self._idle_source_seq + 1
-        candidates = select_idle_candidates(
-            window,
-            replicas,
-            observations_fresh=observations_fresh,
-            min_active_gpus=min_active_gpus,
-            current_active_gpus=current_active_gpus,
-            routable_count=routable_count,
-        )
-        report = IdleCandidateReport(
-            task_session=window.task_session,
-            gs_epoch=gs_epoch,
-            lb_session=lb_session,
-            source_seq=source_seq,
-            production_revision=window.revision,
-            valid_for_ms=valid_for_ms,
-            candidates=candidates,
-        )
-        self._idle_source_seq = source_seq
-        self._last_idle_report = report
-        return report
-
-    def report_idle_candidates(self, report: IdleCandidateReport) -> Ack:
-        """Send one already-frozen report to GS; retries reuse the same object."""
-        if not isinstance(report, IdleCandidateReport):
-            raise TypeError("report_idle_candidates requires IdleCandidateReport")
-        if self.group_scheduler is None:
-            raise RuntimeError("GroupScheduler handle is required for idle reporting")
-        if self._last_idle_report is None or report != self._last_idle_report:
-            raise ValueError("LB may report only its latest frozen candidate set")
-        ack = ray.get(
-            self.group_scheduler.report_idle_candidates.remote(report),
-            timeout=30,
-        )
-        if not isinstance(ack, Ack):
-            raise TypeError("GroupScheduler returned a non-Ack idle-report response")
-        return ack
-
-    def close_for_exit(
-        self,
-        ctx,
-        key,
-        *,
-        phase_revision: int,
-        server_admission_epoch: int,
-    ) -> DrainTicket:
-        """Move one ROUTABLE entry to DRAINING and fence its old route tickets."""
-        if key.task_session != ctx.task_session:
-            raise ValueError("drain target does not belong to operation task_session")
-        existing_ticket = self.draining.get((ctx.identity, key))
-        if existing_ticket is not None:
-            return existing_ticket
-
-        route = self.routes.get(key)
-        if route is None:
-            raise ValueError("drain target has no RouteEntry")
-        if route.state is not RouteState.ROUTABLE:
-            raise ValueError(f"drain target route is {route.state.value}, not ROUTABLE")
-
-        route_epoch = self._next_route_epoch(key)
-        self.lb_revision += 1
-        self.routes[key] = RouteEntry(
-            key=key,
-            head_server=route.head_server,
-            state=RouteState.DRAINING,
-            replica_route_epoch=route_epoch,
-            sync_epoch=route.sync_epoch,
-            serving_version=route.serving_version,
-            commit_operation_id=ctx.operation_id,
-        )
-        drain_id = f"drain-{uuid.uuid4().hex}"
-        ticket = DrainTicket(
-            header=EvidenceHeader(
-                ctx=ctx,
-                key=key,
-                phase_revision=phase_revision,
-                digest=_digest("DRAIN", ctx.identity, key, drain_id, route_epoch),
-            ),
-            drain_id=drain_id,
-            route_epoch=route_epoch,
-            server_admission_epoch=server_admission_epoch,
-        )
-        self.draining[(ctx.identity, key)] = ticket
-        return ticket
-
-    def commit_routable(self, ctx, prepared, weight, ce_commit) -> CommitReceipt:
-        """Commit R=ROUTABLE after valid weight and CE ADD evidence."""
-        key = prepared.key
-        if key.task_session != ctx.task_session or weight.header.ctx != ctx or weight.header.key != key:
-            raise ValueError("LB ADD evidence identity mismatch")
-        if (
-            ce_commit.header.ctx != ctx
-            or ce_commit.header.key != key
-            or ce_commit.owner is not CommitOwner.CE
-            or ce_commit.action is not ServiceAction.ADD
-            or ce_commit.version != weight.version
-        ):
-            raise ValueError("LB ADD requires matching CE ADD commit")
-        cache_key = (ctx.identity, key, ServiceAction.ADD)
-        cached = self._commit_receipts.get(cache_key)
-        if cached is not None:
-            return cached
-
-        existing = self.routes.get(key)
-        if existing is not None and existing.state in {
-            RouteState.ROUTABLE,
-            RouteState.DRAINING,
-            RouteState.QUARANTINED,
-        }:
-            raise ValueError(
-                f"cannot commit route from existing state {existing.state.value}"
+    def acquire_server(self, request_id: str, **extra):
+        state = self.attempt_state.get(request_id)
+        if state in {AttemptState.ADMITTED, AttemptState.TERMINATED}:
+            raise RuntimeError(
+                "request attempt has not reached SETTLED and cannot be re-admitted"
             )
 
-        route_epoch = self._next_route_epoch(key)
-        self.lb_revision += 1
-        self.routes[key] = RouteEntry(
-            key=key,
-            head_server=prepared.head_server,
-            state=RouteState.ROUTABLE,
-            replica_route_epoch=route_epoch,
-            sync_epoch=self.sync_epoch,
-            serving_version=weight.version,
-            commit_operation_id=ctx.operation_id,
-        )
-        self.draining.pop((ctx.identity, key), None)
-        digest = _digest(
-            "LB",
-            "ADD",
-            ctx.identity,
-            key,
-            self.lb_revision,
-            route_epoch,
-            weight.header.digest,
-            ce_commit.header.digest,
-        )
-        receipt = CommitReceipt(
-            header=EvidenceHeader(
-                ctx=ctx,
-                key=key,
-                phase_revision=max(
-                    weight.header.phase_revision, ce_commit.header.phase_revision
-                ) + 1,
-                digest=digest,
-            ),
-            owner=CommitOwner.LB,
-            action=ServiceAction.ADD,
-            revision=self.lb_revision,
-            version=weight.version,
-            route_epoch=route_epoch,
-        )
-        self._commit_receipts[cache_key] = receipt
-        return receipt
+        server_id, handle = super().acquire_server(request_id, **extra)
+        if state is AttemptState.SETTLED:
+            # Only a successfully admitted replacement attempt invalidates the
+            # previous ACK-loss continuation proof. A failed acquire must leave
+            # the settled attempt queryable exactly as it was.
+            self.continuation_proofs.pop(request_id, None)
+        self.active_request_server[request_id] = server_id
+        self.attempt_state[request_id] = AttemptState.ADMITTED
+        return server_id, handle
 
-    def _has_unsettled_attempts(self, key) -> bool:
-        attempts = self.attempts.get(key)
-        if attempts is None:
-            return False
-        if isinstance(attempts, dict):
-            terminal = {"TERMINAL", "RELEASED"}
-            for value in attempts.values():
-                state = getattr(value, "state", value)
-                state = getattr(state, "value", state)
-                if state not in terminal:
-                    return True
-            return False
-        return bool(attempts)
+    def release_server(self, server_id: str, request_id: str | None = None):
+        state = self.attempt_state.get(request_id) if request_id else None
+        if request_id:
+            owner = self.active_request_server.get(request_id)
+            if owner is not None and owner != server_id:
+                raise ValueError("request release belongs to another server")
+            if state is AttemptState.SETTLED:
+                return
+        super().release_server(server_id, request_id=request_id)
+        if request_id and state in {AttemptState.ADMITTED, AttemptState.TERMINATED}:
+            self.attempt_state[request_id] = AttemptState.SETTLED
+            self.active_request_server.pop(request_id, None)
+            self._gc_settled_requests()
 
-    def finish_remove(self, ctx, proof, ce_commit) -> CommitReceipt:
-        """Commit R=REMOVED only for this operation's active, settled drain."""
-        key = proof.header.key
-        if proof.header.ctx != ctx:
-            raise ValueError("LB REMOVE exit evidence belongs to another operation")
-        if (
-            ce_commit.header.ctx != ctx
-            or ce_commit.header.key != key
-            or ce_commit.owner is not CommitOwner.CE
-            or ce_commit.action is not ServiceAction.REMOVE
+    def query_attempt(self, request_id: str):
+        return self.attempt_state.get(request_id)
+
+    def confirm_continuation(self, request_id: str, client_id: str,
+                             prefix_digest: str) -> OperationEvidence:
+        if not request_id or not client_id or not prefix_digest:
+            raise ValueError("continuation fields must be nonempty")
+
+        previous = self.continuation_proofs.get(request_id)
+        if previous is not None:
+            previous_client, previous_digest, _operation_id, evidence = previous
+            if previous_client != client_id or previous_digest != prefix_digest:
+                raise ValueError("conflicting continuation proof replay")
+            return evidence
+
+        if self.attempt_state.get(request_id) is not AttemptState.ADMITTED:
+            raise ValueError("request is not eligible for continuation")
+        server_id = self.active_request_server.get(request_id)
+        operation_id = self.draining_operations.get(server_id)
+        if operation_id is None:
+            raise KeyError("request is not part of an active drain operation")
+
+        evidence = OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
+        self.continuation_proofs[request_id] = (
+            client_id,
+            prefix_digest,
+            operation_id,
+            evidence,
+        )
+        self.continuation_handoffs.setdefault(operation_id, set()).add(request_id)
+        self.attempt_state[request_id] = AttemptState.TERMINATED
+        return evidence
+
+    def continuation_handoff_requests(self, operation_id: str) -> tuple[str, ...]:
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("operation_id must be a nonempty string")
+        return tuple(sorted(self.continuation_handoffs.get(operation_id, ())))
+
+    def requests_for_server(self, server_id: str) -> tuple[str, ...]:
+        return tuple(r for r, s in self.active_request_server.items() if s == server_id)
+
+    def has_unsettled_requests(self, server_id: str) -> bool:
+        return any(self.attempt_state.get(r) is AttemptState.ADMITTED
+                   for r in self.requests_for_server(server_id))
+
+    def commit_ready(
+        self,
+        key: ReplicaKey,
+        server_id: str,
+        server_handle,
+        operation_id: str,
+    ) -> OperationEvidence:
+        """Atomically publish one fully bootstrapped server into R."""
+        if not isinstance(key, ReplicaKey):
+            raise TypeError("commit_ready key must be ReplicaKey")
+        if not isinstance(server_id, str) or not server_id:
+            raise ValueError("commit_ready requires nonempty server_id")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("commit_ready requires nonempty operation_id")
+        if server_handle is None:
+            raise ValueError("commit_ready requires server_handle")
+
+        previous = self.ready_operations.get(operation_id)
+        if previous is not None:
+            previous_key, previous_server, evidence = previous
+            if previous_key != key or previous_server != server_id:
+                raise ValueError("conflicting ready operation replay")
+            if self.routes.get(key) != server_id or server_id not in self._servers:
+                raise RuntimeError("ready operation ledger disagrees with routing state")
+            return evidence
+
+        existing_route = self.routes.get(key)
+        if existing_route is not None and existing_route != server_id:
+            raise ValueError("ReplicaKey already routes to another server")
+        existing_handle = self._servers.get(server_id)
+        if existing_handle is not None and existing_handle != server_handle:
+            raise ValueError("server_id is already bound to another handle")
+        for existing_operation, (existing_key, existing_server, _evidence) in self.ready_operations.items():
+            if existing_key == key and existing_operation != operation_id:
+                raise ValueError("ReplicaKey was published by another operation")
+            if existing_server == server_id and existing_key != key:
+                raise ValueError("server_id is already owned by another ReplicaKey")
+
+        self.add_servers({server_id: server_handle})
+        self.routes[key] = server_id
+        evidence = OperationEvidence.now(
+            operation_id,
+            EvidenceType.SERVICE_COMMITTED,
+        )
+        self.ready_operations[operation_id] = (key, server_id, evidence)
+        return evidence
+
+    def query_ready_operation(self, operation_id: str):
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("operation_id must be a nonempty string")
+        entry = self.ready_operations.get(operation_id)
+        return None if entry is None else entry[2]
+
+    def server_for_replica(self, key: ReplicaKey):
+        if not isinstance(key, ReplicaKey):
+            raise TypeError("key must be ReplicaKey")
+        return self.routes.get(key)
+
+    def begin_drain(self, key: ReplicaKey, operation_id: str):
+        """Close admission and bind the drain to one lifecycle operation.
+
+        The server is dropped from the native pool so least-loaded selection and
+        the sticky cache stop choosing it: native ``acquire_server`` honours a
+        removed server by clearing the stale sticky entry and re-selecting a
+        healthy replica. Request facts stay in ``routes``/``active_request_server``,
+        which the drain loop reads instead of the native sticky cache.
+        """
+        if not isinstance(key, ReplicaKey):
+            raise TypeError("key must be ReplicaKey")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("begin_drain requires operation_id")
+        server_id = self.routes.get(key)
+        if server_id is None:
+            raise KeyError(key)
+        existing = self.draining_operations.get(server_id)
+        if existing is not None and existing != operation_id:
+            raise ValueError("server is already draining under another operation")
+        self.draining_operations[server_id] = operation_id
+        self.remove_servers([server_id])
+        return server_id
+
+    def finish_remove(self, key: ReplicaKey):
+        server_id = self.routes.get(key)
+        if server_id is None:
+            return
+        if self.has_unsettled_requests(server_id):
+            raise ValueError("cannot remove route while requests remain admitted")
+
+        # TERMINATED is safe to stop serving; SETTLED is the point where the old
+        # server no longer owns the request in R. Keep SETTLED for ACK-loss query.
+        for request_id in self.requests_for_server(server_id):
+            if self.attempt_state.get(request_id) is AttemptState.TERMINATED:
+                self.attempt_state[request_id] = AttemptState.SETTLED
+                self.active_request_server.pop(request_id, None)
+
+        self.remove_servers([server_id])
+        operation_id = self.draining_operations.pop(server_id, None)
+        if operation_id is not None:
+            self.continuation_handoffs.pop(operation_id, None)
+        self._gc_settled_requests()
+        self.routes.pop(key, None)
+        for operation_id, (ready_key, _server_id, _evidence) in tuple(
+            self.ready_operations.items()
         ):
-            raise ValueError("LB REMOVE requires matching CE REMOVE commit")
+            if ready_key == key:
+                self.ready_operations.pop(operation_id, None)
 
-        cache_key = (ctx.identity, key, ServiceAction.REMOVE)
-        cached = self._commit_receipts.get(cache_key)
-        if cached is not None:
-            return cached
-
-        ticket = self.draining.get((ctx.identity, key))
-        if ticket is None:
-            raise ValueError("LB REMOVE requires the active drain ticket")
-        if proof.drain_id != ticket.drain_id:
-            raise ValueError("ExitEvidence drain_id does not match active drain ticket")
-        if proof.header.phase_revision < ticket.header.phase_revision:
-            raise ValueError("ExitEvidence predates the active drain ticket")
-        if self._has_unsettled_attempts(key):
-            raise ValueError("cannot remove route while attempts remain unsettled")
-
-        route = self.routes.get(key)
-        if route is None or route.state is not RouteState.DRAINING:
-            raise ValueError("LB REMOVE requires a DRAINING RouteEntry")
-        if route.replica_route_epoch != ticket.route_epoch:
-            raise ValueError("active RouteEntry epoch does not match drain ticket")
-
-        route_epoch = self._next_route_epoch(key)
-        self.lb_revision += 1
-        self.routes[key] = RouteEntry(
-            key=key,
-            head_server=route.head_server,
-            state=RouteState.REMOVED,
-            replica_route_epoch=route_epoch,
-            sync_epoch=route.sync_epoch,
-            serving_version=route.serving_version,
-            commit_operation_id=ctx.operation_id,
-        )
-        self.draining.pop((ctx.identity, key), None)
-        digest = _digest(
-            "LB",
-            "REMOVE",
-            ctx.identity,
-            key,
-            self.lb_revision,
-            route_epoch,
-            proof.header.digest,
-            ce_commit.header.digest,
-        )
-        receipt = CommitReceipt(
-            header=EvidenceHeader(
-                ctx=ctx,
-                key=key,
-                phase_revision=max(
-                    proof.header.phase_revision, ce_commit.header.phase_revision
-                ) + 1,
-                digest=digest,
-            ),
-            owner=CommitOwner.LB,
-            action=ServiceAction.REMOVE,
-            revision=self.lb_revision,
-            version=None,
-            route_epoch=route_epoch,
-        )
-        self._commit_receipts[cache_key] = receipt
-        return receipt
-
-    def set_sync_barrier(self, token, direction, version=None):
-        """Canonical PAUSE/RESUME entry; requires real Server barrier wiring."""
-        raise NotImplementedError(
-            "LB.set_sync_barrier requires verified task-wide admission barrier wiring"
-        )
-
-    def query_phase(self, ctx, phase):
-        """Owner-side query must be backed by a real phase journal before use."""
-        raise NotImplementedError("LB query_phase requires owner-side journal wiring")

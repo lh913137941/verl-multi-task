@@ -1,0 +1,66 @@
+From 9f5b131195f848c9d78347179ed02f6fe48c42fc Mon Sep 17 00:00:00 2001
+Subject: [fully_async] feat: add optional multitask task-runner bridge
+
+Baseline: verl v0.10.0.dev, commit f92febf50fe3db102273eaf59b1854f392ae761d
+
+diff --git a/verl/experimental/fully_async_policy/config/fully_async_ppo_trainer.yaml b/verl/experimental/fully_async_policy/config/fully_async_ppo_trainer.yaml
+--- a/verl/experimental/fully_async_policy/config/fully_async_ppo_trainer.yaml
++++ b/verl/experimental/fully_async_policy/config/fully_async_ppo_trainer.yaml
+@@ -6,6 +6,15 @@ defaults:
+   - ppo_trainer
+   - _self_
+ 
++# Optional verl-multitask bridge. The extension package is imported only when
++# enabled=true; runtime.profile alone never activates it.
++multitask:
++  enabled: false
++  # Bound natural DONATE/REMOVE drain waits; FORCE has its own shorter handoff deadline.
++  drain_timeout_s: 300.0
++  runtime:
++    profile: null
++
+ async_training:
+ 
+   # Maximum samples staleness threshold
+diff --git a/verl/experimental/fully_async_policy/fully_async_main.py b/verl/experimental/fully_async_policy/fully_async_main.py
+--- a/verl/experimental/fully_async_policy/fully_async_main.py
++++ b/verl/experimental/fully_async_policy/fully_async_main.py
+@@ -219,6 +219,33 @@ class FullyAsyncTaskRunner:
+             print("[ASYNC MAIN] Training completed or interrupted")
+ 
+ 
++def _resolve_task_runner_class(config):
++    """Keep native Fully Async unless MultiTask is explicitly enabled."""
++    multitask = config.get("multitask")
++    if multitask is None:
++        return FullyAsyncTaskRunner
++
++    enabled = multitask.get("enabled", False)
++    if type(enabled) is not bool:
++        raise ValueError("multitask.enabled must be a boolean")
++    if not enabled:
++        return FullyAsyncTaskRunner
++
++    from multi_task_scheduler.integration.verl.runtime_profile import (
++        resolve_runtime_profile,
++    )
++
++    task_runner_class = resolve_runtime_profile(config)
++    if task_runner_class is None:
++        raise RuntimeError(
++            "multitask.enabled=true did not resolve a supported runtime profile"
++        )
++    return task_runner_class
++
++
+ @hydra.main(config_path="config", config_name="fully_async_ppo_trainer", version_base=None)
+ def main(config):
+     from verl.trainer.main_ppo import run_ppo
+@@ -235,7 +262,8 @@ def main(config):
+     config.actor_rollout_ref.rollout.nnodes = config.rollout.nnodes
+     config.actor_rollout_ref.rollout.n_gpus_per_node = config.rollout.n_gpus_per_node
+     config = migrate_legacy_reward_impl(config)
+-    run_ppo(config, task_runner_class=FullyAsyncTaskRunner)
++    task_runner_class = _resolve_task_runner_class(config)
++    run_ppo(config, task_runner_class=task_runner_class)
+     print(f"total time: {time() - start_time:.2f} seconds")

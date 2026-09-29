@@ -27,6 +27,7 @@ class GateKind(str, Enum):
     REMOVE = "remove"
     RESTORE = "restore"
     NATIVE_SYNC = "native_sync"
+    RECOVERY = "recovery"
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,7 @@ class ReplicaSyncGate:
         self._owner: GateOwner | None = None
         self._epoch = 0
         self._blocked_reason: str | None = None
+        self._blocked_operation_id: str | None = None
         self.wait_seconds = 0.0
         self.max_owner_seconds = 0.0
 
@@ -72,21 +74,84 @@ class ReplicaSyncGate:
     def blocked_reason(self) -> str | None:
         return self._blocked_reason
 
+    @property
+    def blocked_operation_id(self) -> str | None:
+        return self._blocked_operation_id
+
     def block(self, owner: GateOwner, reason: str) -> None:
         """Latch uncertain side effects; releasing the lock does not prove recovery.
 
-        There is deliberately no boolean reset. A verified backend reconciliation
-        protocol must be implemented before this state can be cleared.
+        There is deliberately no boolean reset. ``reconcile()`` is the only
+        clearing path and it requires the operation that latched the gate to run
+        its owner-level reconciliation while the gate remains exclusively held.
         """
         if not self._is_active(owner):
             raise GateFencedError("Only the current gate owner may block synchronization")
         if not isinstance(reason, str) or not reason:
             raise ValueError("A blocked gate requires a reason")
         self._blocked_reason = reason
+        self._blocked_operation_id = owner.operation_id
 
     def _require_healthy(self) -> None:
         if self._blocked_reason is not None:
             raise GateFencedError(f"Replica synchronization is BLOCKED: {self._blocked_reason}")
+
+    async def reconcile(
+        self,
+        operation_id: str,
+        reconciliation: Callable[[], Any],
+    ) -> bool:
+        """Clear a BLOCKED latch only after owner-level reconciliation succeeds.
+
+        The reconciliation callback runs while the same task-local lock is held,
+        so no membership change or native sync can race the repair. Returning
+        normally is the proof boundary; any exception leaves the latch intact.
+        Only the operation that originally blocked the gate may reconcile it.
+        """
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("operation_id must be a nonempty string")
+        if not callable(reconciliation):
+            raise TypeError("reconciliation must be callable")
+        if self._blocked_reason is None:
+            return False
+        if self._blocked_operation_id != operation_id:
+            raise GateFencedError(
+                "Only the operation that blocked synchronization may reconcile it"
+            )
+
+        wait_started = time.monotonic()
+        await self._lock.acquire()
+        self.wait_seconds += time.monotonic() - wait_started
+        try:
+            # Another reconciler may have completed while this coroutine waited.
+            if self._blocked_reason is None:
+                return False
+            if self._blocked_operation_id != operation_id:
+                raise GateFencedError(
+                    "Blocked synchronization belongs to another operation"
+                )
+
+            self._epoch += 1
+            owner = GateOwner(
+                operation_id=operation_id,
+                kind=GateKind.RECOVERY,
+                epoch=self._epoch,
+                acquired_at=time.monotonic(),
+            )
+            self._owner = owner
+            try:
+                result = reconciliation()
+                if inspect.isawaitable(result):
+                    await result
+                self._blocked_reason = None
+                self._blocked_operation_id = None
+                return True
+            finally:
+                held_seconds = time.monotonic() - owner.acquired_at
+                self.max_owner_seconds = max(self.max_owner_seconds, held_seconds)
+                self._owner = None
+        finally:
+            self._lock.release()
 
     async def acquire(
         self,
@@ -154,6 +219,14 @@ class GateLease:
     async def release(self) -> bool:
         return await self._gate._release(self.owner)
 
+    async def __aenter__(self) -> GateLease:
+        if not self.active:
+            raise GateFencedError("cannot enter an inactive gate lease")
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.release()
+
     async def guard(self, call: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         if not self.active:
             raise GateFencedError(
@@ -167,12 +240,3 @@ class GateLease:
             raise GateFencedError("Gate ownership or health changed before the result was committed")
         return result
 
-    async def __aenter__(self) -> GateLease:
-        if not self.active:
-            raise GateFencedError(
-                f"cannot enter inactive gate lease for {self.owner.operation_id}"
-            )
-        return self
-
-    async def __aexit__(self, exc_type, exc, traceback) -> None:
-        await self.release()
