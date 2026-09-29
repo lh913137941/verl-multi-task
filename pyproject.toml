@@ -25,4 +25,5 @@ markers = [
   "native: imports the actual verl and backend dependencies",
   "ray_integration: starts real CPU Ray actors (no verl or GPU training)",
   "gpu_integration: requires explicit real CUDA/vLLM/model acceptance environment",
+  "npu_integration: requires real Ascend NPU/vLLM-Ascend/model acceptance environment",
 ]
