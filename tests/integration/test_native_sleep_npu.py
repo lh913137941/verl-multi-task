@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from uuid import uuid4
 
@@ -461,13 +462,12 @@ async def _init_standalone_with_diagnostics(replica) -> None:
             and "KeyError" in logs
         ):
             pytest.fail(
-                "vLLM-Ascend Qwen3 weight-loader incompatibility detected: "
-                "the installed patch_gqa_c8 path expects fused gate_up_proj "
-                "parameters that are absent from the instantiated model. Use a "
-                "plain BF16/FP16 Qwen3 acceptance model and align the vLLM / "
-                "vLLM-Ascend source versions before running MultiTask lifecycle "
-                "acceptance. This failure occurs before MultiTask sleep/FORCE/"
-                "RESTORE logic.",
+                "Qwen3 fused gate_up_proj is absent during the VERL/vLLM "
+                "bootstrap. This occurs before MultiTask sleep/FORCE/RESTORE. "
+                "Run the npu_backend_smoke stage and compare its direct "
+                "vLLM-Ascend result with the VERL vLLMReplica stage: if direct "
+                "vLLM passes but VERL fails, inspect VERL server args / "
+                "worker_extension_cls rather than MultiTask lifecycle logic.",
                 pytrace=False,
             )
         raise exc
