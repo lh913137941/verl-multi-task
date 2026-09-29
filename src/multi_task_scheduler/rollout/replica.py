@@ -56,21 +56,39 @@ class MultiTaskvLLMReplica(vLLMReplica):
 
     @staticmethod
     def _runtime_placement_probe(_worker) -> dict:
-        """Run inside VERL's native CheckpointEngineWorker via __ray_call__."""
+        """Return one stable physical-accelerator identity from inside the CE actor.
+
+        The public first-release contract keeps the field name gpu_uuid for
+        backward compatibility. On CUDA it remains the real GPU UUID. On
+        Ascend, where Ray exposes logical NPU ids, node_id + Ray accelerator
+        id provides a stable cluster-wide identity without a second lease schema.
+        """
         resource_name = get_resource_name()
-        if resource_name != "GPU":
+        if resource_name not in {"GPU", "NPU"}:
             raise NotImplementedError(
-                f"first release placement probe supports GPU only, got {resource_name!r}"
+                "first release placement probe supports GPU/NPU accelerators, "
+                f"got {resource_name!r}"
             )
         context = ray.get_runtime_context()
+        node_id = context.get_node_id()
         ids = context.get_accelerator_ids().get(resource_name, [])
         if len(ids) != 1:
             raise RuntimeError(
-                f"expected exactly one Ray GPU id for CE actor, got {ids!r}"
+                f"expected exactly one Ray {resource_name} id for CE actor, got {ids!r}"
             )
         accelerator_id = str(ids[0])
+
+        if resource_name == "NPU":
+            physical_id = f"NPU:{node_id}:{accelerator_id}"
+            return {
+                "node_id": node_id,
+                "gpu_uuid": physical_id,
+                "resource_name": resource_name,
+                "accelerator_id": accelerator_id,
+            }
+
         if accelerator_id.startswith("GPU-"):
-            gpu_uuid = accelerator_id
+            physical_id = accelerator_id
         elif accelerator_id.startswith("MIG-"):
             raise NotImplementedError("first release does not support MIG placement")
         elif accelerator_id.isdigit():
@@ -89,7 +107,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
                     index, uuid = [part.strip() for part in line.split(",", 1)]
                     mapping[index] = uuid
             try:
-                gpu_uuid = mapping[accelerator_id]
+                physical_id = mapping[accelerator_id]
             except KeyError as exc:
                 raise RuntimeError(
                     f"nvidia-smi did not report Ray GPU id {accelerator_id!r}"
@@ -98,7 +116,12 @@ class MultiTaskvLLMReplica(vLLMReplica):
             raise RuntimeError(
                 f"cannot map Ray GPU accelerator id {accelerator_id!r} to a UUID"
             )
-        return {"node_id": context.get_node_id(), "gpu_uuid": gpu_uuid}
+        return {
+            "node_id": node_id,
+            "gpu_uuid": physical_id,
+            "resource_name": resource_name,
+            "accelerator_id": accelerator_id,
+        }
 
     def validate_placement(self, spec: dict) -> None:
         """Validate runtime identity/topology on a normalized Lease spec."""
@@ -174,7 +197,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
         return (dict(placement),)
 
     async def validate_worker_placement(self) -> tuple[dict, ...]:
-        """Verify each borrower CE actor landed on the claimed node/GPU UUID."""
+        """Verify each borrower CE actor landed on the claimed physical accelerator."""
         claims = tuple(self.placement_claims or ())
         if len(self.workers) != len(claims):
             raise RuntimeError(
@@ -188,7 +211,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
                 )
             if actual.get("gpu_uuid") != claim["gpu_uuid"]:
                 raise RuntimeError(
-                    f"borrower rank {claim['rank']} landed on unexpected GPU UUID"
+                    f"borrower rank {claim['rank']} landed on unexpected physical accelerator"
                 )
         return placements
 
@@ -429,18 +452,31 @@ class MultiTaskvLLMReplica(vLLMReplica):
             raise exc
 
     async def sleep(self):
-        """Deep-sleep the retained native TP=1 runtime."""
+        """Sleep the retained native TP=1 runtime at the platform-safe level."""
         if self.replica_kind is not ReplicaKind.NATIVE:
             raise ValueError("sleep is valid only for retained NATIVE replicas")
         if len(self.servers) != 1:
             raise RuntimeError("current verified native runtime requires one server")
+        resource_name = get_resource_name()
+        if resource_name == "GPU":
+            expected_level = 2
+        elif resource_name == "NPU":
+            # VERL/vLLM-Ascend currently exposes level-1 sleep as the deepest
+            # supported device-release primitive.
+            expected_level = 1
+        else:
+            raise NotImplementedError(
+                f"native sleep is unsupported for Ray resource {resource_name!r}"
+            )
         receipt = await self.servers[0].sleep.remote()
         if (
             not isinstance(receipt, dict)
-            or receipt.get("sleep_level") != 2
+            or receipt.get("sleep_level") != expected_level
             or receipt.get("sleeping") is not True
         ):
-            raise RuntimeError("native server did not confirm level-2 sleep")
+            raise RuntimeError(
+                f"native server did not confirm level-{expected_level} sleep"
+            )
         return (receipt,)
 
     async def wake_up(self, tags: list[str] | None = None):
