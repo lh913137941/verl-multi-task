@@ -25,9 +25,9 @@ def package_version(name: str) -> str:
         return "not-installed"
 
 
-def git_info(module_file: str | None) -> tuple[str | None, str | None]:
+def git_info(module_file: str | None) -> tuple[str | None, str | None, str | None]:
     if not module_file:
-        return None, None
+        return None, None, None
     path = Path(module_file).resolve()
     for parent in (path.parent, *path.parents):
         if (parent / ".git").exists():
@@ -42,10 +42,15 @@ def git_info(module_file: str | None) -> tuple[str | None, str | None]:
                     text=True,
                     timeout=5,
                 ).strip()
-                return head, branch
+                status = subprocess.check_output(
+                    ["git", "-C", str(parent), "status", "--short"],
+                    text=True,
+                    timeout=5,
+                ).strip()
+                return head, branch, status or None
             except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                return None, None
-    return None, None
+                return None, None, None
+    return None, None, None
 
 
 def verl_expected_pair() -> tuple[str, str] | None:
@@ -61,20 +66,28 @@ def verl_expected_pair() -> tuple[str, str] | None:
         text = script.read_text(encoding="utf-8")
     except OSError:
         return None
-    vllm_match = re.search(
-        r"--branch\s+v(?P<version>\d+\.\d+\.\d+).*?vllm\.git",
-        text,
-        flags=re.DOTALL,
-    )
-    ascend_match = re.search(
-        r"vllm-ascend\.git.*?(?:-b|--branch)\s+releases/v"
-        r"(?P<version>\d+\.\d+\.\d+)",
-        text,
-        flags=re.DOTALL,
-    )
-    if not vllm_match or not ascend_match:
+    vllm_version = None
+    ascend_version = None
+    for line in text.splitlines():
+        if "git clone" not in line:
+            continue
+        if "vllm-ascend.git" in line:
+            match = re.search(
+                r"(?:-b|--branch)\s+releases/v(?P<version>\d+\.\d+\.\d+)",
+                line,
+            )
+            if match:
+                ascend_version = match.group("version")
+        elif "vllm.git" in line:
+            match = re.search(
+                r"(?:-b|--branch)\s+v(?P<version>\d+\.\d+\.\d+)",
+                line,
+            )
+            if match:
+                vllm_version = match.group("version")
+    if not vllm_version or not ascend_version:
         return None
-    return vllm_match.group("version"), ascend_match.group("version")
+    return vllm_version, ascend_version
 
 
 def read_json(path: Path) -> dict | None:
@@ -124,40 +137,55 @@ def main() -> int:
         import vllm
 
         vllm_path = str(Path(vllm.__file__).resolve())
-        vllm_head, vllm_branch = git_info(vllm.__file__)
+        vllm_head, vllm_branch, vllm_status = git_info(vllm.__file__)
     except Exception as exc:
         vllm_path = f"import-error: {exc!r}"
-        vllm_head = vllm_branch = None
+        vllm_head = vllm_branch = vllm_status = None
         failures.append("vllm import failed")
     print("vllm path:", vllm_path)
     print("vllm git head:", vllm_head)
     print("vllm git branch:", vllm_branch)
+    print("vllm git dirty:", vllm_status or False)
 
     try:
         import vllm_ascend
 
         ascend_path = str(Path(vllm_ascend.__file__).resolve())
-        ascend_head, ascend_branch = git_info(vllm_ascend.__file__)
+        ascend_head, ascend_branch, ascend_status = git_info(vllm_ascend.__file__)
     except Exception as exc:
         ascend_path = f"import-error: {exc!r}"
-        ascend_head = ascend_branch = None
+        ascend_head = ascend_branch = ascend_status = None
         failures.append("vllm_ascend import failed")
     print("vllm-ascend path:", ascend_path)
     print("vllm-ascend git head:", ascend_head)
     print("vllm-ascend git branch:", ascend_branch)
+    print("vllm-ascend git dirty:", ascend_status or False)
 
     if expected is not None:
+        from packaging.version import InvalidVersion, Version
+
         expected_vllm, expected_ascend = expected
         actual_vllm = package_version("vllm")
         actual_ascend = package_version("vllm-ascend")
-        if actual_vllm not in {"0.0.0", expected_vllm}:
+        try:
+            actual_vllm_version = Version(actual_vllm)
+            actual_ascend_version = Version(actual_ascend)
+            expected_vllm_version = Version(expected_vllm)
+            expected_ascend_version = Version(expected_ascend)
+        except InvalidVersion:
+            actual_vllm_version = actual_ascend_version = None
+            expected_vllm_version = expected_ascend_version = None
+
+        if (
+            actual_vllm_version is not None
+            and actual_vllm_version.release[:3] != expected_vllm_version.release[:3]
+        ):
             failures.append(
                 f"VERL expects vllm {expected_vllm}, metadata reports {actual_vllm}"
             )
-        if not (
-            actual_ascend == "0.0.0"
-            or actual_ascend == expected_ascend
-            or actual_ascend.startswith(expected_ascend + ".")
+        if (
+            actual_ascend_version is not None
+            and actual_ascend_version.release[:2] != expected_ascend_version.release[:2]
         ):
             failures.append(
                 f"VERL expects vllm-ascend {expected_ascend} lane, "
@@ -196,6 +224,7 @@ def main() -> int:
     print("\n=== Ray temp filesystem ===")
     ray_tmp = Path(args.ray_tmpdir).expanduser().resolve()
     try:
+        ray_tmp.mkdir(parents=True, exist_ok=True)
         usage = shutil.disk_usage(ray_tmp)
         free_gib = usage.free / (1024**3)
         free_pct = (usage.free / usage.total * 100) if usage.total else 0.0
