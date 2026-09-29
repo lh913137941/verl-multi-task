@@ -537,6 +537,48 @@ import os
 
 from vllm import LLM, SamplingParams
 import vllm_ascend  # noqa: F401
+from vllm.model_executor.models.qwen2 import Qwen2Model
+
+_original_qwen2_load_weights = Qwen2Model.load_weights
+
+def _diagnostic_qwen2_load_weights(self, weights):
+    params = dict(self.named_parameters(remove_duplicate=False))
+    layer10 = sorted(
+        name for name in params
+        if name.startswith("layers.10.mlp.")
+    )
+    module = self.layers[10].mlp.gate_up_proj
+    print(
+        "DIRECT_QWEN3_LAYER10_LAYOUT",
+        {
+            "gate_up_proj_type": (
+                type(module).__module__ + "." + type(module).__qualname__
+            ),
+            "layer10_mlp_params": layer10,
+            "gate_up_named_parameters": [
+                name for name, _ in module.named_parameters(
+                    recurse=True,
+                    remove_duplicate=False,
+                )
+            ],
+            "gate_up_named_buffers": [
+                name for name, _ in module.named_buffers(recurse=True)
+            ],
+            "quant_config_type": (
+                None
+                if getattr(self, "quant_config", None) is None
+                else (
+                    type(self.quant_config).__module__
+                    + "."
+                    + type(self.quant_config).__qualname__
+                )
+            ),
+        },
+        flush=True,
+    )
+    return _original_qwen2_load_weights(self, weights)
+
+Qwen2Model.load_weights = _diagnostic_qwen2_load_weights
 
 model = os.environ["VERL_MULTITASK_DIRECT_SMOKE_MODEL"]
 backend = os.environ["VERL_MULTITASK_DIRECT_SMOKE_BACKEND"]
