@@ -22,6 +22,7 @@ from multi_task_scheduler.orchestration.contracts import (
     ReplicaKind,
     ReplicaState,
     native_replica_key,
+    require_operation_evidence,
 )
 from multi_task_scheduler.orchestration.operation_journal import OperationJournal
 from multi_task_scheduler.orchestration.replica_sync_gate import GateKind, ReplicaSyncGate
@@ -116,6 +117,7 @@ def taskrunner_class():
         ray=FakeRay,
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
         CONTROL_RPC_TIMEOUT_S=CONTROL_RPC_TIMEOUT_S,
+        _require_evidence=require_operation_evidence,
         logger=type("Logger", (), {"exception": lambda *args, **kwargs: None})(),
     )
 
