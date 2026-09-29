@@ -7,6 +7,7 @@ devices; ordinary unit/native/ray integration suites must not depend on it.
 from __future__ import annotations
 
 import asyncio
+import json
 from importlib import metadata
 import os
 import shutil
@@ -132,6 +133,48 @@ def _print_npu_runtime_diagnostics() -> None:
     )
 
 
+def _load_json_if_present(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        pytest.fail(f"cannot parse model metadata {path}: {exc}")
+    if not isinstance(value, dict):
+        pytest.fail(f"model metadata {path} must contain a JSON object")
+    return value
+
+
+def _require_plain_acceptance_model(path: Path) -> None:
+    """Keep lifecycle acceptance independent from Ascend quantization patches."""
+    config = _load_json_if_present(path / "config.json") or {}
+    quant_description = _load_json_if_present(
+        path / "quant_model_description.json"
+    )
+
+    quantization_config = config.get("quantization_config")
+    if quantization_config:
+        pytest.skip(
+            "NPU lifecycle acceptance requires a plain BF16/FP16 model; "
+            "config.json contains quantization_config. Quantized-model loader "
+            "compatibility must be validated separately."
+        )
+
+    if quant_description:
+        kv_cache_type = quant_description.get("kv_cache_type")
+        pytest.skip(
+            "NPU lifecycle acceptance requires a plain BF16/FP16 model; "
+            "quant_model_description.json is present"
+            + (
+                f" with kv_cache_type={kv_cache_type!r}"
+                if kv_cache_type is not None
+                else ""
+            )
+            + ". vLLM-Ascend C8/ModelSlim weight-loader compatibility is "
+            "outside this lifecycle acceptance."
+        )
+
+
 def _require_model_path() -> str:
     value = os.environ.get(MODEL_ENV)
     if not value:
@@ -139,6 +182,7 @@ def _require_model_path() -> str:
     path = Path(value).expanduser().resolve()
     if not path.exists():
         pytest.skip(f"{MODEL_ENV} does not exist: {path}")
+    _require_plain_acceptance_model(path)
     return str(path)
 
 
