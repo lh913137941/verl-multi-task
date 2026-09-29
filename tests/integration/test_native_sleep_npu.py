@@ -7,6 +7,7 @@ devices; ordinary unit/native/ray integration suites must not depend on it.
 from __future__ import annotations
 
 import asyncio
+from importlib import metadata
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -23,6 +24,68 @@ def _pin_verl_npu_platform(monkeypatch):
     monkeypatch.setenv("VERL_PLATFORM", "huawei")
 
 MODEL_ENV = "VERL_MULTITASK_NPU_MODEL_PATH"
+
+
+def _ascend_rl_engine_kwargs() -> dict:
+    """Select the vLLM-Ascend RL config shape supported by this environment."""
+    try:
+        from vllm_ascend import ascend_config
+
+        ascend_cls = getattr(ascend_config, "AscendConfig", None)
+        dataclass_fields = getattr(ascend_cls, "__dataclass_fields__", {}) or {}
+        model_fields = getattr(ascend_cls, "model_fields", {}) or {}
+        if (
+            hasattr(ascend_config, "RlConfig")
+            or "rl_config" in dataclass_fields
+            or "rl_config" in model_fields
+        ):
+            additional_config = {
+                "rl_config": {
+                    "enabled": True,
+                }
+            }
+        else:
+            # Older vLLM-Ascend releases used the top-level NZ switch.
+            additional_config = {"weight_nz_mode": 0}
+    except Exception:
+        # Keep the fallback compatible with pre-rl_config releases. Any real
+        # backend incompatibility remains visible during server startup.
+        additional_config = {"weight_nz_mode": 0}
+
+    return {
+        "vllm": {
+            "additional_config": additional_config,
+        }
+    }
+
+
+def _print_npu_runtime_diagnostics() -> None:
+    def version(name: str) -> str:
+        try:
+            return metadata.version(name)
+        except metadata.PackageNotFoundError:
+            return "not-installed"
+
+    import torch
+
+    from verl.utils.device import get_device_name, get_resource_name
+
+    print(
+        "NPU_ACCEPTANCE_ENV",
+        {
+            "torch": getattr(torch, "__version__", "unknown"),
+            "torch_npu": version("torch-npu"),
+            "vllm": version("vllm"),
+            "vllm_ascend": version("vllm-ascend"),
+            "verl_device": get_device_name(),
+            "ray_resource": get_resource_name(),
+            "VERL_PLATFORM": os.environ.get("VERL_PLATFORM"),
+            "VLLM_WORKER_MULTIPROC_METHOD": os.environ.get(
+                "VLLM_WORKER_MULTIPROC_METHOD"
+            ),
+        },
+        flush=True,
+    )
 
 
 def _require_model_path() -> str:
@@ -61,6 +124,8 @@ def _runtime_env() -> dict:
             "VERL_PLATFORM": "huawei",
             "TOKENIZERS_PARALLELISM": "true",
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+            "VLLM_SERVER_DEV_MODE": "1",
+            "VLLM_ASCEND_ENABLE_NZ": "0",
             "HCCL_CONNECT_TIMEOUT": "1500",
             "HCCL_HOST_SOCKET_PORT_RANGE": "60000-60050",
             "HCCL_NPU_SOCKET_PORT_RANGE": "61000-61050",
@@ -110,15 +175,7 @@ def _config(model_path: str):
         config.actor_rollout_ref.rollout.free_cache_engine = True
         config.actor_rollout_ref.rollout.load_format = "auto"
         config.actor_rollout_ref.rollout.skip_tokenizer_init = False
-        config.actor_rollout_ref.rollout.engine_kwargs = {
-            "vllm": {
-                "additional_config": {
-                    "rl_config": {
-                        "enabled": True,
-                    }
-                }
-            }
-        }
+        config.actor_rollout_ref.rollout.engine_kwargs = _ascend_rl_engine_kwargs()
     return config
 
 
@@ -243,6 +300,7 @@ def test_real_npu_sleep_releases_same_slot_to_borrower():
 
     model_path = _require_model_path()
     _require_npu(1)
+    _print_npu_runtime_diagnostics()
 
     import ray
     from transformers import AutoTokenizer
@@ -349,6 +407,7 @@ def test_real_npu_force_remove_continues_on_another_replica():
 
     model_path = _require_model_path()
     _require_npu(2)
+    _print_npu_runtime_diagnostics()
 
     import ray
     from omegaconf import OmegaConf
@@ -610,6 +669,7 @@ def test_real_npu_restore_reinstalls_current_vpub_and_generates_again():
 
     model_path = _require_model_path()
     _require_npu(2)
+    _print_npu_runtime_diagnostics()
 
     import ray
 
@@ -666,15 +726,7 @@ def test_real_npu_restore_reinstalls_current_vpub_and_generates_again():
         skip_tokenizer_init=False,
         enable_sleep_mode=True,
         free_cache_engine=True,
-        engine_kwargs={
-            "vllm": {
-                "additional_config": {
-                    "rl_config": {
-                        "enabled": True,
-                    }
-                }
-            }
-        },
+        engine_kwargs=_ascend_rl_engine_kwargs(),
         checkpoint_engine=checkpoint_config,
     )
 
