@@ -109,6 +109,8 @@ def _print_npu_runtime_diagnostics() -> None:
             return "not-installed"
 
     import torch
+    import vllm
+    import vllm_ascend
 
     from verl.utils.device import get_device_name, get_resource_name
 
@@ -119,6 +121,8 @@ def _print_npu_runtime_diagnostics() -> None:
             "torch_npu": version("torch-npu"),
             "vllm": version("vllm"),
             "vllm_ascend": version("vllm-ascend"),
+            "vllm_path": str(Path(vllm.__file__).resolve()),
+            "vllm_ascend_path": str(Path(vllm_ascend.__file__).resolve()),
             "verl_device": get_device_name(),
             "ray_resource": get_resource_name(),
             "VERL_PLATFORM": os.environ.get("VERL_PLATFORM"),
