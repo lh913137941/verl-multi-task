@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from importlib import metadata
 import os
+import shutil
 from pathlib import Path
 from uuid import uuid4
 
@@ -24,6 +25,34 @@ def _pin_verl_npu_platform(monkeypatch):
     monkeypatch.setenv("VERL_PLATFORM", "huawei")
 
 MODEL_ENV = "VERL_MULTITASK_NPU_MODEL_PATH"
+
+
+RAY_TMPDIR_ENV = "VERL_MULTITASK_RAY_TMPDIR"
+MIN_RAY_TMP_FREE_GIB = 4
+
+
+def _ray_init_kwargs(num_cpus: int) -> dict:
+    """Select and preflight a Ray temp directory for real-device acceptance."""
+    raw = os.environ.get(RAY_TMPDIR_ENV)
+    temp_dir = Path(raw).expanduser().resolve() if raw else Path("/tmp").resolve()
+    if not temp_dir.exists():
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+    usage = shutil.disk_usage(temp_dir)
+    free_gib = usage.free / (1024 ** 3)
+    if free_gib < MIN_RAY_TMP_FREE_GIB:
+        pytest.skip(
+            f"Ray temp filesystem {temp_dir} has only {free_gib:.2f} GiB free; "
+            f"set {RAY_TMPDIR_ENV} to a filesystem with at least "
+            f"{MIN_RAY_TMP_FREE_GIB} GiB free"
+        )
+
+    return {
+        "num_cpus": num_cpus,
+        "_temp_dir": str(temp_dir),
+        "runtime_env": _runtime_env(),
+        "ignore_reinit_error": True,
+    }
 
 
 def _ascend_rl_engine_kwargs() -> dict:
@@ -322,11 +351,7 @@ def test_real_npu_sleep_releases_same_slot_to_borrower():
     model_config = config.actor_rollout_ref.model
 
     ray.shutdown()
-    ray.init(
-        num_cpus=4,
-        runtime_env=_runtime_env(),
-        ignore_reinit_error=True,
-    )
+    ray.init(**_ray_init_kwargs(4))
 
     try:
         _require_ray_npus(ray, 1)
@@ -439,11 +464,7 @@ def test_real_npu_force_remove_continues_on_another_replica():
     model_config = config.actor_rollout_ref.model
 
     ray.shutdown()
-    ray.init(
-        num_cpus=8,
-        runtime_env=_runtime_env(),
-        ignore_reinit_error=True,
-    )
+    ray.init(**_ray_init_kwargs(8))
 
     try:
         _require_ray_npus(ray, 2)
@@ -731,11 +752,7 @@ def test_real_npu_restore_reinstalls_current_vpub_and_generates_again():
     )
 
     ray.shutdown()
-    ray.init(
-        num_cpus=8,
-        runtime_env=_runtime_env(),
-        ignore_reinit_error=True,
-    )
+    ray.init(**_ray_init_kwargs(8))
 
     try:
         _require_ray_npus(ray, 2)
