@@ -326,13 +326,23 @@ CUDA acceptance 若检测到 `transfer_to_npu` 已加载则直接 skip，避免�
 真实 NPU acceptance 建议使用 plain BF16/FP16 模型；C8/ModelSlim/其它量化模型应先单独验证
 vLLM-Ascend loader 兼容性，不要把量化 backend 失败混入生命周期验收。
 
+先验证 vanilla VERL + vLLM-Ascend 基线，再跑 MultiTask lifecycle：
+
 ```bash
 export VERL_MULTITASK_NPU_MODEL_PATH=/path/to/local/model
 
 # /tmp 空间不足时，把 Ray session/object-spill 临时目录放到大盘。
 export VERL_MULTITASK_RAY_TMPDIR=/path/to/large/local/filesystem/ray_tmp
 
-python -m pytest -q -s -m npu_integration tests/integration/test_native_sleep_npu.py
+# 1) 不经过 MultiTask subclass，只验证 upstream load + generate。
+python -m pytest -q -s \
+  -m npu_backend_smoke \
+  tests/integration/test_native_sleep_npu.py
+
+# 2) backend smoke 通过后再跑完整生命周期。
+python -m pytest -q -s \
+  -m npu_integration \
+  tests/integration/test_native_sleep_npu.py
 ```
 
 NPU acceptance 在启动 Ray 前会检查临时文件系统的剩余空间；空间不足时会
