@@ -332,6 +332,80 @@ class MultiTaskvLLMReplica(vLLMReplica):
             raise RuntimeError("native server/worker node placement mismatch")
         return dict(health)
 
+    def _server_actor_names(self) -> tuple[str, ...]:
+        borrowed = tuple(getattr(self, "borrowed_server_names", ()) or ())
+        if borrowed:
+            return borrowed
+        prefix = self._get_server_name_prefix()
+        names = []
+        for node_rank in range(self.nnodes):
+            if self.is_reward_model:
+                name = (
+                    f"{prefix}server_reward_{self.replica_rank}_{node_rank}"
+                    f"{self.name_suffix}"
+                )
+            elif self.is_teacher_model:
+                name = (
+                    f"{prefix}server_teacher_{self.replica_rank}_{node_rank}"
+                    f"{self.name_suffix}"
+                )
+            else:
+                name = (
+                    f"{prefix}server_{self.replica_rank}_{node_rank}"
+                    f"{self.name_suffix}"
+                )
+            names.append(name)
+        return tuple(names)
+
+    @staticmethod
+    def _actor_name_states(
+        names: tuple[str, ...],
+        namespace: str,
+    ) -> dict[str, tuple[str, ...]]:
+        result = {}
+        for name in names:
+            states = list_actors(
+                filters=[
+                    ("ray_namespace", "=", namespace),
+                    ("name", "=", name),
+                ]
+            )
+            result[name] = tuple(
+                state.state if hasattr(state, "state") else state["state"]
+                for state in states
+            )
+        return result
+
+    async def runtime_loss_verified(self) -> bool:
+        """Require failed runtime health plus explicit Ray DEAD server records."""
+        try:
+            await self.validate_server_runtime()
+            return False
+        except BaseException:
+            pass
+
+        names = self._server_actor_names()
+        if not names:
+            return False
+        namespace = ray.get_runtime_context().namespace
+        try:
+            states = await asyncio.to_thread(
+                self._actor_name_states,
+                names,
+                namespace,
+            )
+        except BaseException:
+            # Ray State API uncertainty must never be promoted to death proof.
+            return False
+
+        # Missing records are also not proof. Every expected server actor must
+        # have at least one explicit record and all incarnations must be DEAD.
+        return all(
+            actor_states
+            and all(state == "DEAD" for state in actor_states)
+            for actor_states in states.values()
+        )
+
     async def _shutdown_servers_verified(self) -> None:
         servers = list(getattr(self, "servers", []) or [])
         names = tuple(getattr(self, "borrowed_server_names", ()) or ())

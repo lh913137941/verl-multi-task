@@ -1802,7 +1802,10 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
             ReplicaState.RELEASED,
             ReplicaState.QUARANTINED,
         },
-        ReplicaState.ACTIVE: {ReplicaState.DRAINING},
+        ReplicaState.ACTIVE: {
+            ReplicaState.DRAINING,
+            ReplicaState.QUARANTINED,
+        },
         ReplicaState.DRAINING: {
             ReplicaState.ACTIVE,
             ReplicaState.DORMANT,
@@ -2161,6 +2164,14 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     quarantined_record = manager.borrowed_operations["borrower-lease-unverified-failure"]
     assert manager.replica_state[quarantined_key] is ReplicaState.QUARANTINED
     assert quarantined_record["error"] is not None
+
+    # A separately proved permanent runtime loss may quarantine an ACTIVE
+    # projection directly; ordinary lifecycle exit still uses DRAINING.
+    manager.replica_state[key] = ReplicaState.ACTIVE
+    assert (
+        manager.transition_replica(key, ReplicaState.QUARANTINED)
+        is ReplicaState.QUARANTINED
+    )
 
 
 def test_http_server_health_and_shutdown_use_real_engine_boundaries():
@@ -3328,11 +3339,21 @@ def http_server_class():
 
 
 def runtime_replica_class():
+    fake_ray = type(
+        "ReplicaRay",
+        (),
+        {
+            "get_runtime_context": staticmethod(
+                lambda: type("RuntimeContext", (), {"namespace": "verl-test"})()
+            )
+        },
+    )
     return isolated(
         "rollout/replica.py",
         "MultiTaskvLLMReplica",
         object,
         asyncio=asyncio,
+        ray=fake_ray,
         ReplicaKind=ReplicaKind,
         Lease=Lease,
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
@@ -3802,6 +3823,53 @@ def test_native_runtime_health_probe_confirms_server_and_ce_worker_node():
     result = asyncio.run(replica.validate_server_runtime())
     assert result["global_steps"] == 12
     assert result["node_id"] == "node-0"
+
+
+def test_runtime_loss_requires_explicit_ray_dead_state_after_health_failure():
+    cls = runtime_replica_class()
+    replica = cls.__new__(cls)
+    replica.replica_kind = ReplicaKind.NATIVE
+    replica.replica_rank = 2
+    replica.nnodes = 1
+    replica.name_suffix = ""
+    replica.is_reward_model = False
+    replica.is_teacher_model = False
+    replica.borrowed_server_names = ()
+    replica._get_server_name_prefix = lambda: "vllm_"
+
+    async def failed_health():
+        raise RuntimeError("server unavailable")
+
+    replica.validate_server_runtime = failed_health
+    original = cls._actor_name_states
+    try:
+        cls._actor_name_states = staticmethod(
+            lambda names, namespace: {names[0]: ("DEAD",)}
+        )
+        assert asyncio.run(replica.runtime_loss_verified()) is True
+
+        cls._actor_name_states = staticmethod(
+            lambda names, namespace: {names[0]: ("ALIVE",)}
+        )
+        assert asyncio.run(replica.runtime_loss_verified()) is False
+
+        cls._actor_name_states = staticmethod(
+            lambda names, namespace: {names[0]: ()}
+        )
+        assert asyncio.run(replica.runtime_loss_verified()) is False
+    finally:
+        cls._actor_name_states = original
+
+
+def test_runtime_loss_is_false_when_runtime_health_is_still_valid():
+    cls = runtime_replica_class()
+    replica = cls.__new__(cls)
+
+    async def healthy():
+        return {"ok": True}
+
+    replica.validate_server_runtime = healthy
+    assert asyncio.run(replica.runtime_loss_verified()) is False
 
 
 def test_native_replica_requires_verified_server_receipts_for_sleep_and_wake():
@@ -4537,6 +4605,58 @@ def test_rollouter_natural_drain_timeout_stays_draining_and_same_op_resumes():
     assert evidence.type is EvidenceType.EXIT_READY
     assert manager.replica_state[key] is ReplicaState.DRAINING
     assert state["begin_calls"] >= 2
+
+
+def test_rollouter_natural_drain_timeout_quarantines_after_dead_proof():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "native-0")
+    rollouter._natural_drain_timeout_s = 0.01
+    calls = []
+    probes = {"count": 0}
+
+    class LB:
+        begin_drain = AsyncRemoteMethod(lambda target, operation_id: "s0")
+        has_unsettled_requests = AsyncRemoteMethod(lambda server_id: True)
+
+    class Manager:
+        global_load_balancer = LB()
+
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.ACTIVE}
+            self.replica_kind = {key: ReplicaKind.NATIVE}
+
+        def replica_meta(self, target):
+            return self.replica_kind[target], self.replica_state[target]
+
+        async def runtime_loss_verified(self, target):
+            probes["count"] += 1
+            return True
+
+        def deactivate_service(self, target):
+            calls.append(("deactivate", target))
+
+        def transition_replica(self, target, state):
+            self.replica_state[target] = state
+
+    manager = Manager()
+    rollouter.llm_server_manager = manager
+    rollouter._update_max_concurrent_samples = lambda: calls.append(("capacity",))
+
+    with pytest.raises(RuntimeError, match="runtime loss verified during drain"):
+        asyncio.run(
+            rollouter.prepare_exit(
+                key,
+                operation_id="op-dead-drain",
+                force=False,
+            )
+        )
+
+    assert probes["count"] == 1
+    assert manager.replica_state[key] is ReplicaState.QUARANTINED
+    assert rollouter.get_pending_target("op-dead-drain") == key
+    assert ("deactivate", key) in calls
+    assert ("capacity",) in calls
 
 
 def test_rollouter_add_commit_publishes_hidden_borrower_after_e_is_ready():

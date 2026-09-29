@@ -22,7 +22,10 @@ from multi_task_scheduler.rollout.replica import MultiTaskvLLMReplica
 
 _ALLOWED = {
     ReplicaState.CREATING: {ReplicaState.ACTIVE, ReplicaState.RELEASED, ReplicaState.QUARANTINED},
-    ReplicaState.ACTIVE: {ReplicaState.DRAINING},
+    ReplicaState.ACTIVE: {
+        ReplicaState.DRAINING,
+        ReplicaState.QUARANTINED,
+    },
     ReplicaState.DRAINING: {
         ReplicaState.ACTIVE,
         ReplicaState.DORMANT,
@@ -146,6 +149,22 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
 
     def inspect_runtime(self, key: ReplicaKey):
         return self._runtime_inventory.get(key)
+
+    async def runtime_loss_verified(self, key: ReplicaKey) -> bool:
+        """Return True only for runtime-owned permanent server-loss proof."""
+        if not isinstance(key, ReplicaKey):
+            raise TypeError("runtime_loss_verified requires ReplicaKey")
+        if self.replica_state.get(key) not in {
+            ReplicaState.ACTIVE,
+            ReplicaState.DRAINING,
+        }:
+            return False
+        runtime = self._runtime_inventory.get(key)
+        if runtime is None:
+            # Missing owner-local inventory is inconsistent, but it does not
+            # prove that the physical/runtime actors are dead.
+            return False
+        return bool(await runtime.runtime_loss_verified())
 
     def query_release_evidence(
         self,
