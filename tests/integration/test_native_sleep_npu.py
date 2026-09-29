@@ -565,6 +565,62 @@ def _exercise_same_npu_borrower(
     return destroy_evidence
 
 
+@pytest.mark.npu_backend_smoke
+def test_real_npu_backend_smoke_loads_and_generates_plain_model():
+    """Prove the vanilla VERL/vLLM-Ascend stack before MultiTask lifecycle tests."""
+
+    model_path = _require_model_path()
+    _require_npu(1)
+    _print_npu_runtime_diagnostics()
+
+    import ray
+    from transformers import AutoTokenizer
+
+    from verl.utils.tokenizer import normalize_token_ids
+    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
+
+    config = _config(model_path)
+    rollout_config = config.actor_rollout_ref.rollout
+    model_config = config.actor_rollout_ref.model
+
+    ray.shutdown()
+    ray.init(**_ray_init_kwargs(4))
+
+    try:
+        _require_ray_npus(ray, 1)
+
+        replica = vLLMReplica(
+            replica_rank=0,
+            config=rollout_config,
+            model_config=model_config,
+            gpus_per_node=1,
+        )
+        asyncio.run(_init_standalone_with_diagnostics(replica))
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+        )
+        prompt_ids = normalize_token_ids(
+            tokenizer.encode(
+                "Hello from the vanilla VERL NPU backend smoke test.",
+                add_special_tokens=True,
+            )
+        )
+        output = ray.get(
+            replica._server_handle.generate.remote(
+                request_id=f"npu-backend-smoke-{uuid4().hex}",
+                prompt_ids=prompt_ids,
+                sampling_params={"temperature": 0.0, "max_tokens": 8},
+                image_data=None,
+            ),
+            timeout=120,
+        )
+        assert getattr(output, "token_ids", None)
+    finally:
+        ray.shutdown()
+
+
 def test_real_npu_sleep_releases_same_slot_to_borrower():
     """One-NPU DONATE acceptance using vLLM-Ascend level-1 sleep.
 
