@@ -30,6 +30,7 @@ MODEL_ENV = "VERL_MULTITASK_NPU_MODEL_PATH"
 
 RAY_TMPDIR_ENV = "VERL_MULTITASK_RAY_TMPDIR"
 MIN_RAY_TMP_FREE_GIB = 4
+MIN_RAY_TMP_FREE_RATIO = 0.05
 
 
 def _ray_temp_dir() -> Path:
@@ -41,11 +42,17 @@ def _ray_temp_dir() -> Path:
 
     usage = shutil.disk_usage(temp_dir)
     free_gib = usage.free / (1024 ** 3)
-    if free_gib < MIN_RAY_TMP_FREE_GIB:
+    free_ratio = usage.free / usage.total if usage.total else 0.0
+    if (
+        free_gib < MIN_RAY_TMP_FREE_GIB
+        or free_ratio < MIN_RAY_TMP_FREE_RATIO
+    ):
         pytest.skip(
-            f"Ray temp filesystem {temp_dir} has only {free_gib:.2f} GiB free; "
-            f"set {RAY_TMPDIR_ENV} to a filesystem with at least "
-            f"{MIN_RAY_TMP_FREE_GIB} GiB free"
+            f"Ray temp filesystem {temp_dir} has {free_gib:.2f} GiB free "
+            f"({free_ratio * 100:.2f}%); Ray may fail object creation/spilling "
+            f"when filesystem usage exceeds 95%. Set {RAY_TMPDIR_ENV} to a "
+            f"filesystem with at least {MIN_RAY_TMP_FREE_GIB} GiB and "
+            f"{MIN_RAY_TMP_FREE_RATIO * 100:.0f}% free space"
         )
     return temp_dir
 
