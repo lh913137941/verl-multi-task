@@ -10,6 +10,7 @@ import os
 import ray
 from verl.checkpoint_engine.base import CheckpointEngineManager
 from verl.single_controller.ray import RayWorkerGroup
+from verl.utils.device import get_device_name
 
 from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
@@ -398,6 +399,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             ray_cls_with_init=replicas[0].get_ray_class_with_init_args(),
             name_prefix=f"bootstrap_{operation_id}_",
             use_gpu=True,
+            device_name=get_device_name(),
         )
         actor_wg = self.actor_wg
         topology_started = False
@@ -430,7 +432,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                 )
                 if not released_gpu_uuids:
                     raise RuntimeError(
-                        "native RESTORE target has no verified physical GPU UUID"
+                        "native RESTORE target has no verified physical accelerator id"
                     )
                 await asyncio.gather(
                     *[replica.wake_up(tags=["weights"]) for replica in replicas]
