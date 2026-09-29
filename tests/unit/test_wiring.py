@@ -2167,6 +2167,37 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     assert quarantined_record["error"] is not None
 
 
+def test_runtime_health_fails_fast_when_vllm_sleep_api_is_incompatible():
+    class Engine:
+        async def check_health(self):
+            return None
+
+        async def is_sleeping(self):
+            return False
+
+        async def sleep(self, level=1):
+            return None
+
+        async def wake_up(self, tags=None):
+            return None
+
+        async def wait_for_requests_to_drain(self):
+            return None
+
+        async def reset_prefix_cache(self, reset_connector=False):
+            return True
+
+    server = http_server_class()()
+    server.nnodes = 1
+    server.node_rank = 0
+    server._server_port = 12345
+    server._server_task = type("Task", (), {"done": lambda self: False})()
+    server.engine = Engine()
+
+    with pytest.raises(RuntimeError, match=r"sleep\(level=.*mode"):
+        asyncio.run(server.runtime_health())
+
+
 def test_http_server_health_and_shutdown_use_real_engine_boundaries():
     class Engine:
         def __init__(self):
@@ -2176,6 +2207,22 @@ def test_http_server_health_and_shutdown_use_real_engine_boundaries():
 
         async def check_health(self):
             self.healthy = True
+
+        async def is_sleeping(self):
+            return False
+
+        async def sleep(self, level=1, mode="abort"):
+            return None
+
+        async def wake_up(self, tags=None):
+            return None
+
+        async def reset_prefix_cache(
+            self,
+            reset_running_requests=False,
+            reset_connector=False,
+        ):
+            return True
 
         async def wait_for_requests_to_drain(self):
             self.drained = True
@@ -2201,6 +2248,7 @@ def test_http_server_health_and_shutdown_use_real_engine_boundaries():
         "MultiTaskvLLMHttpServer",
         Parent,
         asyncio=asyncio,
+        inspect=__import__("inspect"),
         ray=fake_ray,
     )
 
@@ -3316,6 +3364,68 @@ def test_ce_rejects_duplicate_target_runtimes():
         ce.add_effective(key, ["runtime", "runtime"], loaded_version=1)
 
 
+def test_multitask_client_waits_for_same_request_release_before_reacquire():
+    class AwaitableRef:
+        def __init__(self):
+            self.event = asyncio.Event()
+
+        def __await__(self):
+            return self.event.wait().__await__()
+
+    release_ref = AwaitableRef()
+    calls = []
+
+    class ReleaseRemote:
+        def remote(self, **kwargs):
+            calls.append(("release", kwargs))
+            return release_ref
+
+    class LoadBalancer:
+        release_server = ReleaseRemote()
+
+    class Parent:
+        def __init__(self, *args, **kwargs):
+            self.config = type(
+                "Config",
+                (),
+                {
+                    "async_training": type(
+                        "Async",
+                        (),
+                        {"partial_rollout": False},
+                    )()
+                },
+            )()
+            self._load_balancer = LoadBalancer()
+            self._lb_require_release_fields = ["request_id"]
+
+        async def _acquire_server(self, request_id, **extra):
+            calls.append(("acquire", request_id))
+            return "s1", object()
+
+    cls = isolated(
+        f"{INTEGRATION}/rollouter.py",
+        "_MultiTaskFullyAsyncLLMServerClient",
+        Parent,
+        asyncio=asyncio,
+        _ContinuationAwareServer=object,
+    )
+    client = cls(client_id="client-1")
+
+    async def scenario():
+        client._release_server("s0", request_id="request-1")
+        acquire = asyncio.create_task(client._acquire_server("request-1"))
+        await asyncio.sleep(0)
+        assert not acquire.done()
+        assert [call[0] for call in calls] == ["release"]
+
+        release_ref.event.set()
+        await acquire
+        assert [call[0] for call in calls] == ["release", "acquire"]
+
+    asyncio.run(scenario())
+
+
 def test_rollouter_idle_detection_treats_unknown_capacity_as_zero():
     cls = rollouter_class()
     rollouter = cls(object(), object())
@@ -3334,6 +3444,7 @@ def http_server_class():
         "MultiTaskvLLMHttpServer",
         Parent,
         asyncio=asyncio,
+        inspect=__import__("inspect"),
         json=__import__("json"),
         ray=FakeRay,
     )
@@ -5148,6 +5259,51 @@ def test_rollouter_invalid_exit_state_does_not_bind_pending_operation():
             )
         )
     assert "op-invalid-exit" not in rollouter._pending_operation_targets
+
+
+def test_rollouter_retries_transient_read_rpc_without_unknown_escalation():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key = ReplicaKey("task-a", "r0")
+    attempts = {"count": 0}
+
+    class LB:
+        begin_drain = AsyncRemoteMethod(lambda target, operation_id: "s0")
+
+        async def _has_unsettled(self, server_id):
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise RuntimeError("transient LB read failure")
+            return False
+
+        has_unsettled_requests = type(
+            "Remote",
+            (),
+            {
+                "remote": lambda self, server_id:
+                LB()._has_unsettled(server_id)
+            },
+        )()
+
+    class Manager:
+        global_load_balancer = LB()
+
+        def __init__(self):
+            self.replica_state = {key: ReplicaState.ACTIVE}
+            self.replica_kind = {key: ReplicaKind.NATIVE}
+
+        def replica_meta(self, target):
+            return self.replica_kind[target], self.replica_state[target]
+
+        def transition_replica(self, target, state):
+            self.replica_state[target] = state
+
+    rollouter.llm_server_manager = Manager()
+    evidence = asyncio.run(
+        rollouter.prepare_exit(key, operation_id="op-read-retry")
+    )
+    assert evidence.type is EvidenceType.EXIT_READY
+    assert attempts["count"] == 3
 
 
 def test_rollouter_natural_exit_separates_drain_from_service_commit():
