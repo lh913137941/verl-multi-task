@@ -90,6 +90,24 @@ def verl_expected_pair() -> tuple[str, str] | None:
     return vllm_version, ascend_version
 
 
+def verl_expected_transformers() -> str | None:
+    """Read the final transformers pin from the installed VERL NPU installer."""
+    try:
+        import verl
+    except Exception:
+        return None
+    repo_root = Path(verl.__file__).resolve().parent.parent
+    script = repo_root / "scripts" / "install_vllm_mcore_npu.sh"
+    if not script.exists():
+        return None
+    try:
+        text = script.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    matches = re.findall(r"transformers==(?P<version>\d+\.\d+\.\d+)", text)
+    return matches[-1] if matches else None
+
+
 def read_json(path: Path) -> dict | None:
     if not path.exists():
         return None
@@ -132,6 +150,8 @@ def main() -> int:
     print("\n=== VERL runtime contract ===")
     expected = verl_expected_pair()
     print("expected vllm/vllm-ascend:", expected)
+    expected_transformers = verl_expected_transformers()
+    print("expected transformers:", expected_transformers)
 
     try:
         import vllm
@@ -190,6 +210,14 @@ def main() -> int:
             failures.append(
                 f"VERL expects vllm-ascend {expected_ascend} lane, "
                 f"metadata reports {actual_ascend}"
+            )
+
+    if expected_transformers is not None:
+        actual_transformers = package_version("transformers")
+        if actual_transformers != expected_transformers:
+            failures.append(
+                f"VERL NPU installer expects transformers {expected_transformers}, "
+                f"metadata reports {actual_transformers}"
             )
 
     print("\n=== NPU platform ===")
