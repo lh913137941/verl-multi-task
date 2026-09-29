@@ -380,6 +380,36 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         # reconciled by the existing service path rather than overwritten here.
         return False
 
+    async def _quarantine_verified_runtime_loss(
+        self,
+        replica_key: ReplicaKey,
+        operation_id: str,
+        *,
+        route_already_draining: bool,
+    ) -> bool:
+        """Close R/C and quarantine M only after permanent runtime-loss proof."""
+        manager = self.llm_server_manager
+        probe = getattr(manager, "runtime_loss_verified", None)
+        if probe is None or not await probe(replica_key):
+            return False
+
+        self._pending_operation_targets[operation_id] = replica_key
+        lb = manager.global_load_balancer
+        if not route_already_draining:
+            await lb.begin_drain.remote(replica_key, operation_id)
+
+        try:
+            manager.deactivate_service(replica_key)
+            self._update_max_concurrent_samples()
+        finally:
+            state = manager.replica_state.get(replica_key)
+            if state in {ReplicaState.ACTIVE, ReplicaState.DRAINING}:
+                manager.transition_replica(
+                    replica_key,
+                    ReplicaState.QUARANTINED,
+                )
+        return True
+
     async def prepare_exit(
         self,
         replica_key: ReplicaKey,
@@ -505,10 +535,16 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
 
                 return OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
             except BaseException:
-                # Once FORCE closes admission or abort may have happened, keep
-                # DRAINING and preserve the same operation's request facts.
-                # Replays resume this operation; they never reset M to ACTIVE
-                # and never blindly repeat an already-issued abort.
+                # FORCE uncertainty is normally resumable under the same op.
+                # A separately proved DEAD runtime is the only exception.
+                if await self._quarantine_verified_runtime_loss(
+                    replica_key,
+                    operation_id,
+                    route_already_draining=True,
+                ):
+                    raise RuntimeError(
+                        "runtime loss verified during FORCE; replica quarantined"
+                    )
                 raise
 
         if state not in {ReplicaState.ACTIVE, ReplicaState.DRAINING}:
@@ -549,9 +585,16 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                     next_log = now + 10.0
                 await asyncio.sleep(min(0.1, max(0.0, deadline - now)))
         except BaseException:
-            # Natural drain timeout/ACK uncertainty is resumable. Preserve M as
-            # DRAINING and the same operation binding; do not silently upgrade
-            # to FORCE or quarantine away the only safe replay path.
+            # Natural drain timeout/ACK uncertainty stays resumable unless the
+            # runtime itself is independently proved DEAD.
+            if await self._quarantine_verified_runtime_loss(
+                replica_key,
+                operation_id,
+                route_already_draining="server_id" in locals(),
+            ):
+                raise RuntimeError(
+                    "runtime loss verified during drain; replica quarantined"
+                )
             raise
 
         return OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
