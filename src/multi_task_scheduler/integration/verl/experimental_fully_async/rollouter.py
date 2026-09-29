@@ -177,6 +177,7 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         self._natural_drain_timeout_s = float(timeout_value)
         self._idle_report_signature = None
         self._idle_report_last_sent = None
+        self._idle_report_task = None
         super().__init__(
             config,
             tokenizer,
@@ -228,6 +229,15 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             ),
         )
 
+        # Keep native FullyAsyncRollouter.fit() untouched.  This existing
+        # multitask-only initialization hook is the narrow place to attach the
+        # advisory idle reporter; it exits after the native fit lifecycle has
+        # been observed running and then stopped.
+        if self.group_scheduler is not None and (
+            self._idle_report_task is None or self._idle_report_task.done()
+        ):
+            self._idle_report_task = asyncio.create_task(self._idle_report_loop())
+
     def collect_idle_candidates(self) -> tuple[tuple[ReplicaKey, ReplicaKind], ...]:
         """Return only ACTIVE replicas whose removal preserves committed C.
 
@@ -277,13 +287,22 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         return await self.group_scheduler.submit_idle_report.remote(report)
 
     async def _idle_report_loop(self):
-        """Emit one metadata report per distinct paused surplus set."""
+        """Emit metadata while native fit is active, then exit with that lifecycle."""
+        observed_running = False
         while True:
             await asyncio.sleep(1.0)
-            # fit() owns cancellation of this reporter. Do not exit merely
-            # because native super().fit() has not set running=True yet.
-            if not getattr(self, "running", False):
+            running = bool(getattr(self, "running", False))
+            if running:
+                observed_running = True
+            elif observed_running:
                 self._idle_report_signature = None
+                self._idle_report_last_sent = None
+                return
+            else:
+                # The reporter is created during async-manager initialization,
+                # which precedes native fit() setting running=True.
+                self._idle_report_signature = None
+                self._idle_report_last_sent = None
                 continue
             if not getattr(self, "paused", False) or self.group_scheduler is None:
                 self._idle_report_signature = None
@@ -318,14 +337,6 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             else:
                 self._idle_report_signature = signature
                 self._idle_report_last_sent = now
-
-    async def fit(self):
-        reporter = asyncio.create_task(self._idle_report_loop())
-        try:
-            return await super().fit()
-        finally:
-            reporter.cancel()
-            await asyncio.gather(reporter, return_exceptions=True)
 
     async def prepare_replica(
         self,
