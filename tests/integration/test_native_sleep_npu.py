@@ -692,19 +692,16 @@ model = os.environ["VERL_MULTITASK_DIRECT_SMOKE_MODEL"]
 utilization = float(
     os.environ["VERL_MULTITASK_DIRECT_SMOKE_UTILIZATION"]
 )
-try:
-    LLM(
-        model=model,
-        dtype="bfloat16",
-        tensor_parallel_size=1,
-        gpu_memory_utilization=utilization,
-        max_model_len=512,
-        max_num_seqs=1,
-        enforce_eager=True,
-        trust_remote_code=True,
-    )
-except _LayoutProbeComplete:
-    print("DIRECT_QWEN3_PRELOAD_LAYOUT_PASS", flush=True)
+LLM(
+    model=model,
+    dtype="bfloat16",
+    tensor_parallel_size=1,
+    gpu_memory_utilization=utilization,
+    max_model_len=512,
+    max_num_seqs=1,
+    enforce_eager=True,
+    trust_remote_code=True,
+)
 """
     result = subprocess.run(
         [sys.executable, "-c", script],
