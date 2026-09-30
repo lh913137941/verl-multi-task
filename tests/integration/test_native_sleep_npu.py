@@ -922,6 +922,8 @@ def _print_ray_acceptance_state(ray, label: str) -> None:
     except BaseException as exc:
         cluster = {"error": f"{type(exc).__name__}: {exc}"}
     try:
+        from ray.util.state import list_actors
+
         actors = []
         for state in list_actors():
             value = state.state if hasattr(state, "state") else state.get("state")
