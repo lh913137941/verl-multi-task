@@ -1790,7 +1790,7 @@ def test_real_npu_restore_reinstalls_current_vpub_and_generates_again():
         )
         assert destroy_evidence.released_gpu_uuids == release.released_gpu_uuids
 
-        mutation_receipts = ray.get(
+        mutation_receipts = (
             actor_wg.zero_output_weights_for_restore_acceptance()
         )
         assert all(
