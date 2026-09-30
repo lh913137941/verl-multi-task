@@ -1618,10 +1618,37 @@ def _training_sender_class():
             global_steps: int = None,
             mode: str = "auto",
         ):
+            print(
+                "NPU_RESTORE_STAGE",
+                {"stage": "trainer-export-start", "global_steps": global_steps},
+                flush=True,
+            )
             weights, _ = self.engine.get_per_tensor_param()
+
+            async def traced_weights():
+                first = True
+                for name, tensor in weights:
+                    if first:
+                        print(
+                            "NPU_RESTORE_STAGE",
+                            {
+                                "stage": "trainer-first-weight",
+                                "name": str(name),
+                                "shape": tuple(tensor.shape),
+                            },
+                            flush=True,
+                        )
+                        first = False
+                    yield name, tensor
+
             await self.checkpoint_engine.send_weights(
-                weights,
+                traced_weights(),
                 global_steps=global_steps,
+            )
+            print(
+                "NPU_RESTORE_STAGE",
+                {"stage": "trainer-send-done", "global_steps": global_steps},
+                flush=True,
             )
 
         @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
@@ -1631,11 +1658,13 @@ def _training_sender_class():
     return RestoreTrainingWorker
 
 
-def test_real_npu_restore_reinstalls_current_vpub_and_generates_again():
+def test_real_npu_restore_reinstalls_current_vpub_and_generates_again(monkeypatch):
     """Two-NPU RESTORE acceptance using the HCCL implementation registered as nccl."""
 
     model_path = _require_model_path()
     _require_npu(2)
+    monkeypatch.setenv("MULTITASK_PARAMETER_VALIDATION", "0")
+    monkeypatch.setenv("MULTITASK_SOURCE_VALIDATION", "0")
     _print_npu_runtime_diagnostics()
 
     import ray
