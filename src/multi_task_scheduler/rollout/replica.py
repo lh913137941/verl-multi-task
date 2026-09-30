@@ -13,6 +13,9 @@ from verl.utils.device import get_device_name, get_resource_name
 from verl.workers.rollout.replica import RolloutMode
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
+from multi_task_scheduler.checkpoint.checkpoint_engine_worker import (
+    MultiTaskCheckpointEngineWorker,
+)
 from multi_task_scheduler.orchestration.contracts import (
     FIRST_RELEASE_MAX_COLOCATE_COUNT,
     Lease,
@@ -42,23 +45,50 @@ class MultiTaskvLLMReplica(vLLMReplica):
         super().__init__(*args, **kwargs)
         self.server_class = ray.remote(MultiTaskvLLMHttpServer)
 
+    def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
+        """Use the expansion CE worker subclass with native method metadata."""
+        return RayClassWithInitArgs(
+            cls=ray.remote(MultiTaskCheckpointEngineWorker),
+            rollout_config=self.config,
+            model_config=self.model_config,
+            replica_rank=self.replica_rank,
+        )
+
     @staticmethod
     def _runtime_placement_probe(_worker) -> dict:
-        """Run inside VERL's native CheckpointEngineWorker via __ray_call__."""
+        """Return one stable physical-accelerator identity from inside the CE actor.
+
+        The public first-release contract keeps the field name gpu_uuid for
+        backward compatibility. On CUDA it remains the real GPU UUID. On
+        Ascend, where Ray exposes logical NPU ids, node_id + Ray accelerator
+        id provides a stable cluster-wide identity without a second lease schema.
+        """
         resource_name = get_resource_name()
-        if resource_name != "GPU":
+        if resource_name not in {"GPU", "NPU"}:
             raise NotImplementedError(
-                f"first release placement probe supports GPU only, got {resource_name!r}"
+                "first release placement probe supports GPU/NPU accelerators, "
+                f"got {resource_name!r}"
             )
         context = ray.get_runtime_context()
+        node_id = context.get_node_id()
         ids = context.get_accelerator_ids().get(resource_name, [])
         if len(ids) != 1:
             raise RuntimeError(
-                f"expected exactly one Ray GPU id for CE actor, got {ids!r}"
+                f"expected exactly one Ray {resource_name} id for CE actor, got {ids!r}"
             )
         accelerator_id = str(ids[0])
+
+        if resource_name == "NPU":
+            physical_id = f"NPU:{node_id}:{accelerator_id}"
+            return {
+                "node_id": node_id,
+                "gpu_uuid": physical_id,
+                "resource_name": resource_name,
+                "accelerator_id": accelerator_id,
+            }
+
         if accelerator_id.startswith("GPU-"):
-            gpu_uuid = accelerator_id
+            physical_id = accelerator_id
         elif accelerator_id.startswith("MIG-"):
             raise NotImplementedError("first release does not support MIG placement")
         elif accelerator_id.isdigit():
@@ -77,7 +107,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
                     index, uuid = [part.strip() for part in line.split(",", 1)]
                     mapping[index] = uuid
             try:
-                gpu_uuid = mapping[accelerator_id]
+                physical_id = mapping[accelerator_id]
             except KeyError as exc:
                 raise RuntimeError(
                     f"nvidia-smi did not report Ray GPU id {accelerator_id!r}"
@@ -86,7 +116,12 @@ class MultiTaskvLLMReplica(vLLMReplica):
             raise RuntimeError(
                 f"cannot map Ray GPU accelerator id {accelerator_id!r} to a UUID"
             )
-        return {"node_id": context.get_node_id(), "gpu_uuid": gpu_uuid}
+        return {
+            "node_id": node_id,
+            "gpu_uuid": physical_id,
+            "resource_name": resource_name,
+            "accelerator_id": accelerator_id,
+        }
 
     def validate_placement(self, spec: dict) -> None:
         """Validate runtime identity/topology on a normalized Lease spec."""
@@ -116,7 +151,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
     def build_borrowed_worker_plan(self, spec: dict) -> dict:
         """Build deterministic TP=1 CE actor placement metadata."""
         self.validate_placement(spec)
-        prefix = f"borrowed_ce_{self.replica_rank}_"
+        prefix = f"borrowed_ce_{self.replica_rank}{self.name_suffix}_"
         claim = spec["claims"][0]
         self.placement_claims = (dict(claim),)
         self.borrowed_server_names = (
@@ -162,7 +197,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
         return (dict(placement),)
 
     async def validate_worker_placement(self) -> tuple[dict, ...]:
-        """Verify each borrower CE actor landed on the claimed node/GPU UUID."""
+        """Verify each borrower CE actor landed on the claimed physical accelerator."""
         claims = tuple(self.placement_claims or ())
         if len(self.workers) != len(claims):
             raise RuntimeError(
@@ -176,7 +211,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
                 )
             if actual.get("gpu_uuid") != claim["gpu_uuid"]:
                 raise RuntimeError(
-                    f"borrower rank {claim['rank']} landed on unexpected GPU UUID"
+                    f"borrower rank {claim['rank']} landed on unexpected physical accelerator"
                 )
         return placements
 
@@ -291,7 +326,8 @@ class MultiTaskvLLMReplica(vLLMReplica):
             except BaseException as cleanup_exc:
                 self.workers = []
                 raise RuntimeError(
-                    "borrowed CE creation failed and actor cleanup is unverified"
+                    "borrowed CE creation failed: "
+                    f"{type(exc).__name__}: {exc}; actor cleanup is unverified"
                 ) from cleanup_exc
             self.workers = []
             raise exc
@@ -331,80 +367,6 @@ class MultiTaskvLLMReplica(vLLMReplica):
         if len(worker_nodes) != 1 or health.get("node_id") not in worker_nodes:
             raise RuntimeError("native server/worker node placement mismatch")
         return dict(health)
-
-    def _server_actor_names(self) -> tuple[str, ...]:
-        borrowed = tuple(getattr(self, "borrowed_server_names", ()) or ())
-        if borrowed:
-            return borrowed
-        prefix = self._get_server_name_prefix()
-        names = []
-        for node_rank in range(self.nnodes):
-            if self.is_reward_model:
-                name = (
-                    f"{prefix}server_reward_{self.replica_rank}_{node_rank}"
-                    f"{self.name_suffix}"
-                )
-            elif self.is_teacher_model:
-                name = (
-                    f"{prefix}server_teacher_{self.replica_rank}_{node_rank}"
-                    f"{self.name_suffix}"
-                )
-            else:
-                name = (
-                    f"{prefix}server_{self.replica_rank}_{node_rank}"
-                    f"{self.name_suffix}"
-                )
-            names.append(name)
-        return tuple(names)
-
-    @staticmethod
-    def _actor_name_states(
-        names: tuple[str, ...],
-        namespace: str,
-    ) -> dict[str, tuple[str, ...]]:
-        result = {}
-        for name in names:
-            states = list_actors(
-                filters=[
-                    ("ray_namespace", "=", namespace),
-                    ("name", "=", name),
-                ]
-            )
-            result[name] = tuple(
-                state.state if hasattr(state, "state") else state["state"]
-                for state in states
-            )
-        return result
-
-    async def runtime_loss_verified(self) -> bool:
-        """Require failed runtime health plus explicit Ray DEAD server records."""
-        try:
-            await self.validate_server_runtime()
-            return False
-        except BaseException:
-            pass
-
-        names = self._server_actor_names()
-        if not names:
-            return False
-        namespace = ray.get_runtime_context().namespace
-        try:
-            states = await asyncio.to_thread(
-                self._actor_name_states,
-                names,
-                namespace,
-            )
-        except BaseException:
-            # Ray State API uncertainty must never be promoted to death proof.
-            return False
-
-        # Missing records are also not proof. Every expected server actor must
-        # have at least one explicit record and all incarnations must be DEAD.
-        return all(
-            actor_states
-            and all(state == "DEAD" for state in actor_states)
-            for actor_states in states.values()
-        )
 
     async def _shutdown_servers_verified(self) -> None:
         servers = list(getattr(self, "servers", []) or [])
@@ -486,23 +448,37 @@ class MultiTaskvLLMReplica(vLLMReplica):
                 await self.cleanup_borrowed_runtime()
             except BaseException as cleanup_exc:
                 raise RuntimeError(
-                    "borrowed runtime creation failed and cleanup is unverified"
+                    "borrowed runtime creation failed: "
+                    f"{type(exc).__name__}: {exc}; cleanup is unverified"
                 ) from cleanup_exc
             raise exc
 
     async def sleep(self):
-        """Deep-sleep the retained native TP=1 runtime."""
+        """Sleep the retained native TP=1 runtime at the platform-safe level."""
         if self.replica_kind is not ReplicaKind.NATIVE:
             raise ValueError("sleep is valid only for retained NATIVE replicas")
         if len(self.servers) != 1:
             raise RuntimeError("current verified native runtime requires one server")
+        resource_name = get_resource_name()
+        if resource_name == "GPU":
+            expected_level = 2
+        elif resource_name == "NPU":
+            # VERL/vLLM-Ascend currently exposes level-1 sleep as the deepest
+            # supported device-release primitive.
+            expected_level = 1
+        else:
+            raise NotImplementedError(
+                f"native sleep is unsupported for Ray resource {resource_name!r}"
+            )
         receipt = await self.servers[0].sleep.remote()
         if (
             not isinstance(receipt, dict)
-            or receipt.get("sleep_level") != 2
+            or receipt.get("sleep_level") != expected_level
             or receipt.get("sleeping") is not True
         ):
-            raise RuntimeError("native server did not confirm level-2 sleep")
+            raise RuntimeError(
+                f"native server did not confirm level-{expected_level} sleep"
+            )
         return (receipt,)
 
     async def wake_up(self, tags: list[str] | None = None):

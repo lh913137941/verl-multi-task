@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - chatgpt/092203-simplified-fusion
+      - chatgpt/0928-merge-verl-expansion
   workflow_dispatch:
 
 jobs:
@@ -17,5 +18,10 @@ jobs:
           python-version: "3.11"
       - name: Install unit-test dependencies
         run: python -m pip install -e '.[test]'
+      - name: Compile opt-in integration entrypoints
+        run: |
+          python -m py_compile tests/integration/test_native_sleep_npu.py
+          python -m py_compile scripts/e2e/diagnose_npu_runtime.py
+
       - name: Run unit suite
         run: python -m pytest -q tests/unit

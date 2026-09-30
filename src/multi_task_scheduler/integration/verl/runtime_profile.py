@@ -74,7 +74,6 @@ def validate_runtime_profile(config) -> bool:
         ("actor_rollout_ref.rollout.calculate_log_probs", True),
         ("actor_rollout_ref.rollout.enable_sleep_mode", True),
         ("actor_rollout_ref.rollout.free_cache_engine", True),
-        ("trainer.device", "cuda"),
         ("data.train_batch_size", 0),
         ("data.gen_batch_size", 1),
     ):
@@ -83,6 +82,13 @@ def validate_runtime_profile(config) -> bool:
             raise ProfileConfigurationError(
                 f"{path} must be {expected!r}, got {value!r}"
             )
+
+    trainer_device = _select(config, "trainer.device")
+    if trainer_device not in {"cuda", "npu"}:
+        raise ProfileConfigurationError(
+            "trainer.device must be 'cuda' or 'npu' for MultiTask accelerator lending, "
+            f"got {trainer_device!r}"
+        )
 
     prefix = "actor_rollout_ref.rollout"
     disaggregation = _select(config, f"{prefix}.disaggregation", None)
@@ -107,7 +113,7 @@ def validate_runtime_profile(config) -> bool:
             raise ProfileConfigurationError(f"{prefix}.mtp must be a mapping")
         if mtp.get("enable", False) and mtp.get("enable_rollout", False):
             raise ProfileConfigurationError(
-                "first release whole-GPU DONATE requires level-2 sleep and does not support MTP rollout"
+                "first release accelerator lending does not support MTP rollout"
             )
 
     model = _select(config, "actor_rollout_ref.model", None)
@@ -123,13 +129,13 @@ def validate_runtime_profile(config) -> bool:
         )
         if lora_enabled and lora.get("merge", False) is not True:
             raise ProfileConfigurationError(
-                "first release whole-GPU DONATE requires level-2 sleep and does not support unmerged LoRA rollout"
+                "first release accelerator lending does not support unmerged LoRA rollout"
             )
 
     backend = _select(config, f"{prefix}.checkpoint_engine.backend")
     if backend != "nccl":
         raise ProfileConfigurationError(
-            "first release CUDA whole-GPU lending requires checkpoint_engine.backend='nccl'"
+            "first release dynamic checkpoint membership requires checkpoint_engine.backend='nccl'"
         )
     rebuild_path = f"{prefix}.checkpoint_engine.engine_kwargs.nccl.rebuild_group"
     if _select(config, rebuild_path, False) is not True:

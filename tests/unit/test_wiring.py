@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import hashlib
 import threading
 import time
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from multi_task_scheduler.orchestration.contracts import (
+    CONTROL_RPC_TIMEOUT_S,
     EvidenceType,
     AttemptState,
     FIRST_RELEASE_MAX_COLOCATE_COUNT,
@@ -20,6 +22,8 @@ from multi_task_scheduler.orchestration.contracts import (
     ReplicaKey,
     ReplicaKind,
     ReplicaState,
+    native_replica_key,
+    require_operation_evidence,
 )
 from multi_task_scheduler.orchestration.operation_journal import OperationJournal
 from multi_task_scheduler.orchestration.replica_sync_gate import GateKind, ReplicaSyncGate
@@ -113,7 +117,16 @@ def taskrunner_class():
         threading=threading,
         ray=FakeRay,
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
-        logger=type("Logger", (), {"exception": lambda *args, **kwargs: None})(),
+        CONTROL_RPC_TIMEOUT_S=CONTROL_RPC_TIMEOUT_S,
+        _require_evidence=require_operation_evidence,
+        logger=type(
+            "Logger",
+            (),
+            {
+                "exception": lambda *args, **kwargs: None,
+                "warning": lambda *args, **kwargs: None,
+            },
+        )(),
     )
 
 
@@ -133,6 +146,7 @@ def trainer_class():
         EvidenceType=EvidenceType,
         ReplicaKey=ReplicaKey,
         ReplicaKind=ReplicaKind,
+        native_replica_key=native_replica_key,
         GateKind=GateKind,
         ReplicaSyncGate=ReplicaSyncGate,
         _require_evidence=_test_require_evidence,
@@ -296,10 +310,17 @@ def test_load_balancer_bounds_settled_request_history():
     for index in range(5):
         request_id = f"request-{index}"
         server_id, _ = lb.acquire_server(request_id)
+        lb.continuation_proofs[request_id] = (
+            "client",
+            f"digest-{index}",
+            "op",
+            OperationEvidence.now("op", EvidenceType.EXIT_READY),
+        )
         lb.release_server(server_id, request_id=request_id)
 
     assert len(lb.attempt_state) <= 2
     assert set(lb.attempt_state) == {"request-3", "request-4"}
+    assert set(lb.continuation_proofs) == {"request-3", "request-4"}
     assert all(state is AttemptState.SETTLED for state in lb.attempt_state.values())
 
 
@@ -454,6 +475,35 @@ def test_taskrunner_minimal_journal_surface_and_replay_does_not_relaunch():
     missing = runner.query_operation("missing")
     assert missing.status is OperationStatus.UNKNOWN
     assert missing.result is None
+
+
+def test_taskrunner_terminal_finish_clears_rollouter_binding_but_unknown_keeps_it():
+    runner = taskrunner_class()()
+    cleared = []
+
+    class Rollouter:
+        clear_operation_binding = RemoteMethod(
+            lambda operation_id: cleared.append(operation_id) or True
+        )
+
+    runner.components["rollouter"] = Rollouter()
+
+    for operation_id, status in (
+        ("op-success", OperationStatus.SUCCEEDED),
+        ("op-failed", OperationStatus.FAILED),
+        ("op-unknown", OperationStatus.UNKNOWN),
+    ):
+        command = OperationCommand(
+            operation_id,
+            OperationKind.REMOVE,
+            ReplicaKey("task-a", "borrowed-0"),
+            "l1",
+        )
+        runner._operation_journal.begin(command)
+        runner._operation_journal.mark_running(operation_id)
+        runner._finish(operation_id, status, status.value)
+
+    assert cleared == ["op-success", "op-failed"]
 
 
 def test_taskrunner_exact_unknown_remove_replay_relaunches_same_operation():
@@ -1802,10 +1852,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
             ReplicaState.RELEASED,
             ReplicaState.QUARANTINED,
         },
-        ReplicaState.ACTIVE: {
-            ReplicaState.DRAINING,
-            ReplicaState.QUARANTINED,
-        },
+        ReplicaState.ACTIVE: {ReplicaState.DRAINING},
         ReplicaState.DRAINING: {
             ReplicaState.ACTIVE,
             ReplicaState.DORMANT,
@@ -1865,6 +1912,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     class FakeBorrowedRuntime:
         def __init__(self, **kwargs):
             self.replica_rank = kwargs["replica_rank"]
+            self.name_suffix = kwargs.get("name_suffix", "")
             self.workers = ["worker-0"]
             self.servers = ["server-0"]
             self.borrowed_worker_names = ("worker-name",)
@@ -1901,6 +1949,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
         FIRST_RELEASE_RAY_GPU_FRACTION=FIRST_RELEASE_RAY_GPU_FRACTION,
         asyncio=asyncio,
+        hashlib=hashlib,
         ray=fake_ray,
         time=time,
         _ALLOWED=allowed,
@@ -2048,6 +2097,8 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     assert manager.replica_state[borrowed_key] is ReplicaState.CREATING
     borrowed_runtime = manager.inspect_runtime(borrowed_key)
     assert borrowed_runtime is not None
+    assert borrowed_runtime.name_suffix.startswith("borrowed_")
+    assert "borrower-lease" not in borrowed_runtime.name_suffix
     assert manager.next_replica_rank == assigned_rank + 1
 
     # Exact replay returns the same hidden runtime receipt without another rank.
@@ -2165,14 +2216,6 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     assert manager.replica_state[quarantined_key] is ReplicaState.QUARANTINED
     assert quarantined_record["error"] is not None
 
-    # A separately proved permanent runtime loss may quarantine an ACTIVE
-    # projection directly; ordinary lifecycle exit still uses DRAINING.
-    manager.replica_state[key] = ReplicaState.ACTIVE
-    assert (
-        manager.transition_replica(key, ReplicaState.QUARANTINED)
-        is ReplicaState.QUARANTINED
-    )
-
 
 def test_runtime_health_fails_fast_when_vllm_sleep_api_is_incompatible():
     class Engine:
@@ -2182,7 +2225,7 @@ def test_runtime_health_fails_fast_when_vllm_sleep_api_is_incompatible():
         async def is_sleeping(self):
             return False
 
-        async def sleep(self, level=1):
+        async def sleep(self):
             return None
 
         async def wake_up(self, tags=None):
@@ -2201,7 +2244,7 @@ def test_runtime_health_fails_fast_when_vllm_sleep_api_is_incompatible():
     server._server_task = type("Task", (), {"done": lambda self: False})()
     server.engine = Engine()
 
-    with pytest.raises(RuntimeError, match=r"sleep\(level=.*mode"):
+    with pytest.raises(RuntimeError, match=r"sleep\(level"):
         asyncio.run(server.runtime_health())
 
 
@@ -2336,6 +2379,7 @@ def replica_class():
         get_resource_name=lambda: "GPU",
         get_visible_devices_keyword=lambda: "CUDA_VISIBLE_DEVICES",
         MultiTaskvLLMHttpServer=object,
+        MultiTaskCheckpointEngineWorker=object,
         os=__import__("os"),
         subprocess=__import__("subprocess"),
         ray=fake_ray,
@@ -2359,6 +2403,7 @@ def test_borrowed_worker_plan_is_deterministic_and_side_effect_free():
         model_config=object(),
         replica_kind=ReplicaKind.BORROWED,
         runtime_epoch=3,
+        name_suffix="borrowed_deadbeef_3",
     )
     spec = {
         "operation_id": "op-add",
@@ -2390,7 +2435,12 @@ def test_borrowed_worker_plan_is_deterministic_and_side_effect_free():
     second = replica.build_borrowed_worker_plan(spec)
 
     assert first == second
-    assert first["actor_name"].startswith("borrowed_ce_7_")
+    assert first["actor_name"].startswith(
+        "borrowed_ce_7borrowed_deadbeef_3_"
+    )
+    assert replica.borrowed_server_names == (
+        "vllm_server_7_0borrowed_deadbeef_3",
+    )
     assert first["pg_id"] == "pg"
     assert first["bundle_index"] == 4
     assert first["num_gpus"] == FIRST_RELEASE_RAY_GPU_FRACTION
@@ -2489,6 +2539,7 @@ def test_worker_gpu_uuid_probe_uses_native_worker_ray_call_context():
         Lease=Lease,
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
         MultiTaskvLLMHttpServer=object,
+        MultiTaskCheckpointEngineWorker=object,
         os=__import__("os"),
         subprocess=fake_subprocess,
         ray=fake_ray,
@@ -2615,6 +2666,7 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
         get_master_addr_port=object,
         get_device_name=lambda: "cuda",
         MultiTaskvLLMHttpServer=object,
+        MultiTaskCheckpointEngineWorker=object,
         asyncio=asyncio,
         list_actors=lambda **kwargs: [],
         ray=fake_ray,
@@ -2695,7 +2747,7 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
         runtime_epoch=0,
     )
     failed._get_master_addr_port_for_slot = fake_master
-    with pytest.raises(RuntimeError, match="unexpected GPU UUID"):
+    with pytest.raises(RuntimeError, match="unexpected physical accelerator"):
         asyncio.run(failed._create_workers_from_claims(spec, {"pg": "PG"}))
     assert killed
     assert failed.workers == []
@@ -2767,6 +2819,7 @@ def test_init_from_lease_reaches_runtime_ready_only_after_server_health():
         get_master_addr_port=object,
         get_device_name=lambda: "cuda",
         MultiTaskvLLMHttpServer=object,
+        MultiTaskCheckpointEngineWorker=object,
         asyncio=asyncio,
         list_actors=lambda **kwargs: [],
         ray=fake_ray,
@@ -2868,6 +2921,10 @@ def checkpoint_manager_class(**extra_scope):
         "EvidenceType": EvidenceType,
         "ReplicaKind": ReplicaKind,
         "asyncio": asyncio,
+        "hashlib": __import__("hashlib"),
+        "json": __import__("json"),
+        "os": __import__("os"),
+        "get_device_name": lambda: "cuda",
         **extra_scope,
     }
     return isolated(
@@ -3364,6 +3421,53 @@ def test_ce_rejects_duplicate_target_runtimes():
         ce.add_effective(key, ["runtime", "runtime"], loaded_version=1)
 
 
+def test_continuation_wrapper_reduces_remaining_min_tokens_after_abort():
+    calls = []
+
+    class Output:
+        stop_reason = "abort"
+        token_ids = [11, 12, 13]
+
+    class Server:
+        generate = AsyncRemoteMethod(lambda *args, **kwargs: Output())
+
+    class LoadBalancer:
+        confirm_continuation = AsyncRemoteMethod(
+            lambda *args: calls.append(args) or object()
+        )
+
+    cls = isolated(
+        f"{INTEGRATION}/rollouter.py",
+        "_ContinuationAwareServer",
+        object,
+        _continuation_prefix_digest=lambda prompt_ids, token_ids: "digest",
+    )
+    wrapper = cls.__new__(cls)
+    wrapper._server = Server()
+    wrapper._load_balancer = LoadBalancer()
+    wrapper._logical_request_id = "request-1"
+    wrapper._client_id = "client-1"
+
+    sampling_params = {
+        "temperature": 0.0,
+        "max_tokens": 128,
+        "min_tokens": 128,
+    }
+    output = asyncio.run(
+        wrapper._generate(
+            request_id="attempt-1",
+            prompt_ids=[1, 2],
+            sampling_params=sampling_params,
+            image_data=None,
+        )
+    )
+
+    assert output.stop_reason == "abort"
+    assert sampling_params["max_tokens"] == 128
+    assert sampling_params["min_tokens"] == 125
+    assert calls == [("request-1", "client-1", "digest")]
+
+
 def test_multitask_client_waits_for_same_request_release_before_reacquire():
     class AwaitableRef:
         def __init__(self):
@@ -3414,9 +3518,7 @@ def test_multitask_client_waits_for_same_request_release_before_reacquire():
 
     async def scenario():
         client._release_server("s0", request_id="request-1")
-        acquire = asyncio.create_task(
-            client._acquire_server("request-1")
-        )
+        acquire = asyncio.create_task(client._acquire_server("request-1"))
         await asyncio.sleep(0)
         assert not acquire.done()
         assert [call[0] for call in calls] == ["release"]
@@ -3428,6 +3530,28 @@ def test_multitask_client_waits_for_same_request_release_before_reacquire():
     asyncio.run(scenario())
 
 
+def test_rollouter_clear_operation_binding_is_scoped_and_idempotent():
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    key0 = ReplicaKey("task-a", "borrowed-0")
+    key1 = ReplicaKey("task-a", "borrowed-1")
+    rollouter._pending_operation_targets = {
+        "op-0": key0,
+        "op-1": key1,
+    }
+    rollouter._force_exit_recovery = {
+        "op-0": (("request-0",), 1),
+        "op-1": (("request-1",), 1),
+    }
+
+    assert rollouter.clear_operation_binding("op-0") is True
+    assert "op-0" not in rollouter._pending_operation_targets
+    assert "op-0" not in rollouter._force_exit_recovery
+    assert rollouter._pending_operation_targets["op-1"] == key1
+    assert "op-1" in rollouter._force_exit_recovery
+    assert rollouter.clear_operation_binding("op-0") is False
+
+
 def test_rollouter_idle_detection_treats_unknown_capacity_as_zero():
     cls = rollouter_class()
     rollouter = cls(object(), object())
@@ -3435,7 +3559,7 @@ def test_rollouter_idle_detection_treats_unknown_capacity_as_zero():
     assert rollouter.collect_idle_candidates() == ()
 
 
-def http_server_class():
+def http_server_class(resource_name="GPU"):
     class Parent:
         async def resume_kv_cache(self):
             await self.engine.wake_up(tags=["kv_cache"])
@@ -3447,29 +3571,23 @@ def http_server_class():
         Parent,
         asyncio=asyncio,
         inspect=__import__("inspect"),
+        json=__import__("json"),
         ray=FakeRay,
+        get_resource_name=lambda: resource_name,
     )
 
 
 def runtime_replica_class():
-    fake_ray = type(
-        "ReplicaRay",
-        (),
-        {
-            "get_runtime_context": staticmethod(
-                lambda: type("RuntimeContext", (), {"namespace": "verl-test"})()
-            )
-        },
-    )
     return isolated(
         "rollout/replica.py",
         "MultiTaskvLLMReplica",
         object,
         asyncio=asyncio,
-        ray=fake_ray,
         ReplicaKind=ReplicaKind,
         Lease=Lease,
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
+        MultiTaskCheckpointEngineWorker=object,
+        get_resource_name=lambda: "GPU",
     )
 
 
@@ -3483,6 +3601,7 @@ def native_manager_class():
         ReplicaState=ReplicaState,
         EvidenceType=EvidenceType,
         OperationEvidence=OperationEvidence,
+        native_replica_key=native_replica_key,
         asyncio=asyncio,
     )
 
@@ -3598,6 +3717,55 @@ def test_standalone_server_level2_sleep_and_two_phase_wake_keep_admission_fenced
     assert calls[-2:] == [("health",), ("gate", "set")]
 
 
+def test_standalone_server_npu_accepts_level1_sleep_without_mode():
+    calls = []
+
+    class Event:
+        def __init__(self):
+            self.is_set = True
+
+        def clear(self):
+            self.is_set = False
+
+        def set(self):
+            self.is_set = True
+
+    class Engine:
+        def __init__(self):
+            self.sleeping = False
+
+        async def wait_for_requests_to_drain(self):
+            calls.append(("drain",))
+
+        async def sleep(self, *, level):
+            calls.append(("sleep", level))
+            self.sleeping = True
+
+        async def is_sleeping(self):
+            return self.sleeping
+
+    server = http_server_class("NPU")()
+    server.nnodes = 1
+    server.node_rank = 0
+    server.replica_rank = 0
+    server.global_steps = 1
+    server.config = type(
+        "Config",
+        (),
+        {"enable_sleep_mode": True, "free_cache_engine": True},
+    )()
+    server.engine = Engine()
+    server._resolve_sleep_level = lambda: 1
+    server._submission_paused = False
+    server._resume_event = Event()
+    server._admitting = 0
+
+    receipt = asyncio.run(server.sleep())
+    assert receipt["sleep_level"] == 1
+    assert receipt["sleeping"] is True
+    assert server._multitask_sleep_stage() == "level1"
+    assert calls == [("drain",), ("sleep", 1)]
+
 def test_standalone_server_weights_stage_rollback_returns_to_level2_sleep():
     calls = []
 
@@ -3682,7 +3850,7 @@ def test_standalone_server_rejects_configs_that_cannot_use_level2_sleep():
     server._submission_paused = False
     server._resume_event = Event()
 
-    with pytest.raises(NotImplementedError, match="level-2 sleep"):
+    with pytest.raises(NotImplementedError, match="GPU DONATE requires vLLM sleep level 2"):
         asyncio.run(server.sleep())
     assert server._submission_paused is False
     assert server._resume_event.clear_calls == 0
@@ -3938,53 +4106,6 @@ def test_native_runtime_health_probe_confirms_server_and_ce_worker_node():
     assert result["node_id"] == "node-0"
 
 
-def test_runtime_loss_requires_explicit_ray_dead_state_after_health_failure():
-    cls = runtime_replica_class()
-    replica = cls.__new__(cls)
-    replica.replica_kind = ReplicaKind.NATIVE
-    replica.replica_rank = 2
-    replica.nnodes = 1
-    replica.name_suffix = ""
-    replica.is_reward_model = False
-    replica.is_teacher_model = False
-    replica.borrowed_server_names = ()
-    replica._get_server_name_prefix = lambda: "vllm_"
-
-    async def failed_health():
-        raise RuntimeError("server unavailable")
-
-    replica.validate_server_runtime = failed_health
-    original = cls._actor_name_states
-    try:
-        cls._actor_name_states = staticmethod(
-            lambda names, namespace: {names[0]: ("DEAD",)}
-        )
-        assert asyncio.run(replica.runtime_loss_verified()) is True
-
-        cls._actor_name_states = staticmethod(
-            lambda names, namespace: {names[0]: ("ALIVE",)}
-        )
-        assert asyncio.run(replica.runtime_loss_verified()) is False
-
-        cls._actor_name_states = staticmethod(
-            lambda names, namespace: {names[0]: ()}
-        )
-        assert asyncio.run(replica.runtime_loss_verified()) is False
-    finally:
-        cls._actor_name_states = original
-
-
-def test_runtime_loss_is_false_when_runtime_health_is_still_valid():
-    cls = runtime_replica_class()
-    replica = cls.__new__(cls)
-
-    async def healthy():
-        return {"ok": True}
-
-    replica.validate_server_runtime = healthy
-    assert asyncio.run(replica.runtime_loss_verified()) is False
-
-
 def test_native_replica_requires_verified_server_receipts_for_sleep_and_wake():
     class Server:
         sleep = AsyncRemoteMethod(
@@ -4105,6 +4226,8 @@ def _isolated_group_scheduler_class():
         "EvidenceType": EvidenceType,
         "_RELEASE_KINDS": {OperationKind.DONATE, OperationKind.REMOVE},
         "_IDLE_REPORT_MAX_AGE_S": 10.0,
+        "CONTROL_RPC_TIMEOUT_S": CONTROL_RPC_TIMEOUT_S,
+        "native_replica_key": native_replica_key,
         "time": time,
         "ray": FakeRay,
     }
@@ -4371,6 +4494,8 @@ def test_group_scheduler_binds_donate_to_lease_donor_rank():
         "EvidenceType": EvidenceType,
         "_RELEASE_KINDS": {OperationKind.DONATE, OperationKind.REMOVE},
         "_IDLE_REPORT_MAX_AGE_S": 10.0,
+        "CONTROL_RPC_TIMEOUT_S": CONTROL_RPC_TIMEOUT_S,
+        "native_replica_key": native_replica_key,
         "time": time,
         "ray": type("Ray", (), {"remote": staticmethod(lambda **kwargs: (lambda cls: cls))}),
     }
@@ -4419,6 +4544,8 @@ def test_group_scheduler_restore_requires_original_donor_and_returned_claims():
         "EvidenceType": EvidenceType,
         "_RELEASE_KINDS": {OperationKind.DONATE, OperationKind.REMOVE},
         "_IDLE_REPORT_MAX_AGE_S": 10.0,
+        "CONTROL_RPC_TIMEOUT_S": CONTROL_RPC_TIMEOUT_S,
+        "native_replica_key": native_replica_key,
         "time": time,
         "ray": FakeRay,
     }
@@ -4604,6 +4731,7 @@ def rollouter_class():
         EvidenceType=EvidenceType,
         _require_evidence=_test_require_evidence,
         asyncio=asyncio,
+        json=__import__("json"),
         ray=FakeRay,
     )
 
@@ -4718,58 +4846,6 @@ def test_rollouter_natural_drain_timeout_stays_draining_and_same_op_resumes():
     assert evidence.type is EvidenceType.EXIT_READY
     assert manager.replica_state[key] is ReplicaState.DRAINING
     assert state["begin_calls"] >= 2
-
-
-def test_rollouter_natural_drain_timeout_quarantines_after_dead_proof():
-    cls = rollouter_class()
-    rollouter = cls(object(), object())
-    key = ReplicaKey("task-a", "native-0")
-    rollouter._natural_drain_timeout_s = 0.01
-    calls = []
-    probes = {"count": 0}
-
-    class LB:
-        begin_drain = AsyncRemoteMethod(lambda target, operation_id: "s0")
-        has_unsettled_requests = AsyncRemoteMethod(lambda server_id: True)
-
-    class Manager:
-        global_load_balancer = LB()
-
-        def __init__(self):
-            self.replica_state = {key: ReplicaState.ACTIVE}
-            self.replica_kind = {key: ReplicaKind.NATIVE}
-
-        def replica_meta(self, target):
-            return self.replica_kind[target], self.replica_state[target]
-
-        async def runtime_loss_verified(self, target):
-            probes["count"] += 1
-            return True
-
-        def deactivate_service(self, target):
-            calls.append(("deactivate", target))
-
-        def transition_replica(self, target, state):
-            self.replica_state[target] = state
-
-    manager = Manager()
-    rollouter.llm_server_manager = manager
-    rollouter._update_max_concurrent_samples = lambda: calls.append(("capacity",))
-
-    with pytest.raises(RuntimeError, match="runtime loss verified during drain"):
-        asyncio.run(
-            rollouter.prepare_exit(
-                key,
-                operation_id="op-dead-drain",
-                force=False,
-            )
-        )
-
-    assert probes["count"] == 1
-    assert manager.replica_state[key] is ReplicaState.QUARANTINED
-    assert rollouter.get_pending_target("op-dead-drain") == key
-    assert ("deactivate", key) in calls
-    assert ("capacity",) in calls
 
 
 def test_rollouter_add_commit_publishes_hidden_borrower_after_e_is_ready():

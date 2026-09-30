@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -20,6 +21,25 @@ pytestmark = [pytest.mark.native, pytest.mark.gpu_integration]
 
 MODEL_ENV = "VERL_MULTITASK_GPU_MODEL_PATH"
 MIN_RELEASE_ENV = "VERL_MULTITASK_MIN_RELEASE_MIB"
+
+
+def _require_cuda_devices(min_devices: int) -> None:
+    """Reject CUDA acceptance when torch.cuda has been monkey-patched to NPU."""
+    if "torch_npu.contrib.transfer_to_npu" in sys.modules:
+        pytest.skip(
+            "CUDA acceptance is invalid while torch_npu transfer_to_npu is active"
+        )
+
+    import torch
+
+    from verl.utils.device import get_device_name, get_resource_name
+
+    if get_device_name() != "cuda" or get_resource_name() != "GPU":
+        pytest.skip("VERL platform did not resolve to NVIDIA CUDA")
+    if not torch.cuda.is_available() or torch.cuda.device_count() < min_devices:
+        pytest.skip(
+            f"CUDA acceptance requires at least {min_devices} CUDA GPU(s)"
+        )
 
 
 def _require_model_path() -> str:
@@ -226,8 +246,7 @@ def test_real_standalone_level2_sleep_releases_device_memory_and_weights_wake_st
     import ray
     import torch
 
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
-        pytest.skip("CUDA GPU is unavailable")
+    _require_cuda_devices(1)
 
     from transformers import AutoTokenizer
 
@@ -307,6 +326,7 @@ def test_real_standalone_level2_sleep_releases_device_memory_and_weights_wake_st
         manager.replica_kind = {key: ReplicaKind.NATIVE}
         manager.replica_state = {key: ReplicaState.DRAINING}
         manager._runtime_inventory = {key: replica}
+        manager._native_release_evidence = {}
 
         before_mib = _gpu_memory_used_mib(gpu_uuid)
         release = asyncio.run(
@@ -373,8 +393,7 @@ def test_real_force_remove_aborts_target_and_continues_on_another_replica():
     from omegaconf import OmegaConf, open_dict
     from transformers import AutoTokenizer
 
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-        pytest.skip("FORCE continuation acceptance requires at least 2 CUDA GPUs")
+    _require_cuda_devices(2)
 
     from multi_task_scheduler.integration.verl.experimental_fully_async.rollouter import (
         MultiTaskFullyAsyncRollouter,
@@ -622,8 +641,7 @@ def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
     import ray
     import torch
 
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-        pytest.skip("current-Vpub RESTORE acceptance requires at least 2 CUDA GPUs")
+    _require_cuda_devices(2)
 
     from multi_task_scheduler.checkpoint.checkpoint_engine_manager import (
         MultiTaskCheckpointEngineManager,
@@ -766,6 +784,7 @@ def test_real_level2_restore_reinstalls_current_vpub_and_generates_again():
         manager.replica_kind = {key: ReplicaKind.NATIVE}
         manager.replica_state = {key: ReplicaState.DRAINING}
         manager._runtime_inventory = {key: replica}
+        manager._native_release_evidence = {}
 
         release = asyncio.run(
             manager.sleep(key, operation_id="gpu-restore-donate")

@@ -13,6 +13,7 @@ def get_or_create_group_scheduler():
     """
     import ray
 
+    from multi_task_scheduler.orchestration.contracts import CONTROL_RPC_TIMEOUT_S
     from .group_scheduler import RUNTIME_KIND, GroupScheduler
 
     if not ray.is_initialized():
@@ -24,6 +25,6 @@ def get_or_create_group_scheduler():
         lifetime="detached",
         get_if_exists=True,
     ).remote()
-    if ray.get(scheduler.runtime_kind.remote(), timeout=30) != RUNTIME_KIND:
+    if ray.get(scheduler.runtime_kind.remote(), timeout=CONTROL_RPC_TIMEOUT_S) != RUNTIME_KIND:
         raise RuntimeError("The named GroupScheduler belongs to an incompatible runtime")
     return scheduler

@@ -66,9 +66,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
     def acquire_server(self, request_id: str, **extra):
         state = self.attempt_state.get(request_id)
         if state in {AttemptState.ADMITTED, AttemptState.TERMINATED}:
-            raise RuntimeError(
-                "request attempt has not reached SETTLED and cannot be re-admitted"
-            )
+            raise RuntimeError("request already has an unsettled generation")
 
         server_id, handle = super().acquire_server(request_id, **extra)
         if state is AttemptState.SETTLED:

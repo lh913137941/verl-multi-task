@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import os
 
 import ray
 from verl.checkpoint_engine.base import CheckpointEngineManager
 from verl.single_controller.ray import RayWorkerGroup
+from verl.utils.device import get_device_name
 
 from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
@@ -24,6 +28,15 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         self._effective_replica_map = {}
         self._pending_bootstrap_map = {}
         self._bootstrap_ready_map = {}
+        # Imported from verl_expansion main as an opt-in acceptance check.
+        # The default path remains byte-for-byte native CE transfer semantics.
+        self.parameter_validation_enabled = (
+            os.environ.get("MULTITASK_PARAMETER_VALIDATION", "0") == "1"
+            or os.environ.get("MULTITASK_SOURCE_VALIDATION", "0") == "1"
+        )
+        self.source_validation_enabled = (
+            os.environ.get("MULTITASK_SOURCE_VALIDATION", "0") == "1"
+        )
 
     @property
     def effective_replicas(self) -> dict:
@@ -153,6 +166,197 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         for key, (replicas, _old_version) in tuple(self._effective_replica_map.items()):
             self._effective_replica_map[key] = (replicas, loaded_version)
 
+    @staticmethod
+    def _validate_manifest(manifest: dict) -> None:
+        """Reject missing/partial audit data before comparing receiver digests."""
+        if not isinstance(manifest, dict) or manifest.get("complete") is not True:
+            raise RuntimeError("parameter manifest is incomplete")
+        entries = manifest.get("parameters")
+        if not isinstance(entries, list) or not entries:
+            raise RuntimeError("parameter manifest must contain parameters")
+        names = set()
+        total_numel = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise RuntimeError("parameter manifest entry must be a mapping")
+            name = entry.get("name")
+            if not isinstance(name, str) or not name or name in names:
+                raise RuntimeError("parameter manifest names must be nonempty and unique")
+            names.add(name)
+            if any(not isinstance(entry.get(field), str) or not entry[field]
+                   for field in ("dtype", "sha256")):
+                raise RuntimeError("parameter manifest entry lacks dtype or sha256")
+            shape = entry.get("shape")
+            numel = entry.get("numel")
+            if (not isinstance(shape, (list, tuple))
+                    or any(type(size) is not int or size < 0 for size in shape)
+                    or type(numel) is not int or numel < 0):
+                raise RuntimeError("parameter manifest entry has invalid shape/numel")
+            expected_numel = 1
+            for size in shape:
+                expected_numel *= size
+            if numel != expected_numel:
+                raise RuntimeError("parameter manifest shape/numel mismatch")
+            total_numel += numel
+        if (type(manifest.get("parameter_count")) is not int
+                or manifest["parameter_count"] != len(entries)
+                or type(manifest.get("total_numel")) is not int
+                or manifest["total_numel"] != total_numel):
+            raise RuntimeError("parameter manifest counts do not match its entries")
+
+    @staticmethod
+    def _manifest_digest(manifest: dict) -> str:
+        entries = manifest.get("parameters", [])
+        canonical = [
+            {
+                "name": item.get("name"),
+                "shape": list(item.get("shape", [])),
+                "dtype": item.get("dtype"),
+                "numel": int(item.get("numel", 0)),
+                "sha256": item.get("sha256"),
+            }
+            for item in entries
+        ]
+        canonical.sort(key=lambda item: item["name"] or "")
+        encoded = json.dumps(
+            canonical, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    async def _get_source_manifest(self) -> dict:
+        """Read an opt-in actor-source manifest when the backend exposes it."""
+        refs = self.actor_wg.execute_checkpoint_engine(
+            ["get_source_manifest"] * self.actor_wg.world_size
+        )
+        manifests = ray.get(refs)
+        for manifest in manifests:
+            if isinstance(manifest, dict) and manifest.get("complete", False):
+                return manifest
+        raise RuntimeError(
+            f"actor source manifest is unavailable or incomplete: {manifests}"
+        )
+
+    @staticmethod
+    def _manifest_mismatches(
+        expected: dict,
+        actual: dict,
+        limit: int = 8,
+    ) -> list[dict]:
+        expected_entries = {
+            item.get("name"): item for item in expected.get("parameters", [])
+        }
+        actual_entries = {
+            item.get("name"): item for item in actual.get("parameters", [])
+        }
+        mismatches = []
+        for name in sorted(set(expected_entries) | set(actual_entries)):
+            source = expected_entries.get(name)
+            received = actual_entries.get(name)
+            if source is None or received is None:
+                mismatches.append(
+                    {"name": name, "source": source, "received": received}
+                )
+            else:
+                differences = {
+                    field: {
+                        "source": source.get(field),
+                        "received": received.get(field),
+                    }
+                    for field in ("shape", "dtype", "numel", "sha256")
+                    if source.get(field) != received.get(field)
+                }
+                if differences:
+                    mismatches.append(
+                        {"name": name, "differences": differences}
+                    )
+            if len(mismatches) >= limit:
+                break
+        return mismatches
+
+    async def validate_parameter_sync(
+        self,
+        replicas,
+        expected_version: int | None = None,
+        source_manifest: dict | None = None,
+    ) -> dict:
+        """Validate receiver manifests without moving tensor payloads to Trainer."""
+        workers = []
+        for replica in replicas:
+            replica_workers = list(getattr(replica, "workers", ()) or ())
+            if not replica_workers:
+                raise RuntimeError("parameter validation requires a CE Worker for every replica")
+            workers.extend(replica_workers)
+        if not workers:
+            raise RuntimeError(
+                "parameter validation requires at least one CE Worker"
+            )
+        manifests = ray.get(
+            [worker.get_parameter_manifest.remote() for worker in workers]
+        )
+        if len(manifests) != len(workers):
+            raise RuntimeError("CE parameter manifest does not cover every worker")
+        for manifest in manifests:
+            self._validate_manifest(manifest)
+        if expected_version is not None:
+            mismatched_versions = [
+                manifest.get("global_steps")
+                for manifest in manifests
+                if manifest.get("global_steps") != expected_version
+            ]
+            if mismatched_versions:
+                raise RuntimeError(
+                    "CE parameter version mismatch: "
+                    f"expected={expected_version}, "
+                    f"received={mismatched_versions}"
+                )
+
+        if source_manifest is not None:
+            self._validate_manifest(source_manifest)
+            if (
+                expected_version is not None
+                and source_manifest.get("global_steps") != expected_version
+            ):
+                raise RuntimeError(
+                    "actor source parameter version mismatch: "
+                    f"expected={expected_version}, "
+                    f"received={source_manifest.get('global_steps')}"
+                )
+            for worker_index, manifest in enumerate(manifests):
+                mismatches = self._manifest_mismatches(
+                    source_manifest, manifest
+                )
+                if mismatches:
+                    raise RuntimeError(
+                        f"CE worker {worker_index} differs from actor "
+                        f"source manifest: {mismatches}"
+                    )
+
+        digests = [self._manifest_digest(manifest) for manifest in manifests]
+        if len(set(digests)) != 1:
+            raise RuntimeError(
+                f"CE workers received different parameter manifests: {digests}"
+            )
+
+        first = manifests[0]
+        result = {
+            "state": "PARAMETERS_VALIDATED",
+            "version": first.get("global_steps"),
+            "worker_count": len(manifests),
+            "parameter_count": first.get("parameter_count", 0),
+            "total_numel": first.get("total_numel", 0),
+            "manifest_digest": digests[0],
+        }
+        if source_manifest is not None:
+            result.update(
+                {
+                    "source_state": "SOURCE_TO_RECEIVER_VALIDATED",
+                    "source_manifest_digest": self._manifest_digest(
+                        source_manifest
+                    ),
+                }
+            )
+        return result
+
     async def bootstrap_target(
         self,
         key: ReplicaKey,
@@ -195,6 +399,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             ray_cls_with_init=replicas[0].get_ray_class_with_init_args(),
             name_prefix=f"bootstrap_{operation_id}_",
             use_gpu=True,
+            device_name=get_device_name(),
         )
         actor_wg = self.actor_wg
         topology_started = False
@@ -227,10 +432,22 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                 )
                 if not released_gpu_uuids:
                     raise RuntimeError(
-                        "native RESTORE target has no verified physical GPU UUID"
+                        "native RESTORE target has no verified physical accelerator id"
                     )
                 await asyncio.gather(
                     *[replica.wake_up(tags=["weights"]) for replica in replicas]
+                )
+                print(
+                    "RESTORE_BOOTSTRAP_STAGE "
+                    + json.dumps(
+                        {
+                            "stage": "weights-wake-complete",
+                            "operation_id": operation_id,
+                            "replica": repr(key),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
                 )
 
             # Borrowed ADD targets are resident and use VERL's native
@@ -243,6 +460,18 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
 
             topology_started = True
             self.build_process_group(rollout)
+            print(
+                "RESTORE_BOOTSTRAP_STAGE "
+                + json.dumps(
+                    {
+                        "stage": "checkpoint-topology-ready",
+                        "operation_id": operation_id,
+                        "replica": repr(key),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
             # Keep native VERL synchronization semantics here. Its
             # CheckpointEngineManager.update_weights() is async but deliberately
@@ -250,12 +479,36 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             # only this target path to a background thread/future would let the
             # Trainer event loop progress while G still protects an in-flight
             # collective, diverging from the native ordering contract.
+            print(
+                "RESTORE_BOOTSTRAP_STAGE "
+                + json.dumps(
+                    {
+                        "stage": "weight-transfer-start",
+                        "operation_id": operation_id,
+                        "replica": repr(key),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
             ray.get(
                 actor_wg.update_weights(
                     global_steps=loaded_version,
                     mode=self.backend,
                 )
                 + rollout.update_weights(global_steps=loaded_version)
+            )
+            print(
+                "RESTORE_BOOTSTRAP_STAGE "
+                + json.dumps(
+                    {
+                        "stage": "weight-transfer-complete",
+                        "operation_id": operation_id,
+                        "replica": repr(key),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
             )
 
             ray.get(
@@ -267,9 +520,33 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                 )
             )
             finalized = True
+            print(
+                "RESTORE_BOOTSTRAP_STAGE "
+                + json.dumps(
+                    {
+                        "stage": "checkpoint-finalize-complete",
+                        "operation_id": operation_id,
+                        "replica": repr(key),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
             await asyncio.gather(
                 *[replica.resume_kv_cache() for replica in replicas]
+            )
+            print(
+                "RESTORE_BOOTSTRAP_STAGE "
+                + json.dumps(
+                    {
+                        "stage": "kv-resume-complete",
+                        "operation_id": operation_id,
+                        "replica": repr(key),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
             )
             health = await asyncio.gather(
                 *[replica.validate_server_runtime() for replica in replicas]
@@ -277,6 +554,22 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             if any(item.get("global_steps") != loaded_version for item in health):
                 raise RuntimeError(
                     "target server did not confirm the published parameter version"
+                )
+
+            if self.parameter_validation_enabled:
+                source_manifest = (
+                    await self._get_source_manifest()
+                    if self.source_validation_enabled
+                    else None
+                )
+                validation = await self.validate_parameter_sync(
+                    replicas,
+                    expected_version=loaded_version,
+                    source_manifest=source_manifest,
+                )
+                print(
+                    "CE_PARAMETER_VALIDATION "
+                    + json.dumps(validation, sort_keys=True)
                 )
 
             evidence = OperationEvidence.now(

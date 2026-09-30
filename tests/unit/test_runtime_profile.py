@@ -50,6 +50,14 @@ def test_valid_profile_is_not_mutated():
     assert current == before
 
 
+def test_npu_profile_is_valid_after_verl_device_autodetection():
+    current = config()
+    current["trainer"]["device"] = "npu"
+    before = copy.deepcopy(current)
+    assert validate_runtime_profile(current)
+    assert current == before
+
+
 @pytest.mark.parametrize(
     "disabled",
     [
@@ -90,7 +98,7 @@ def test_enabled_switch_requires_boolean(value):
         ("actor_rollout_ref.rollout.calculate_log_probs", False),
         ("actor_rollout_ref.rollout.enable_sleep_mode", False),
         ("actor_rollout_ref.rollout.free_cache_engine", False),
-        ("trainer.device", "npu"),
+        ("trainer.device", "cpu"),
         ("data.train_batch_size", 1),
         ("data.gen_batch_size", 2),
     ],

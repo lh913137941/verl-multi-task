@@ -1,0 +1,233 @@
+# D4 开发记录：TaskRunner 创建入口与 LB READY
+
+## 1. 目标和边界
+
+D0–D4 的统一综合验收方案见 [comprehensive_acceptance_test.md](comprehensive_acceptance_test.md)。本文件只记录 D4 的实现细节和阶段脚本，不能替代综合验收。
+
+新增的训练期真实 E2E fixture 见 [D0_D4_e2e_develop.md](D0_D4_e2e_develop.md)。
+本文前六节保留默认 D4 smoke 的实现与历史验证；当前综合脚本使用 E2E 模式，见第 7 节。
+
+D4 把 D2 的 borrowed runtime 创建和 D3 的 CE bootstrap 接到一个任务级命令入口：
+
+```text
+TaskRunner.execute_replica_operation(create, spec)
+  -> Rollouter.create_borrowed_replica(spec)
+  -> Trainer.register_replica(replica_rank)
+  -> Trainer.bootstrap_replica(replica_rank)
+  -> Rollouter.commit_replica_ready(replica_rank)
+  -> MultiTaskGlobalRequestLoadBalancer.commit_ready()
+  -> LB_READY receipt
+```
+
+本阶段只实现创建、首次参数同步和 READY 发布。生产级 donor sleep/wake、请求 drain/abort、
+LB `begin_drain/commit_remove`、通信域恢复、reclaim 和 destroy 仍由后续 lifecycle 开发；
+D4 的清理仅是测试辅助清理，不代表资源已经具备生产回收语义。
+
+## 2. 修改内容
+
+### 2.1 `MultiTaskGlobalRequestLoadBalancer`
+
+文件：`src/multi_task_scheduler/rollout/load_balancer.py`
+
+新增 `commit_ready(servers: dict[str, ActorHandle]) -> dict`：
+
+1. 校验 server ID 和 handle；
+2. 对已存在的同 ID/同 ActorHandle 请求幂等返回，保留原有 inflight 计数；
+3. 对同 ID/不同 handle 的旧 runtime 替换请求抛错；
+4. 只把新主 server 加入 `_servers` 和 `_inflight_requests`；
+5. 返回 `READY`、server ID 和新增列表。
+
+该方法没有实现摘流、请求排空或删除。原生 `add_servers()` 没有重复 READY 保护，因此不能
+直接作为 D4 的提交接口。
+
+### 2.2 `MultiTaskLLMServerManager`
+
+文件：`src/multi_task_scheduler/integration/verl/experimental_fully_async/llm_server_manager.py`
+
+新增或扩展：
+
+- `ready_replica_ranks`：本地已提交 LB READY 的任务内 rank 集合；
+- `mark_replica_serving_version()`：同时记录 replica 和 operation 的确认版本；
+- `commit_replica_ready(replica_rank)`：确认 `RUNTIME_READY`、serving version、主 server
+  endpoint 后调用 LB 的 `commit_ready()`，再更新本地地址/句柄投影；
+- `probe_replica_ready(replica_rank)`：D4 测试检查 HTTP server endpoint 和 LB server ID；
+- `sleep_d4_test_donors(spec)`、`cleanup_d4_runtime(replica_rank)`：仅用于 main_ppo D4
+  smoke 的显存释放和测试清理，生产 sleep/wake 与 commit_remove 仍是 TODO；
+- `get_replica_for_ce()`：允许 `RUNTIME_READY` 和 `LB_READY` 状态被 Trainer 查询。
+
+`commit_replica_ready()` 采用短状态转换：`RUNTIME_READY → READY_COMMITTING → LB_READY`。
+LB RPC 失败时恢复到 `RUNTIME_READY` 并保留错误，不返回已发布的假回执。
+
+### 2.3 `MultiTaskFullyAsyncRollouter`
+
+文件：`src/multi_task_scheduler/integration/verl/experimental_fully_async/rollouter.py`
+
+新增薄转发方法：
+
+- `create_borrowed_replica(spec)`；
+- `commit_replica_ready(replica_rank)`；
+- `prepare_d4_runtime_smoke(scenario)`；
+- `probe_replica_ready(replica_rank)`；
+- `cleanup_d4_runtime(replica_rank)`。
+
+Rollouter 不解析 placement、不持有 CE Manager、不持有 GS 句柄，只把命令转发给本任务
+`MultiTaskLLMServerManager`。
+
+### 2.4 `MultiTaskFullyAsyncTaskRunner`
+
+文件：`src/multi_task_scheduler/integration/verl/experimental_fully_async/task_runner.py`
+
+新增：
+
+- Ray Actor `max_concurrency=8`，使训练入口运行时仍能接受管理命令；
+- `_replica_operation_lock`，串行化同一 TaskRunner 的 replica command chain；
+- `execute_replica_operation(operation, request)`：唯一任务级创建编排入口；
+- `_maybe_run_d4_runtime_smoke(config)`：由 main_ppo 显式配置启用的真实 smoke。
+
+创建命令的返回值只包含 metadata、版本、状态和错误，不包含 PG、Worker、server 或 GS
+句柄。`reclaim`、`destroy` 等非创建操作返回 `LIFECYCLE_NOT_IMPLEMENTED` 且
+`released=False`，避免把预留接口误报为完成。
+
+D4 smoke 在 native training 返回后执行，这是为了让 Trainer 已经完成 checkpoint loading、
+拥有稳定参数版本，再调用同一个 TaskRunner 命令入口完成 borrowed bootstrap。生产 GS 命令
+可以在任务运行期间调用同一入口；main_ppo smoke 不声称验证训练中并发调度。
+
+### 2.5 测试文件和脚本
+
+- `tests/unit/test_d4_lifecycle.py`：覆盖 LB READY 幂等、不同 handle 冲突、TaskRunner 调用顺序
+  和不支持的生命周期回执；不启动 Ray/GPU；
+- `D4_test.sh`：沿用 `multi_task_run.sh` 的真实环境、模型和数据配置，通过 main_ppo 执行
+  `basic/split/fragmented/cross_pg` 任一或多个场景；检查 `LB_READY`、endpoint probe、
+  cleanup、严格训练完成回执以及 CE source-to-receiver 参数校验。
+
+## 3. 一键真实测试
+
+在服务器上与 `multi_task_run.sh` 相同的目录运行：
+
+```bash
+# 默认运行 basic
+bash ../D4_test.sh
+
+# 运行四个创建拓扑场景
+D4_RUNTIME_SCENARIOS=basic,split,fragmented,cross_pg bash ../D4_test.sh
+```
+
+脚本会在 `${VERL_REPO_DIR}/logs/d4_runtime/` 保存每个场景日志。通过条件：
+
+1. main_ppo 和 `tee` 的退出码均为 0；
+2. 出现 `D4_RUNTIME_RESULT` 且 JSON 状态为 `LB_READY`；
+3. `probe` 报告 endpoint 可查询且 server 已在 LB；
+4. 出现 `D4_RUNTIME_CLEANUP`；
+5. 非 `shared_bundle` 场景出现 `CE_PARAMETER_VALIDATION` 且包含
+   `source_state=SOURCE_TO_RECEIVER_VALIDATED`；
+6. 出现 `MULTITASK_TRAINING_COMPLETE` 且 `completed_steps == target_steps`。
+
+`Traceback`、`AssertionError` 等文本只保留给故障定位；`LIFECYCLE_NOT_IMPLEMENTED` 仍表示
+当前场景要求的生命周期回执没有实现，属于操作级失败。
+
+脚本中的 `sleep_for_runtime_test()` 仅用于释放同卡 donor 的测试显存，`cleanup_d4_runtime()`
+使用测试 teardown 删除路由并杀死本次创建 Actor；它们不能证明生产 sleep/wake、drain 或
+claim 归还已经完成。
+
+测试 fixture 在 donor 逐个休眠或 READY 后检查失败时执行 best-effort 唤醒/清理；如果清理
+本身失败，TaskRunner 会记录 warning，脚本会因缺少 `D4_RUNTIME_CLEANUP` 或进程异常而失败，
+不能把残留资源当成通过。
+
+## 4. 分层验证
+
+### U：本地无 GPU
+
+```bash
+uv run --no-project --no-cache python -m pytest -q -p no:cacheprovider \
+  tests/unit/test_d4_lifecycle.py \
+  tests/unit/test_checkpoint_membership.py \
+  tests/unit/test_borrowed_runtime.py \
+  tests/unit/test_borrowed_contract.py \
+  tests/unit/test_wiring.py \
+  tests/unit/test_hccl_checkpoint_engine.py
+```
+
+本机执行结果（不包含真实 Ray/GPU）：
+
+```text
+41 passed in 0.44s
+```
+
+这组用例同时覆盖 D4 新增的 READY 幂等和调用顺序，以及 D1-D3 的回归用例。
+完整 `tests/unit` 收集时，本机环境还缺少 `omegaconf`，因此 `test_entry.py` 和
+`test_runtime_profile.py` 无法收集；这属于测试环境依赖缺失，不把它记为 D4 通过。
+
+### G：真实服务器
+
+```bash
+D4_RUNTIME_SCENARIOS=basic bash ../D4_test.sh
+D4_RUNTIME_SCENARIOS=split,fragmented,cross_pg bash ../D4_test.sh
+```
+
+每个场景需要留存 native/borrowed 的 replica rank、server ID、endpoint、参数版本、Ray
+Actor PID、实际 node/device 映射以及 cleanup 结果。真实 GPU 测试未执行前，不能将 D4
+标记为验收通过。
+
+## 5. 已知限制和后续 TODO
+
+- D4 smoke 在原生训练完成后运行，未验证训练循环中 GS 命令与 rollout/optimizer 并发；
+- `commit_ready()` 已实现，`begin_drain()`、`get_drain_status()`、`commit_remove()` 未实现；
+- donor 的 CE suspend/resume 仍是窄接口，真实 sleep/wake 和 target-only wake sync 由其他
+  lifecycle 开发负责；
+- D4 cleanup 直接使用测试 teardown，不代表 `released=True` 或全局 claims 已归还；
+- GS 当前只保存 TaskRunner handles，尚未实现真实 selected_slots 账务和跨任务调度策略。
+- `D4_test.sh` 自身使用旧 Bash 可用语法，但它复用的 `multi_task_run.sh` 必须保持服务器上
+  已验证的 Bash 版本兼容性；脚本不会替换该既有启动入口。
+
+## 6. S5 / S7 / S8 / S9 服务器反馈修复（2026-09-25）
+
+本次仅修改插件。根因与原始错误节选详见 [issue.md 第 11 节](../issue.md#11-s5s7s8s9-批量回归失败2026-09-25)。
+
+| 文件 | 修改内容与目的 |
+| --- | --- |
+| `rollout/replica.py` | 端口任务显式请求 0 CPU，避免 S5 第二次创建时被首 bundle 的 0.5 CPU 余量阻塞；保留 PG/bundle 约束。增加创建阶段、超时诊断与实际 CE 设备映射日志；校验 NPU 设备顺序。 |
+| `integration/verl/experimental_fully_async/llm_server_manager.py` | 合并 NPU claims 时先按真实设备数值排序，再分配 borrower rank；修正 snapshot 中设备索引；创建失败保留类型、原因链、阶段和 traceback。 |
+| `integration/verl/experimental_fully_async/rollouter.py` | 仅在测试入口将 S8/S9 映射为 basic placement，其他场景按原名处理。 |
+| `integration/verl/experimental_fully_async/task_runner.py` | S8/S9 按 spec 的 world_size/节点数校验 Worker/server 数量；保留串行/并发两次 create 和同 rank/server 断言，断言失败后注销已注册 CE。 |
+| `tests/unit/test_borrowed_runtime.py`、`test_borrowed_contract.py`、`test_d4_lifecycle.py` | 加入资源余量、设备合并顺序、错误诊断、场景映射及 TP=4 重试链路回归；无真实 Actor/NPU。 |
+
+S7 排序修复基于已复现的代码问题，不能仅凭 ACL 错误认定是上一场景残留。端口任务不
+使用加速器；CE Worker 继续按 claim 请求资源。测试 helper 的排序不会重排生产 GS spec，
+不会修改 donor PG，sleep/wake/reclaim/destroy 仍保持既有开发边界。
+
+本地验证命令：
+
+```bash
+python -m pytest -q -p no:cacheprovider \
+  tests/unit/test_borrowed_runtime.py tests/unit/test_borrowed_contract.py \
+  tests/unit/test_d4_lifecycle.py tests/unit/test_checkpoint_membership.py \
+  tests/unit/test_hccl_checkpoint_engine.py
+```
+
+使用仓库 `.venv` 解释器执行，结果 **60 passed**。真实 NPU 测试尚未在本机执行。
+
+服务器可使用 `D0_D4_BATCH_SCENARIOS=S5,S7,S8,S9 bash ../D0_D4_batch_test.sh` 依次复测。
+S5 应出现两份真实 placement、`PLACEMENT_READY` 和 cleanup；S7 应完成合并后的
+`RUNTIME_READY -> CE bootstrap -> LB_READY`；S8/S9 应出现各自幂等结果，默认 TP=4
+时 `worker_count=expected_worker_count=4`、`server_count=expected_server_count=1`。
+上述为引入 E2E fixture 前的 smoke 复测证据；当时完整生成/同步覆盖不足会记为
+`INCOMPLETE`。当前综合脚本按第 7 节的单条完整 E2E 回执判定。
+
+## 7. 真实 E2E 验收补充（2026-09-25）
+
+`D4_E2E_TEST=1` 关闭旧 D4 smoke 并启用 `multitask.e2e_test`，在原生 fit 前通过已有
+create 入口建立 borrowed runtime，执行真实生成，在原生训练期保留 borrowed 并记录
+optimizer 后普通 CE 同步、source/receiver manifest 和生成审计；结束后验证新版本
+生成、测试资源清理及 donor 最新参数真实同步和生成。默认 D4 smoke 保持原行为。
+E2E 默认训练两步，旧 smoke 仍默认一步。
+
+综合 S1–S5、S7–S9、S16 自动使用此路径。S2 现在同时保留两个 TP=2 borrower；
+S3/S7 使用两个 TP=2 donor 的全部四个 claims；S5 串行激活 A→B 训练→A 恢复；S16
+在训练前后分别发起至少四个并发真实请求。唯一 `D0_D4_E2E_RESULT` 回执必须同时满足
+进程退出码和结构化证据校验，不能仅凭 READY/PASSED 字样，也不再固定返回 INCOMPLETE。
+
+S6 跨节点、S15 独立 Task/公平性仍为 `BLOCKED`。测试 sleep/wake 和 teardown 不代表
+生产生命周期实现。整合单元回归 **252 passed**，未执行依赖指定原生源码接线的
+`test_entry.py` 16 项；三个验收脚本的 Git Bash 语法检查通过。本机未运行真实 NPU E2E。
+文件职责、整合验证与服务器命令见
+[E2E 开发记录](D0_D4_e2e_develop.md)。

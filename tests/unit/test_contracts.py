@@ -100,11 +100,14 @@ def test_lease_requires_claim_source_owner_and_physical_validation_keys():
             Lease("l1", (invalid,), 0)
 
 
-def test_lease_rejects_legacy_claim_lease_id_alias():
+def test_lease_normalizes_legacy_claim_lease_id_to_source_lease_id():
     legacy = claim()
     legacy["lease_id"] = legacy.pop("source_lease_id")
-    with pytest.raises(ValueError, match="source_lease_id"):
-        Lease("borrower-lease", (legacy,), 0)
+    lease = Lease("borrower-lease", (legacy,), 0)
+    assert lease.claims[0]["source_lease_id"] == "source-lease-0"
+    assert "lease_id" not in lease.claims[0]
+    assert lease.claim_ids == ("claim-0",)
+    assert lease.source_lease_ids == ("source-lease-0",)
 
 
 def test_first_release_lease_rejects_claims_from_multiple_donor_replicas():

@@ -1,0 +1,103 @@
+"""Native receiver extension with an opt-in per-parameter audit manifest."""
+
+import hashlib
+import json
+import os
+
+import torch
+
+from verl.checkpoint_engine.base import CheckpointEngineWorker
+from verl.single_controller.base.decorator import Dispatch, register
+from verl.workers.rollout.utils import ensure_async_iterator
+
+
+class MultiTaskCheckpointEngineWorker(CheckpointEngineWorker):
+    """Record receiver-side parameter fingerprints while reusing native transport."""
+
+    def __init__(self, *args, **kwargs):
+        try:
+            super().__init__(*args, **kwargs)
+        except Exception as error:
+            if "EADDRINUSE" in str(error) or "address already in use" in str(error).lower():
+                # Observe the rendezvous actually selected by Ray/native verl.
+                # Changing just rank 0's port would strand every other rank.
+                diagnostic = {key: os.environ.get(key) for key in
+                              ("RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT", "DIST_INIT_METHOD", "WG_PREFIX")}
+                diagnostic.update(pid=os.getpid(), replica_rank=kwargs.get("replica_rank"), error=str(error))
+                print("CE_RENDEZVOUS_CONFLICT " + json.dumps(diagnostic, sort_keys=True), flush=True)
+            raise
+        self.parameter_validation_enabled = (
+            os.environ.get("MULTITASK_PARAMETER_VALIDATION", "0") == "1"
+            or os.environ.get("MULTITASK_SOURCE_VALIDATION", "0") == "1"
+        )
+        self._last_parameter_manifest = {
+            "complete": False,
+            "global_steps": None,
+            "wire_format": None,
+            "parameters": [],
+            "parameter_count": 0,
+            "total_numel": 0,
+        }
+
+    @staticmethod
+    def _tensor_sha256(tensor: torch.Tensor) -> str:
+        # Hash the exact contiguous byte representation without moving the
+        # tensor payload back to the driver or retaining a second model copy.
+        raw = tensor.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()
+        return hashlib.sha256(raw).hexdigest()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def update_weights(self, global_steps: int = None):
+        """Reuse native receive/load flow and retain one entry per parameter."""
+        if not self.parameter_validation_enabled:
+            return await super().update_weights(global_steps=global_steps)
+        wire_format = getattr(self.checkpoint_engine, "wire_format", "named_tensors")
+        manifest = {
+            "complete": False,
+            "global_steps": global_steps,
+            "wire_format": wire_format,
+            "parameters": [],
+            "parameter_count": 0,
+            "total_numel": 0,
+        }
+        # Publish this attempt before any await: cancellation or a failed receive
+        # must not leave the previous transfer advertised as complete.
+        self._last_parameter_manifest = manifest
+        if wire_format != "named_tensors":
+            raise NotImplementedError(
+                f"per-parameter validation currently requires wire_format='named_tensors', got {wire_format!r}"
+            )
+
+        received = self.checkpoint_engine.receive_weights(global_steps=global_steps)
+        stream_consumed = False
+
+        async def audited_weights():
+            nonlocal stream_consumed
+            async for name, tensor in ensure_async_iterator(received):
+                manifest["parameters"].append(
+                    {
+                        "name": str(name),
+                        "shape": list(tensor.shape),
+                        "dtype": str(tensor.dtype),
+                        "numel": int(tensor.numel()),
+                        "sha256": self._tensor_sha256(tensor),
+                    }
+                )
+                manifest["parameter_count"] += 1
+                manifest["total_numel"] += int(tensor.numel())
+                yield name, tensor
+            stream_consumed = True
+
+        await self.server_adapter.update_weights(
+            audited_weights(),
+            global_steps=global_steps,
+            wire_format=wire_format,
+        )
+        if not stream_consumed or not manifest["parameters"]:
+            raise RuntimeError("parameter manifest requires a fully consumed nonempty weight stream")
+        manifest["complete"] = True
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_parameter_manifest(self) -> dict:
+        """Return only the last receiver-side audit metadata."""
+        return self._last_parameter_manifest
