@@ -326,7 +326,8 @@ class MultiTaskvLLMReplica(vLLMReplica):
             except BaseException as cleanup_exc:
                 self.workers = []
                 raise RuntimeError(
-                    "borrowed CE creation failed and actor cleanup is unverified"
+                    "borrowed CE creation failed: "
+                    f"{type(exc).__name__}: {exc}; actor cleanup is unverified"
                 ) from cleanup_exc
             self.workers = []
             raise exc
@@ -447,7 +448,8 @@ class MultiTaskvLLMReplica(vLLMReplica):
                 await self.cleanup_borrowed_runtime()
             except BaseException as cleanup_exc:
                 raise RuntimeError(
-                    "borrowed runtime creation failed and cleanup is unverified"
+                    "borrowed runtime creation failed: "
+                    f"{type(exc).__name__}: {exc}; cleanup is unverified"
                 ) from cleanup_exc
             raise exc
 
