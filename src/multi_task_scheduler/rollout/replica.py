@@ -151,7 +151,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
     def build_borrowed_worker_plan(self, spec: dict) -> dict:
         """Build deterministic TP=1 CE actor placement metadata."""
         self.validate_placement(spec)
-        prefix = f"borrowed_ce_{self.replica_rank}_"
+        prefix = f"borrowed_ce_{self.replica_rank}{self.name_suffix}_"
         claim = spec["claims"][0]
         self.placement_claims = (dict(claim),)
         self.borrowed_server_names = (
