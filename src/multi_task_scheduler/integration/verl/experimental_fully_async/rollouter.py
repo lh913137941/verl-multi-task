@@ -60,6 +60,23 @@ class _ContinuationAwareServer:
         if getattr(output, "stop_reason", None) not in {"abort", "aborted"}:
             return output
 
+        # VERL rewrites the remaining max_tokens budget after an aborted
+        # attempt, but currently leaves min_tokens at its original logical
+        # request value. Keep the same semantics for the minimum budget:
+        # tokens already produced before FORCE handoff count toward min_tokens.
+        sampling_params = kwargs.get("sampling_params")
+        emitted_tokens = len(getattr(output, "token_ids", ()) or ())
+        if (
+            isinstance(sampling_params, dict)
+            and emitted_tokens > 0
+            and isinstance(sampling_params.get("min_tokens"), int)
+            and not isinstance(sampling_params.get("min_tokens"), bool)
+        ):
+            sampling_params["min_tokens"] = max(
+                0,
+                sampling_params["min_tokens"] - emitted_tokens,
+            )
+
         # FullyAsyncLLMServerClient will retry exactly prompt_ids + token_ids.
         prefix_digest = _continuation_prefix_digest(
             kwargs.get("prompt_ids", ()),
