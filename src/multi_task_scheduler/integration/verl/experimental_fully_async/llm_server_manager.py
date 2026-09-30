@@ -1,3 +1,4 @@
+import hashlib
 """Native Fully Async server manager plus the Manager-owned M view."""
 
 import asyncio
@@ -421,6 +422,9 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
 
             # Keep ownership of the runtime before any awaited initialization so
             # a failing init can still report/perform verified cleanup.
+            lease_name = hashlib.sha256(
+                lease_id.encode("utf-8")
+            ).hexdigest()[:12]
             runtime = self.rollout_replica_class(
                 replica_rank=resolved_spec["replica_rank"],
                 config=self.rollout_config,
@@ -430,6 +434,10 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 placement_claims=resolved_spec["claims"],
                 runtime_epoch=resolved_spec["placement_epoch"],
                 max_colocate_count=FIRST_RELEASE_MAX_COLOCATE_COUNT,
+                name_suffix=(
+                    f"borrowed_{lease_name}_"
+                    f"{resolved_spec['placement_epoch']}"
+                ),
             )
             runtime_receipt = await runtime.init_from_lease(
                 resolved_spec,
