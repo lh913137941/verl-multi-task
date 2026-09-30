@@ -89,16 +89,22 @@ def _ascend_supports_rl_config() -> bool:
 
 
 def _ascend_rl_engine_kwargs() -> dict:
-    """Select exactly one Ascend RL configuration contract."""
+    """Select exactly one Ascend RL/sleep configuration contract."""
     if _ascend_supports_rl_config():
         additional_config = {
             "rl_config": {
                 "enabled": True,
+                "sleep_mode_extra_cleanup": True,
             }
         }
     else:
-        # Pre-rl_config releases used the top-level ND/NZ switch.
-        additional_config = {"weight_nz_mode": 0}
+        # vLLM-Ascend releases/v0.23.0 exposes same-device sleep cleanup at
+        # top-level additional_config. It releases HCCL process groups and ACL
+        # graph/workspace memory before a borrower starts on the same NPU.
+        additional_config = {
+            "weight_nz_mode": 0,
+            "enable_sleep_mode_extra_cleanup": True,
+        }
 
     return {
         "vllm": {
