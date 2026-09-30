@@ -442,6 +442,7 @@ import torch_npu  # noqa: F401
 records = []
 for index in range(torch.npu.device_count()):
     try:
+        _ = torch.tensor(0, device=torch.device("npu", index))
         free_bytes, total_bytes = torch.npu.mem_get_info(index)
     except Exception as exc:
         records.append(
