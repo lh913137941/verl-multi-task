@@ -911,6 +911,37 @@ def _config(
     return config
 
 
+def _print_ray_acceptance_state(ray, label: str) -> None:
+    """Emit compact Ray resource/actor facts when an NPU acceptance stage stalls."""
+    try:
+        available = ray.available_resources()
+    except BaseException as exc:
+        available = {"error": f"{type(exc).__name__}: {exc}"}
+    try:
+        cluster = ray.cluster_resources()
+    except BaseException as exc:
+        cluster = {"error": f"{type(exc).__name__}: {exc}"}
+    try:
+        actors = []
+        for state in list_actors():
+            value = state.state if hasattr(state, "state") else state.get("state")
+            name = state.name if hasattr(state, "name") else state.get("name")
+            if value != "DEAD":
+                actors.append({"name": name, "state": value})
+    except BaseException as exc:
+        actors = [{"error": f"{type(exc).__name__}: {exc}"}]
+    print(
+        "NPU_ACCEPTANCE_RAY_STATE",
+        {
+            "stage": label,
+            "available_resources": available,
+            "cluster_resources": cluster,
+            "non_dead_actors": actors[-20:],
+        },
+        flush=True,
+    )
+
+
 def _exercise_same_npu_borrower(
     *,
     donor_replica,
@@ -982,8 +1013,32 @@ def _exercise_same_npu_borrower(
         "placement_epoch": 0,
     }
 
-    create_receipt = asyncio.run(
-        borrower_manager.create_borrowed_replica(borrowed_spec)
+    print(
+        "NPU_ACCEPTANCE_STAGE",
+        {"stage": "borrower-create-start", "token": token},
+        flush=True,
+    )
+    _print_ray_acceptance_state(ray, "borrower-create-start")
+    try:
+        create_receipt = asyncio.run(
+            asyncio.wait_for(
+                borrower_manager.create_borrowed_replica(borrowed_spec),
+                timeout=360.0,
+            )
+        )
+    except TimeoutError:
+        _print_ray_acceptance_state(ray, "borrower-create-timeout")
+        raise TimeoutError(
+            "borrowed runtime did not reach RUNTIME_READY within 360s"
+        ) from None
+    print(
+        "NPU_ACCEPTANCE_STAGE",
+        {
+            "stage": "borrower-create-ready",
+            "token": token,
+            "server_address": create_receipt.get("server_address"),
+        },
+        flush=True,
     )
     assert create_receipt["state"] == "RUNTIME_READY"
 
@@ -996,6 +1051,11 @@ def _exercise_same_npu_borrower(
     assert borrowed_placement[0]["node_id"] == placement["node_id"]
     assert borrowed_placement[0]["resource_name"] == "NPU"
 
+    print(
+        "NPU_ACCEPTANCE_STAGE",
+        {"stage": "borrower-generate-start", "token": token},
+        flush=True,
+    )
     output = ray.get(
         borrowed_runtime._server_handle.generate.remote(
             request_id=f"{token}-generate-{uuid4().hex}",
@@ -1005,13 +1065,31 @@ def _exercise_same_npu_borrower(
         ),
         timeout=120,
     )
+    print(
+        "NPU_ACCEPTANCE_STAGE",
+        {"stage": "borrower-generate-done", "token": token},
+        flush=True,
+    )
     assert getattr(output, "token_ids", None)
 
+    print(
+        "NPU_ACCEPTANCE_STAGE",
+        {"stage": "borrower-destroy-start", "token": token},
+        flush=True,
+    )
     destroy_evidence = asyncio.run(
-        borrower_manager.destroy(
-            borrowed_key,
-            operation_id=f"{token}-remove",
+        asyncio.wait_for(
+            borrower_manager.destroy(
+                borrowed_key,
+                operation_id=f"{token}-remove",
+            ),
+            timeout=60.0,
         )
+    )
+    print(
+        "NPU_ACCEPTANCE_STAGE",
+        {"stage": "borrower-destroy-done", "token": token},
+        flush=True,
     )
     assert destroy_evidence.type is EvidenceType.RELEASED
     assert destroy_evidence.released_gpu_uuids == (physical_id,)
@@ -1150,7 +1228,22 @@ def test_real_npu_sleep_releases_same_slot_to_borrower():
             gpus_per_node=1,
             replica_kind=ReplicaKind.NATIVE,
         )
-        asyncio.run(_init_standalone_with_diagnostics(replica))
+        print(
+            "NPU_ACCEPTANCE_STAGE",
+            {"stage": "donor-init-start"},
+            flush=True,
+        )
+        asyncio.run(
+            asyncio.wait_for(
+                _init_standalone_with_diagnostics(replica),
+                timeout=360.0,
+            )
+        )
+        print(
+            "NPU_ACCEPTANCE_STAGE",
+            {"stage": "donor-init-ready"},
+            flush=True,
+        )
         placement = asyncio.run(replica.worker_placements())[0]
         assert placement["resource_name"] == "NPU"
         assert placement["gpu_uuid"].startswith("NPU:")
@@ -1183,8 +1276,21 @@ def test_real_npu_sleep_releases_same_slot_to_borrower():
         manager._runtime_inventory = {key: replica}
         manager._native_release_evidence = {}
 
+        print(
+            "NPU_ACCEPTANCE_STAGE",
+            {"stage": "donor-sleep-start"},
+            flush=True,
+        )
         release = asyncio.run(
-            manager.sleep(key, operation_id="npu-donate")
+            asyncio.wait_for(
+                manager.sleep(key, operation_id="npu-donate"),
+                timeout=120.0,
+            )
+        )
+        print(
+            "NPU_ACCEPTANCE_STAGE",
+            {"stage": "donor-sleep-done"},
+            flush=True,
         )
         assert release.type is EvidenceType.RELEASED
         assert release.released_gpu_uuids == (placement["gpu_uuid"],)
