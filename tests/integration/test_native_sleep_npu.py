@@ -1699,7 +1699,11 @@ def test_real_npu_restore_reinstalls_current_vpub_and_generates_again(monkeypatc
 
     checkpoint_config = CheckpointEngineConfig(
         backend="nccl",
-        update_weights_bucket_megabytes=64,
+        # Ascend falls back to host shared memory when accelerator IPC is not
+        # available. In that path each full tensor must fit in one vLLM weight
+        # bucket; Qwen3-0.6B's embedding is ~297 MiB in bf16 (~594 MiB in fp32).
+        # Keep this below VERL's 2048 MiB default while remaining valid for both.
+        update_weights_bucket_megabytes=1024,
         engine_kwargs={"nccl": {"rebuild_group": True}},
     )
     model_config = HFModelConfig(
