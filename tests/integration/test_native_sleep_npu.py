@@ -959,7 +959,7 @@ def test_real_npu_backend_smoke_loads_and_generates_plain_model():
 
     class NoWorkerExtensionServer(vLLMHttpServer):
         def _get_worker_extension_cls(self):
-            return None
+            return ""
 
     class NoWorkerExtensionReplica(vLLMReplica):
         def __init__(self, *args, **kwargs):
@@ -1258,6 +1258,8 @@ def test_real_npu_force_remove_continues_on_another_replica():
             rollouter.config = config
             rollouter.llm_server_manager = Manager()
             rollouter._pending_operation_targets = {}
+            rollouter._force_exit_recovery = {}
+            rollouter._force_handoff_timeout_s = 30.0
 
             exit_ready = await rollouter.prepare_exit(
                 target_key,
