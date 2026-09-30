@@ -430,6 +430,102 @@ def _visible_npu_devices() -> str:
     return ",".join(str(index) for index in range(count))
 
 
+def _probe_visible_npu_memory() -> tuple[dict, ...]:
+    """Return free/total memory for each currently visible Ascend device."""
+    env = os.environ.copy()
+    env["ASCEND_RT_VISIBLE_DEVICES"] = _visible_npu_devices()
+    script = r"""
+import json
+import torch
+import torch_npu  # noqa: F401
+
+records = []
+for index in range(torch.npu.device_count()):
+    try:
+        free_bytes, total_bytes = torch.npu.mem_get_info(index)
+    except Exception as exc:
+        records.append(
+            {
+                "index": index,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        continue
+    records.append(
+        {
+            "index": index,
+            "free_bytes": int(free_bytes),
+            "total_bytes": int(total_bytes),
+        }
+    )
+print("NPU_MEMORY_PROBE " + json.dumps(records), flush=True)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    marker = "NPU_MEMORY_PROBE "
+    line = next(
+        (item for item in result.stdout.splitlines() if item.startswith(marker)),
+        None,
+    )
+    if line is None:
+        raise RuntimeError(
+            "failed to query visible NPU memory: "
+            + (result.stderr.strip() or result.stdout.strip() or "no output")
+        )
+    payload = json.loads(line[len(marker):])
+    if not isinstance(payload, list):
+        raise TypeError("NPU memory probe returned a non-list payload")
+    return tuple(dict(item) for item in payload)
+
+
+def _select_direct_smoke_npu(*, min_free_gib: float) -> tuple[str, float]:
+    """Pick the visible NPU with the most free memory for direct subprocesses."""
+    configured = [
+        item.strip()
+        for item in _visible_npu_devices().split(",")
+        if item.strip()
+    ]
+    records = _probe_visible_npu_memory()
+    candidates = []
+    for record in records:
+        free_bytes = record.get("free_bytes")
+        total_bytes = record.get("total_bytes")
+        index = record.get("index")
+        if (
+            type(index) is not int
+            or type(free_bytes) is not int
+            or type(total_bytes) is not int
+            or index < 0
+            or index >= len(configured)
+            or total_bytes <= 0
+        ):
+            continue
+        candidates.append((free_bytes, total_bytes, index))
+    if not candidates:
+        pytest.skip("could not query free memory for any visible Ascend NPU")
+
+    free_bytes, total_bytes, index = max(candidates)
+    free_gib = free_bytes / (1024**3)
+    total_gib = total_bytes / (1024**3)
+    if free_gib < min_free_gib:
+        pytest.skip(
+            "direct NPU backend smoke requires at least "
+            f"{min_free_gib:.1f} GiB free on one visible NPU; "
+            f"best device has {free_gib:.2f}/{total_gib:.2f} GiB free"
+        )
+
+    # Keep the vLLM reservation comfortably below currently free memory.
+    # Layout probing stops before checkpoint loading, while full smoke needs
+    # room for the model plus runtime/KV overhead.
+    utilization = min(0.40, max(0.03, (free_bytes / total_bytes) * 0.70))
+    return configured[index], utilization
+
+
 def _runtime_env() -> dict:
     env_vars = {
         "VERL_PLATFORM": "huawei",
@@ -515,14 +611,21 @@ async def _init_standalone_with_diagnostics(replica) -> None:
 
 def _run_direct_qwen3_layout_probe(model_path: str) -> None:
     """Inspect the constructed Qwen3 parameter layout before loading weights."""
+    device, utilization = _select_direct_smoke_npu(min_free_gib=1.5)
     env = os.environ.copy()
-    visible = env.get("ASCEND_RT_VISIBLE_DEVICES")
-    if visible:
-        env["ASCEND_RT_VISIBLE_DEVICES"] = visible.split(",", 1)[0].strip()
-    else:
-        env["ASCEND_RT_VISIBLE_DEVICES"] = "0"
+    env["ASCEND_RT_VISIBLE_DEVICES"] = device
     env["VLLM_USE_V1"] = "1"
     env["VERL_MULTITASK_DIRECT_SMOKE_MODEL"] = model_path
+    env["VERL_MULTITASK_DIRECT_SMOKE_UTILIZATION"] = str(utilization)
+    print(
+        "DIRECT_NPU_SELECTION",
+        {
+            "stage": "layout",
+            "device": device,
+            "gpu_memory_utilization": utilization,
+        },
+        flush=True,
+    )
 
     script = r"""
 import os
@@ -585,12 +688,15 @@ def _probe(self, model, model_config):
 DefaultModelLoader.load_weights = _probe
 
 model = os.environ["VERL_MULTITASK_DIRECT_SMOKE_MODEL"]
+utilization = float(
+    os.environ["VERL_MULTITASK_DIRECT_SMOKE_UTILIZATION"]
+)
 try:
     LLM(
         model=model,
         dtype="bfloat16",
         tensor_parallel_size=1,
-        gpu_memory_utilization=0.4,
+        gpu_memory_utilization=utilization,
         max_model_len=512,
         max_num_seqs=1,
         enforce_eager=True,
@@ -624,15 +730,13 @@ def _run_direct_vllm_ascend_smoke(
     distributed_executor_backend: str | None,
 ) -> None:
     """Validate vLLM-Ascend directly, without VERL, Ray, or worker extensions."""
+    device, utilization = _select_direct_smoke_npu(min_free_gib=6.0)
     env = os.environ.copy()
-    visible = env.get("ASCEND_RT_VISIBLE_DEVICES")
-    if visible:
-        env["ASCEND_RT_VISIBLE_DEVICES"] = visible.split(",", 1)[0].strip()
-    else:
-        env["ASCEND_RT_VISIBLE_DEVICES"] = "0"
+    env["ASCEND_RT_VISIBLE_DEVICES"] = device
     env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     env["VLLM_USE_V1"] = "1"
     env["VERL_MULTITASK_DIRECT_SMOKE_MODEL"] = model_path
+    env["VERL_MULTITASK_DIRECT_SMOKE_UTILIZATION"] = str(utilization)
     env["VERL_MULTITASK_DIRECT_SMOKE_BACKEND"] = (
         distributed_executor_backend or ""
     )
@@ -687,20 +791,27 @@ Qwen2Model.load_weights = _diagnostic_qwen2_load_weights
 
 model = os.environ["VERL_MULTITASK_DIRECT_SMOKE_MODEL"]
 backend = os.environ["VERL_MULTITASK_DIRECT_SMOKE_BACKEND"]
+utilization = float(
+    os.environ["VERL_MULTITASK_DIRECT_SMOKE_UTILIZATION"]
+)
 kwargs = {}
 if backend:
     kwargs["distributed_executor_backend"] = backend
 
 print(
     "DIRECT_VLLM_ASCEND_CONFIG",
-    {"backend": backend or "default", "model": model},
+    {
+        "backend": backend or "default",
+        "model": model,
+        "gpu_memory_utilization": utilization,
+    },
     flush=True,
 )
 llm = LLM(
     model=model,
     dtype="bfloat16",
     tensor_parallel_size=1,
-    gpu_memory_utilization=0.4,
+    gpu_memory_utilization=utilization,
     max_model_len=512,
     max_num_seqs=1,
     enforce_eager=True,
