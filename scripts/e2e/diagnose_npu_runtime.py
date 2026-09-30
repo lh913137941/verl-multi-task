@@ -256,6 +256,26 @@ def main() -> int:
 
         print("torch.npu available:", bool(torch.npu.is_available()))
         print("torch.npu count:", int(torch.npu.device_count()))
+        npu_memory = []
+        for index in range(torch.npu.device_count()):
+            try:
+                _ = torch.tensor(0, device=torch.device("npu", index))
+                free_bytes, total_bytes = torch.npu.mem_get_info(index)
+                npu_memory.append(
+                    {
+                        "index": index,
+                        "free_gib": round(free_bytes / (1024**3), 2),
+                        "total_gib": round(total_bytes / (1024**3), 2),
+                    }
+                )
+            except Exception as exc:
+                npu_memory.append(
+                    {
+                        "index": index,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+        print("NPU memory:", npu_memory)
         print(
             "transfer_to_npu loaded after torch_npu import:",
             "torch_npu.contrib.transfer_to_npu" in sys.modules,
