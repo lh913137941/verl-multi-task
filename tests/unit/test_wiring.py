@@ -3421,6 +3421,53 @@ def test_ce_rejects_duplicate_target_runtimes():
         ce.add_effective(key, ["runtime", "runtime"], loaded_version=1)
 
 
+def test_continuation_wrapper_reduces_remaining_min_tokens_after_abort():
+    calls = []
+
+    class Output:
+        stop_reason = "abort"
+        token_ids = [11, 12, 13]
+
+    class Server:
+        generate = AsyncRemoteMethod(lambda *args, **kwargs: Output())
+
+    class LoadBalancer:
+        confirm_continuation = AsyncRemoteMethod(
+            lambda *args: calls.append(args) or object()
+        )
+
+    cls = isolated(
+        f"{INTEGRATION}/rollouter.py",
+        "_ContinuationAwareServer",
+        object,
+        _continuation_prefix_digest=lambda prompt_ids, token_ids: "digest",
+    )
+    wrapper = cls.__new__(cls)
+    wrapper._server = Server()
+    wrapper._load_balancer = LoadBalancer()
+    wrapper._logical_request_id = "request-1"
+    wrapper._client_id = "client-1"
+
+    sampling_params = {
+        "temperature": 0.0,
+        "max_tokens": 128,
+        "min_tokens": 128,
+    }
+    output = asyncio.run(
+        wrapper._generate(
+            request_id="attempt-1",
+            prompt_ids=[1, 2],
+            sampling_params=sampling_params,
+            image_data=None,
+        )
+    )
+
+    assert output.stop_reason == "abort"
+    assert sampling_params["max_tokens"] == 128
+    assert sampling_params["min_tokens"] == 125
+    assert calls == [("request-1", "client-1", "digest")]
+
+
 def test_multitask_client_waits_for_same_request_release_before_reacquire():
     class AwaitableRef:
         def __init__(self):
