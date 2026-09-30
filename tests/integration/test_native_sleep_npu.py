@@ -607,7 +607,7 @@ async def _init_standalone_with_diagnostics(replica) -> None:
                 "worker_extension_cls rather than MultiTask lifecycle logic.",
                 pytrace=False,
             )
-        raise exc
+        raise
 
 
 def _run_direct_qwen3_layout_probe(model_path: str) -> None:
@@ -1045,10 +1045,7 @@ def test_real_npu_backend_smoke_loads_and_generates_plain_model():
     from transformers import AutoTokenizer
 
     from verl.utils.tokenizer import normalize_token_ids
-    from verl.workers.rollout.vllm_rollout.vllm_async_server import (
-        vLLMHttpServer,
-        vLLMReplica,
-    )
+    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
     config = _config(
         model_path,
@@ -1068,15 +1065,6 @@ def test_real_npu_backend_smoke_loads_and_generates_plain_model():
             add_special_tokens=True,
         )
     )
-
-    class NoWorkerExtensionServer(vLLMHttpServer):
-        def _get_worker_extension_cls(self):
-            return ""
-
-    class NoWorkerExtensionReplica(vLLMReplica):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.server_class = ray.remote(NoWorkerExtensionServer)
 
     def run_verl_stage(replica_cls, label: str):
         ray.shutdown()
@@ -1108,11 +1096,9 @@ def test_real_npu_backend_smoke_loads_and_generates_plain_model():
         finally:
             ray.shutdown()
 
-    # Stage 1: keep VERL server/replica orchestration but remove the colocate
-    # worker extension. This isolates VERL CLI/server args from worker patches.
-    run_verl_stage(NoWorkerExtensionReplica, "no-worker-extension")
-
-    # Stage 2: exact upstream VERL vLLMReplica baseline.
+    # Stage 1: exact upstream VERL vLLMReplica baseline. The worker extension
+    # is part of the VERL server contract because run_server() unconditionally
+    # invokes its monkey_patch_model RPC after engine startup.
     run_verl_stage(vLLMReplica, "default-worker-extension")
 
 
