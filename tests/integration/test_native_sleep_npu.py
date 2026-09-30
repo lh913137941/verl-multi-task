@@ -713,16 +713,23 @@ except _LayoutProbeComplete:
         capture_output=True,
         timeout=180,
     )
+    marker = "DIRECT_QWEN3_PRELOAD_LAYOUT"
+    reached_layout = marker in result.stdout
     if result.stdout:
         print("\nDIRECT_QWEN3_LAYOUT_STDOUT\n" + result.stdout, flush=True)
-    if result.stderr:
+    if not reached_layout and result.stderr:
         print("\nDIRECT_QWEN3_LAYOUT_STDERR\n" + result.stderr, flush=True)
-    if "DIRECT_QWEN3_PRELOAD_LAYOUT" not in result.stdout:
+    if not reached_layout:
         pytest.fail(
             "Qwen3 preload layout probe did not reach model construction; "
             "inspect DIRECT_QWEN3_LAYOUT_STDOUT/STDERR above.",
             pytrace=False,
         )
+    print(
+        "DIRECT_QWEN3_PRELOAD_LAYOUT_PROBE_COMPLETE",
+        {"exit_code": result.returncode},
+        flush=True,
+    )
 
 
 def _run_direct_vllm_ascend_smoke(
