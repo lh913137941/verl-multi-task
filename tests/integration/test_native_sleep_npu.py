@@ -981,8 +981,51 @@ def _exercise_same_npu_borrower(
         MultiTaskLLMServerManager
     )
     borrower_task = f"{token}-borrower"
+    class TracingBorrowedReplica(MultiTaskvLLMReplica):
+        async def _create_workers_from_claims(self, spec, pg_by_id):
+            print(
+                "NPU_ACCEPTANCE_STAGE",
+                {"stage": "borrower-ce-create-start", "token": token},
+                flush=True,
+            )
+            result = await super()._create_workers_from_claims(spec, pg_by_id)
+            print(
+                "NPU_ACCEPTANCE_STAGE",
+                {"stage": "borrower-ce-create-done", "token": token},
+                flush=True,
+            )
+            return result
+
+        async def launch_servers(self):
+            print(
+                "NPU_ACCEPTANCE_STAGE",
+                {"stage": "borrower-server-launch-start", "token": token},
+                flush=True,
+            )
+            result = await super().launch_servers()
+            print(
+                "NPU_ACCEPTANCE_STAGE",
+                {"stage": "borrower-server-launch-done", "token": token},
+                flush=True,
+            )
+            return result
+
+        async def validate_server_runtime(self):
+            print(
+                "NPU_ACCEPTANCE_STAGE",
+                {"stage": "borrower-health-start", "token": token},
+                flush=True,
+            )
+            result = await super().validate_server_runtime()
+            print(
+                "NPU_ACCEPTANCE_STAGE",
+                {"stage": "borrower-health-done", "token": token},
+                flush=True,
+            )
+            return result
+
     borrower_manager.task_session = borrower_task
-    borrower_manager.rollout_replica_class = MultiTaskvLLMReplica
+    borrower_manager.rollout_replica_class = TracingBorrowedReplica
     borrower_manager.rollout_config = rollout_config
     borrower_manager.model_config = model_config
     borrower_manager.replica_state = {}
