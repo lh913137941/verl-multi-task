@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import hashlib
 import threading
 import time
 from pathlib import Path
@@ -1911,6 +1912,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     class FakeBorrowedRuntime:
         def __init__(self, **kwargs):
             self.replica_rank = kwargs["replica_rank"]
+            self.name_suffix = kwargs.get("name_suffix", "")
             self.workers = ["worker-0"]
             self.servers = ["server-0"]
             self.borrowed_worker_names = ("worker-name",)
@@ -1947,6 +1949,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
         FIRST_RELEASE_RAY_GPU_FRACTION=FIRST_RELEASE_RAY_GPU_FRACTION,
         asyncio=asyncio,
+        hashlib=hashlib,
         ray=fake_ray,
         time=time,
         _ALLOWED=allowed,
@@ -2094,6 +2097,8 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
     assert manager.replica_state[borrowed_key] is ReplicaState.CREATING
     borrowed_runtime = manager.inspect_runtime(borrowed_key)
     assert borrowed_runtime is not None
+    assert borrowed_runtime.name_suffix.startswith("borrowed_")
+    assert "borrower-lease" not in borrowed_runtime.name_suffix
     assert manager.next_replica_rank == assigned_rank + 1
 
     # Exact replay returns the same hidden runtime receipt without another rank.
@@ -2398,6 +2403,7 @@ def test_borrowed_worker_plan_is_deterministic_and_side_effect_free():
         model_config=object(),
         replica_kind=ReplicaKind.BORROWED,
         runtime_epoch=3,
+        name_suffix="borrowed_deadbeef_3",
     )
     spec = {
         "operation_id": "op-add",
@@ -2429,7 +2435,12 @@ def test_borrowed_worker_plan_is_deterministic_and_side_effect_free():
     second = replica.build_borrowed_worker_plan(spec)
 
     assert first == second
-    assert first["actor_name"].startswith("borrowed_ce_7_")
+    assert first["actor_name"].startswith(
+        "borrowed_ce_7borrowed_deadbeef_3_"
+    )
+    assert replica.borrowed_server_names == (
+        "vllm_server_7_0borrowed_deadbeef_3",
+    )
     assert first["pg_id"] == "pg"
     assert first["bundle_index"] == 4
     assert first["num_gpus"] == FIRST_RELEASE_RAY_GPU_FRACTION
