@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 
 import ray
 from verl.checkpoint_engine.base import CheckpointEngineManager
 from verl.single_controller.ray import RayWorkerGroup
 from verl.utils.device import get_device_name
+
+logger = logging.getLogger(__name__)
 
 from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
@@ -437,6 +440,11 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                 await asyncio.gather(
                     *[replica.wake_up(tags=["weights"]) for replica in replicas]
                 )
+                logger.info(
+                    "RESTORE bootstrap %s: weights wake complete for %s",
+                    operation_id,
+                    key,
+                )
 
             # Borrowed ADD targets are resident and use VERL's native
             # KV-release path. Native RESTORE already has KV absent after the
@@ -448,6 +456,11 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
 
             topology_started = True
             self.build_process_group(rollout)
+            logger.info(
+                "RESTORE bootstrap %s: checkpoint topology ready for %s",
+                operation_id,
+                key,
+            )
 
             # Keep native VERL synchronization semantics here. Its
             # CheckpointEngineManager.update_weights() is async but deliberately
@@ -455,12 +468,22 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             # only this target path to a background thread/future would let the
             # Trainer event loop progress while G still protects an in-flight
             # collective, diverging from the native ordering contract.
+            logger.info(
+                "RESTORE bootstrap %s: weight transfer start for %s",
+                operation_id,
+                key,
+            )
             ray.get(
                 actor_wg.update_weights(
                     global_steps=loaded_version,
                     mode=self.backend,
                 )
                 + rollout.update_weights(global_steps=loaded_version)
+            )
+            logger.info(
+                "RESTORE bootstrap %s: weight transfer complete for %s",
+                operation_id,
+                key,
             )
 
             ray.get(
@@ -472,9 +495,19 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                 )
             )
             finalized = True
+            logger.info(
+                "RESTORE bootstrap %s: checkpoint finalize complete for %s",
+                operation_id,
+                key,
+            )
 
             await asyncio.gather(
                 *[replica.resume_kv_cache() for replica in replicas]
+            )
+            logger.info(
+                "RESTORE bootstrap %s: KV resume complete for %s",
+                operation_id,
+                key,
             )
             health = await asyncio.gather(
                 *[replica.validate_server_runtime() for replica in replicas]
