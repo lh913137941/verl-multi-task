@@ -11,7 +11,7 @@ import pytest
 
 SOURCE = (
     Path(__file__).resolve().parents[2]
-    / "tests/integration/test_native_sleep_npu.py"
+    / "src/multi_task_scheduler/testing/npu_restore_sender.py"
 )
 
 
@@ -28,18 +28,17 @@ def _acceptance_helper(monkeypatch):
     helper = next(
         node for node in tree.body
         if isinstance(node, ast.FunctionDef)
-        and node.name == "_zero_and_verify_restore_output_weights"
-    )
-    scope = {}
-    exec(
-        compile(ast.fix_missing_locations(ast.Module(body=[helper], type_ignores=[])), str(SOURCE), "exec"),
-        scope,
+        and node.name == "zero_and_verify_restore_output_weights"
     )
     torch = SimpleNamespace(
         no_grad=lambda: nullcontext(),
         count_nonzero=lambda tensor: SimpleNamespace(item=lambda: tensor.nonzero),
     )
-    monkeypatch.setitem(sys.modules, "torch", torch)
+    scope = {"torch": torch}
+    exec(
+        compile(ast.fix_missing_locations(ast.Module(body=[helper], type_ignores=[])), str(SOURCE), "exec"),
+        scope,
+    )
     return scope[helper.name]
 
 
