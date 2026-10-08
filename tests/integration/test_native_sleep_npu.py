@@ -436,10 +436,87 @@ def _visible_npu_devices() -> str:
     return ",".join(str(index) for index in range(count))
 
 
+def _parse_npu_smi_memory(output: str, visible: tuple[str, ...]) -> tuple[dict, ...]:
+    """Read the summary table without creating any CANN device context.
+
+    On 910B/910C, `npu-smi info` prints a card row followed by a chip
+    row with `Memory-Usage(MB)` and `HBM-Usage(MB)` (used / total).
+    Prefer the rightmost nonempty memory pair, which is HBM on these hosts.
+    Do not guess when the tool uses a different layout.
+    """
+    records = []
+    current_id = None
+    for line in output.splitlines():
+        card = re.match(r"^\\|\\s*(\\d+)\\s+\\S+\\s*\\|", line)
+        if card:
+            current_id = card.group(1)
+            continue
+        if current_id is None or current_id not in visible:
+            continue
+        # The chip row contains a PCI Bus-Id; unlike the card row it reports
+        # actual HBM usage. Never misread power/temperature as memory.
+        if not re.match(r"^\\|\\s*\\d+\\s*\\|\\s*[0-9a-fA-F:.]+\\s*\\|", line):
+            continue
+        pairs = [
+            (int(used), int(total))
+            for used, total in re.findall(r"(\\d+)\\s*/\\s*(\\d+)", line)
+            if int(total) > 0
+        ]
+        if pairs:
+            used_mb, total_mb = pairs[-1]
+            if used_mb <= total_mb:
+                records.append(
+                    {
+                        "device": current_id,
+                        "free_bytes": (total_mb - used_mb) * (1024 ** 2),
+                        "total_bytes": total_mb * (1024 ** 2),
+                    }
+                )
+        current_id = None
+
+    # Different firmware revisions sometimes report several chip rows. A
+    # duplicated NPU id must not accidentally enter selection twice.
+    return tuple({item["device"]: item for item in records}.values())
+
+
 def _probe_visible_npu_memory() -> tuple[dict, ...]:
-    """Return free/total memory for each currently visible Ascend device."""
+    """Inspect visible NPU free memory, preferring a context-free CLI probe."""
+    visible = tuple(
+        item.strip() for item in _visible_npu_devices().split(",")
+        if item.strip()
+    )
+    # Launching torch_npu and allocating one Tensor per card can trigger
+    # expensive CANN / HDK initialization even before vLLM starts.
+    try:
+        result = subprocess.run(
+            ["npu-smi", "info"],
+            text=True,
+            capture_output=True,
+            timeout=12,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        smi_error = f"{type(exc).__name__}: {exc}"
+    else:
+        if result.returncode == 0:
+            records = _parse_npu_smi_memory(result.stdout, visible)
+            if records:
+                print(
+                    "NPU_MEMORY_PROBE "
+                    + json.dumps({"source": "npu-smi", "devices": records}),
+                    flush=True,
+                )
+                return records
+        smi_error = (
+            f"npu-smi exit={result.returncode}: "
+            + (result.stderr.strip() or "unrecognized memory table")
+        )
+
+    # Compatibility fallback for minimal containers/firmware with no usable
+    # npu-smi table. Query mem_get_info only; do NOT construct tensors on each
+    # device. Fail with a diagnostic instead of leaking TimeoutExpired.
     env = os.environ.copy()
-    env["ASCEND_RT_VISIBLE_DEVICES"] = _visible_npu_devices()
+    env["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(visible)
     script = r"""
 import json
 import torch
@@ -448,14 +525,10 @@ import torch_npu  # noqa: F401
 records = []
 for index in range(torch.npu.device_count()):
     try:
-        _ = torch.tensor(0, device=torch.device("npu", index))
         free_bytes, total_bytes = torch.npu.mem_get_info(index)
     except Exception as exc:
         records.append(
-            {
-                "index": index,
-                "error": f"{type(exc).__name__}: {exc}",
-            }
+            {"index": index, "error": f"{type(exc).__name__}: {exc}"}
         )
         continue
     records.append(
@@ -467,28 +540,51 @@ for index in range(torch.npu.device_count()):
     )
 print("NPU_MEMORY_PROBE " + json.dumps(records), flush=True)
 """
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=30,
-    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=40,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        detail = (exc.stderr or b"")
+        if isinstance(detail, bytes):
+            detail = detail.decode(errors="replace")
+        raise RuntimeError(
+            "NPU memory preflight timed out while initializing torch_npu "
+            "(no model was loaded); npu-smi was unavailable or unparseable: "
+            f"{smi_error}; worker stderr: {detail[-1200:]}"
+        ) from exc
+
     marker = "NPU_MEMORY_PROBE "
     line = next(
         (item for item in result.stdout.splitlines() if item.startswith(marker)),
         None,
     )
-    if line is None:
+    if result.returncode != 0 or line is None:
         raise RuntimeError(
-            "failed to query visible NPU memory: "
+            "failed to query NPU free memory; "
+            f"npu-smi: {smi_error}; torch_npu exit={result.returncode}: "
             + (result.stderr.strip() or result.stdout.strip() or "no output")
         )
     payload = json.loads(line[len(marker):])
     if not isinstance(payload, list):
         raise TypeError("NPU memory probe returned a non-list payload")
-    return tuple(dict(item) for item in payload)
-
+    records = []
+    for record in payload:
+        if not isinstance(record, dict):
+            continue
+        index = record.get("index")
+        if type(index) is int and 0 <= index < len(visible):
+            records.append({"device": visible[index], **record})
+    print(
+        "NPU_MEMORY_PROBE " + json.dumps({"source": "torch_npu", "devices": records}),
+        flush=True,
+    )
+    return tuple(records)
 
 def _select_direct_smoke_npu(*, min_free_gib: float) -> tuple[str, float]:
     """Pick the visible NPU with the most free memory for direct subprocesses."""
@@ -502,21 +598,23 @@ def _select_direct_smoke_npu(*, min_free_gib: float) -> tuple[str, float]:
     for record in records:
         free_bytes = record.get("free_bytes")
         total_bytes = record.get("total_bytes")
-        index = record.get("index")
+        device = record.get("device")
         if (
-            type(index) is not int
+            device not in configured
             or type(free_bytes) is not int
             or type(total_bytes) is not int
-            or index < 0
-            or index >= len(configured)
+            or free_bytes < 0
             or total_bytes <= 0
         ):
             continue
-        candidates.append((free_bytes, total_bytes, index))
+        candidates.append((free_bytes, total_bytes, device))
     if not candidates:
-        pytest.skip("could not query free memory for any visible Ascend NPU")
+        raise RuntimeError(
+            "NPU preflight did not obtain valid free-memory data for "
+            f"visible devices {configured!r}"
+        )
 
-    free_bytes, total_bytes, index = max(candidates)
+    free_bytes, total_bytes, device = max(candidates)
     free_gib = free_bytes / (1024**3)
     total_gib = total_bytes / (1024**3)
     if free_gib < min_free_gib:
@@ -530,7 +628,7 @@ def _select_direct_smoke_npu(*, min_free_gib: float) -> tuple[str, float]:
     # Layout probing stops before checkpoint loading, while full smoke needs
     # room for the model plus runtime/KV overhead.
     utilization = min(0.40, max(0.03, (free_bytes / total_bytes) * 0.70))
-    return configured[index], utilization
+    return device, utilization
 
 
 def _runtime_env() -> dict:
