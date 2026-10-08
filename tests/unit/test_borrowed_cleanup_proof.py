@@ -42,7 +42,7 @@ def replica_class(*, list_actors, kill):
         "asyncio": asyncio,
         "ray": ray,
         "list_actors": list_actors,
-        "ReplicaKind": SimpleNamespace(BORROWED="borrowed"),
+        "ReplicaKind": SimpleNamespace(NATIVE="native", BORROWED="borrowed"),
     }
     exec(compile(ast.fix_missing_locations(module), str(SOURCE), "exec"), scope)
     return scope["MultiTaskvLLMReplica"]
