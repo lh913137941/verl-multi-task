@@ -228,11 +228,14 @@ class MultiTaskvLLMReplica(vLLMReplica):
                     ("name", "=", name),
                 ]
             )
-            for state in states:
-                value = state.state if hasattr(state, "state") else state["state"]
-                if value != "DEAD":
-                    active.append(name)
-                    break
+            # State API absence is not a death certificate. In particular,
+            # failed name lookup or eventual-consistency gaps must never
+            # promote a borrowed REMOVE into RELEASED.
+            if not states or any(
+                (state.state if hasattr(state, "state") else state["state"]) != "DEAD"
+                for state in states
+            ):
+                active.append(name)
         return tuple(active)
 
     async def _wait_actor_names_dead(
@@ -272,6 +275,8 @@ class MultiTaskvLLMReplica(vLLMReplica):
                 # Kill acknowledgement is not release proof. The state query
                 # below remains authoritative for this cleanup attempt.
                 pass
+        if workers and not names:
+            raise RuntimeError("borrowed CE worker cleanup has no actor names for DEAD proof")
         await self._wait_actor_names_dead(names)
 
     async def _create_workers_from_claims(
@@ -324,7 +329,11 @@ class MultiTaskvLLMReplica(vLLMReplica):
                     (item["actor_name"],) if worker is not None else (),
                 )
             except BaseException as cleanup_exc:
-                self.workers = []
+                # Keep the failed worker handle so a later exact-operation
+                # cleanup can retry killing it; only DEAD proof may drop it.
+                if worker is not None:
+                    self.workers = [worker]
+                    self.borrowed_worker_names = (item["actor_name"],)
                 raise RuntimeError(
                     "borrowed CE creation failed: "
                     f"{type(exc).__name__}: {exc}; actor cleanup is unverified"
@@ -372,21 +381,23 @@ class MultiTaskvLLMReplica(vLLMReplica):
         servers = list(getattr(self, "servers", []) or [])
         names = tuple(getattr(self, "borrowed_server_names", ()) or ())
         if servers:
-            shutdown_refs = [server.shutdown_runtime.remote() for server in servers]
             try:
+                shutdown_refs = [server.shutdown_runtime.remote() for server in servers]
                 await asyncio.wait_for(
                     asyncio.gather(*shutdown_refs, return_exceptions=True),
                     timeout=30.0,
                 )
             except BaseException:
-                # Graceful shutdown is best-effort. Actor death below is the
-                # authoritative cleanup condition for the first release.
+                # Even a synchronous remote-submission failure must not skip
+                # forced actor termination and the subsequent DEAD proof.
                 pass
             for server in servers:
                 try:
                     ray.kill(server, no_restart=True)
                 except BaseException:
                     pass
+            if not names:
+                raise RuntimeError("borrowed server cleanup has no actor names for DEAD proof")
         await self._wait_actor_names_dead(names)
         self.servers = []
         self._server_handle = None
@@ -409,7 +420,10 @@ class MultiTaskvLLMReplica(vLLMReplica):
             )
         except BaseException as exc:
             errors.append(exc)
-        self.workers = []
+        else:
+            # Failed DEAD verification must retain handles for a cleanup
+            # replay, instead of losing the only way to reissue ray.kill.
+            self.workers = []
         if errors:
             raise RuntimeError("borrowed runtime cleanup is unverified") from errors[0]
         self.borrowed_cleanup_verified = True
