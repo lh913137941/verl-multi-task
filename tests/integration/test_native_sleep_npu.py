@@ -1558,6 +1558,7 @@ def _training_sender_class():
 
     from verl.checkpoint_engine import CheckpointEngineRegistry
     from verl.single_controller.base.decorator import Dispatch, register
+    from verl.utils.import_utils import import_external_libs
     from verl.workers.engine_workers import TrainingWorker
 
     class RestoreTrainingWorker(TrainingWorker):
@@ -1572,6 +1573,9 @@ def _training_sender_class():
             )
             if torch.distributed.get_rank() == 0:
                 engine_kwargs["is_master"] = True
+            # Mirror native TrainingWorker and CheckpointEngineWorker: every
+            # Ray process registers the opt-in backend before constructing it.
+            import_external_libs(checkpoint_engine_config.custom_backend_module or None)
             self.checkpoint_engine = CheckpointEngineRegistry.new(
                 backend,
                 bucket_size=bucket_size,
@@ -1659,7 +1663,7 @@ def _training_sender_class():
 
 
 def test_real_npu_restore_reinstalls_current_vpub_and_generates_again(monkeypatch):
-    """Two-NPU RESTORE acceptance using the HCCL implementation registered as nccl."""
+    """Two-NPU RESTORE acceptance using the opt-in HCCL teardown adapter."""
 
     model_path = _require_model_path()
     _require_npu(2)
@@ -1698,13 +1702,14 @@ def test_real_npu_restore_reinstalls_current_vpub_and_generates_again(monkeypatc
     )
 
     checkpoint_config = CheckpointEngineConfig(
-        backend="nccl",
+        backend="multitask_hccl",
+        custom_backend_module="multi_task_scheduler.checkpoint.hccl_checkpoint_engine",
         # Ascend falls back to host shared memory when accelerator IPC is not
         # available. In that path each full tensor must fit in one vLLM weight
         # bucket; Qwen3-0.6B's embedding is ~297 MiB in bf16 (~594 MiB in fp32).
         # Keep this below VERL's 2048 MiB default while remaining valid for both.
         update_weights_bucket_megabytes=1024,
-        engine_kwargs={"nccl": {"rebuild_group": True}},
+        engine_kwargs={"multitask_hccl": {"rebuild_group": True}},
     )
     model_config = HFModelConfig(
         path=model_path,
