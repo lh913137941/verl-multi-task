@@ -6068,3 +6068,119 @@ def test_rollouter_force_rejects_native_before_backend_capability_gate():
             rollouter.prepare_exit(key, operation_id="op-force", force=True)
         )
     assert manager.replica_state[key] is ReplicaState.ACTIVE
+
+
+
+def test_taskrunner_exit_binding_query_timeout_keeps_unknown():
+    # A failed owner query is never proof that prepare_exit had no side effects.
+    runner = taskrunner_class()()
+    runner.task_session = "task-a"
+    runner._control_ready = True
+    runner._launch_operation = lambda operation_id: None
+    key = ReplicaKey("task-a", "native-0")
+    command = OperationCommand("op-donate-query-timeout", OperationKind.DONATE, key, "l1")
+
+    class Rollouter:
+        prepare_exit = RemoteMethod(
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                TimeoutError("drain reply lost")
+            )
+        )
+        get_pending_target = RemoteMethod(
+            lambda operation_id: (_ for _ in ()).throw(
+                TimeoutError("owner query timed out")
+            )
+        )
+
+    runner.components = {"rollouter": Rollouter(), "trainer": object()}
+    runner._operation_journal.begin(command)
+    runner._execute_operation(command.operation_id)
+    record = runner.query_operation(command.operation_id)
+    assert record.status is OperationStatus.UNKNOWN
+    assert "inconclusive" in record.result
+
+
+def test_taskrunner_exit_binding_wrapped_keyerror_proves_preflight_rejection():
+    # Ray wraps remote KeyError in RayTaskError with the original cause.
+    runner = taskrunner_class()()
+    runner.task_session = "task-a"
+    runner._control_ready = True
+    runner._launch_operation = lambda operation_id: None
+    key = ReplicaKey("task-a", "native-0")
+    command = OperationCommand("op-donate-query-no-target", OperationKind.DONATE, key, "l1")
+
+    class RemoteKeyError(RuntimeError):
+        def __init__(self):
+            super().__init__("RayTaskError")
+            self.cause = KeyError("no pending lifecycle target")
+
+    class Rollouter:
+        prepare_exit = RemoteMethod(
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                ValueError("preflight refused invalid state")
+            )
+        )
+        get_pending_target = RemoteMethod(
+            lambda operation_id: (_ for _ in ()).throw(RemoteKeyError())
+        )
+
+    runner.components = {"rollouter": Rollouter(), "trainer": object()}
+    runner._operation_journal.begin(command)
+    runner._execute_operation(command.operation_id)
+    record = runner.query_operation(command.operation_id)
+    assert record.status is OperationStatus.FAILED
+    assert "before owner mutation" in record.result
+
+
+def test_lb_retains_settled_history_with_many_unsettled_requests():
+    lb = load_balancer_class()({"s0": object()})
+    lb._settled_retention = 2
+    # In-flight requests must not cause a recent SETTLED proof to be evicted.
+    for n in range(12):
+        lb.acquire_server(f"inflight-{n}")
+    server, _ = lb.acquire_server("settled-0")
+    lb.release_server(server, request_id="settled-0")
+    assert lb.query_attempt("settled-0") is AttemptState.SETTLED
+    assert lb._settled_count == 1
+
+    for n in range(1, 4):
+        request_id = f"settled-{n}"
+        server, _ = lb.acquire_server(request_id)
+        lb.release_server(server, request_id=request_id)
+    assert lb._settled_count == 2
+    assert set(k for k, v in lb.attempt_state.items()
+               if v is AttemptState.SETTLED) == {"settled-2", "settled-3"}
+    assert all(lb.query_attempt(f"inflight-{n}") is AttemptState.ADMITTED
+               for n in range(12))
+
+
+def test_lb_gc_stale_release_preserves_native_inflight_counter():
+    lb = load_balancer_class()({"s0": object()})
+    lb._settled_retention = 1
+    server, _ = lb.acquire_server("old")
+    lb.release_server(server, request_id="old")
+    server, _ = lb.acquire_server("completed")
+    lb.release_server(server, request_id="completed")
+    assert lb.query_attempt("old") is None  # bounded GC already evicted it
+
+    server, _ = lb.acquire_server("active")
+    count = lb._inflight_requests[server]
+    lb.release_server(server, request_id="old")  # duplicate late ACK
+    assert lb._inflight_requests[server] == count
+    assert lb.query_attempt("active") is AttemptState.ADMITTED
+
+
+def test_lb_settled_gc_count_survives_reacquire_and_forced_finish():
+    key = ReplicaKey("task-a", "native-0")
+    lb = load_balancer_class()({"s0": object(), "s1": object()},
+                                initial_routes={key: "s0"})
+    server, _ = lb.acquire_server("request")
+    assert server == "s0"
+    lb.begin_drain(key, "op")
+    lb.confirm_continuation("request", "client", "prefix")
+    lb.finish_remove(key)
+    assert lb._settled_count == 1
+    assert lb.query_attempt("request") is AttemptState.SETTLED
+    lb.acquire_server("request")
+    assert lb._settled_count == 0
+    assert lb.query_attempt("request") is AttemptState.ADMITTED
