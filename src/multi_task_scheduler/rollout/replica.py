@@ -71,6 +71,8 @@ class MultiTaskvLLMReplica(vLLMReplica):
             )
         context = ray.get_runtime_context()
         node_id = context.get_node_id()
+        # Actual membership of this CE actor, not a PG inferred from the node.
+        worker_pg_id = context.get_placement_group_id()
         ids = context.get_accelerator_ids().get(resource_name, [])
         if len(ids) != 1:
             raise RuntimeError(
@@ -82,6 +84,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
             physical_id = f"NPU:{node_id}:{accelerator_id}"
             return {
                 "node_id": node_id,
+                "pg_id": worker_pg_id,
                 "gpu_uuid": physical_id,
                 "resource_name": resource_name,
                 "accelerator_id": accelerator_id,
@@ -118,6 +121,7 @@ class MultiTaskvLLMReplica(vLLMReplica):
             )
         return {
             "node_id": node_id,
+            "pg_id": worker_pg_id,
             "gpu_uuid": physical_id,
             "resource_name": resource_name,
             "accelerator_id": accelerator_id,
