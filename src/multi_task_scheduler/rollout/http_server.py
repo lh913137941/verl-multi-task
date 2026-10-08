@@ -98,6 +98,17 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         engine = getattr(self, "engine", None)
         if engine is not None:
             await engine.wait_for_requests_to_drain()
+            # vLLM V1 AsyncLLM.shutdown() tears down EngineCore before it
+            # cancels its background output_handler. The handler may observe
+            # that planned teardown as EngineDeadError and report a spurious
+            # ERROR even when every request drained successfully. Cancel it
+            # only at this final BORROWED shutdown boundary, while EngineCore
+            # is still alive; do not interfere with normal request processing
+            # or native sleep/RESTORE.
+            output_handler = getattr(engine, "output_handler", None)
+            if isinstance(output_handler, asyncio.Task) and not output_handler.done():
+                output_handler.cancel()
+                await asyncio.gather(output_handler, return_exceptions=True)
 
         server_task = getattr(self, "_server_task", None)
         if server_task is not None and not server_task.done():
