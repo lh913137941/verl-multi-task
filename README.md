@@ -474,42 +474,23 @@ examples/e2e/lease.example.json
 
 ### 两个真实 Fully Async 任务的共享 GS 一键验收
 
-先确保目标 VERL 已应用 `patches/verl-v0.10-fully-async-multitask-entry.patch`（或等价适配），
-所有 Ray 节点都能导入本包，并准备可运行的原生 Fully Async 模型、数据、训练参数。
-将这些 Hydra overrides 逐行保存为 `/tmp/native_args.txt`，不要只使用占位模型路径。
+准备可运行的原生 Fully Async 模型、数据和训练参数，将 Hydra overrides
+逐行写入 `/tmp/native_args.txt`，所有 Ray 节点须能导入本包。
 
-若脚本报 `VERL Fully Async entry has no MultiTask bridge`，先检查当前解释器
-**实际导入**的入口文件（不是猜测相邻仓库，也不要直接删除前置检查）：
+**无需手动设置 `VERL_ROOT`、`git apply` 或安装额外补丁。** 默认启动时，
+`verify_two_verl_jobs.py` 会自动定位当前 Python **实际导入**的 VERL：
+若缺少 MultiTask bridge，先尝试仓库自带的标准补丁；因 VERL 本地改动而
+无法匹配时，使用 AST 定位只修改入口 `TaskRunner` 选择和 Hydra 的
+`multitask` 默认配置。修改前会备份文件，校验不通过会回滚；
+已安装则不重复修改。若入口已有其他自定义 TaskRunner 选择逻辑，
+将直接 BLOCKED 而不会覆盖。也不会删除现有 VERL 改动。
 
-```bash
-python - <<'PY'
-import importlib.util
-spec = importlib.util.find_spec("verl.experimental.fully_async_policy.fully_async_main")
-print("VERL entry:", spec.origin if spec else "<not installed>")
-PY
-```
-
-在与该入口对应的、可写的 VERL **源码 checkout** 根目录执行补丁检查和安装，
-路径按实际环境替换。修补已生效的入口时不要重复 `git apply`：
-
-```bash
-MT_ROOT=/path/to/verl-multi-task
-VERL_ROOT=/path/to/verl
-git -C "$VERL_ROOT" apply --check "$MT_ROOT/patches/verl-v0.10-fully-async-multitask-entry.patch"
-git -C "$VERL_ROOT" apply "$MT_ROOT/patches/verl-v0.10-fully-async-multitask-entry.patch"
-# 如果 Python 实际导入的是另一份已安装的 VERL，让当前环境使用修补后的源码：
-python -m pip install -e "$VERL_ROOT" --no-deps
-python - <<'PY'
-import importlib
-m = importlib.import_module("verl.experimental.fully_async_policy.fully_async_main")
-print("VERL entry:", m.__file__)
-assert callable(getattr(m, "_resolve_task_runner_class", None)), "MultiTask bridge not active"
-PY
-```
-
-`git apply --check` 未通过时，先检查现有修改和 VERL 版本差异，
-不要使用 `--reject` 或 `--3way` 强行套用到不兼容的源码。
-补丁包含 YAML 配置的 `multitask` 键和 Python 入口选择逻辑，两部分缺一不可。
+如只想检查而**不允许自动修改 VERL**，运行 E2E 时增加
+`--no-auto-bridge`；可独立执行
+`python scripts/e2e/ensure_verl_multitask_bridge.py --check-only` 进行只读检查。
+直接执行 `python scripts/e2e/ensure_verl_multitask_bridge.py` 也能单独安装入口。
+对于通过 `site-packages` 导入的非源码版本，脚本会拒绝原地修改，要求先使用
+可编辑安装的 VERL 源码 checkout。
 
 ```bash
 export RAY_ADDRESS=auto  # 或实际 Ray head 地址
