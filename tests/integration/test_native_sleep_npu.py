@@ -1927,9 +1927,34 @@ def test_real_npu_restore_reinstalls_current_vpub_and_generates_again(monkeypatc
 
         restored = ray.get(parked_ref, timeout=120)
         assert getattr(restored, "token_ids", None)
+        # An already-parked request and a fresh request exercise distinct
+        # post-wake admission paths. Check both; a server step number is only
+        # metadata and cannot prove that the model weights changed.
+        fresh = generate_once("npu-fresh-after-restore")
+        assert getattr(fresh, "token_ids", None)
+        print(
+            "NPU_RESTORE_STAGE "
+            + json.dumps(
+                {
+                    "stage": "post-restore-generation",
+                    "baseline_token_ids": baseline.token_ids,
+                    "parked_token_ids": restored.token_ids,
+                    "fresh_token_ids": fresh.token_ids,
+                    "parked_global_steps": (getattr(restored, "extra_fields", None) or {}).get("global_steps"),
+                    "fresh_global_steps": (getattr(fresh, "extra_fields", None) or {}).get("global_steps"),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        assert fresh.token_ids != baseline.token_ids, (
+            "fresh NPU RESTORE generation still uses baseline behavior after "
+            "verified tied-Vpub export and HCCL source/receiver transfer; "
+            "inspect the vLLM model weight-loader path, not global_steps alone"
+        )
         assert restored.token_ids != baseline.token_ids, (
-            "NPU RESTORE output did not change after sender Vpub mutation; "
-            "global_steps alone is not sufficient acceptance evidence"
+            "parked NPU RESTORE request retained baseline behavior while a "
+            "fresh post-wake request changed; inspect admission/wake ordering"
         )
     finally:
         ray.shutdown()
