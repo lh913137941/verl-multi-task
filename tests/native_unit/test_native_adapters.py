@@ -118,7 +118,12 @@ def test_message_queue_deduplicates_completed_native_samples():
 
     first = asyncio.run(queue.put_sample_once(first_payload))
     replay = asyncio.run(queue.put_sample_once(replay_payload))
-    assert replay is first
+    # The SQLite-backed ledger reconstructs immutable evidence on replay.
+    # Exactly-once guarantees equal durable facts and a single enqueue, not
+    # Python object identity (which also cannot survive Ray RPC boundaries).
+    assert replay == first
+    assert replay.enqueue_seq == first.enqueue_seq == 0
+    assert replay.payload_digest == first.payload_digest
     assert asyncio.run(queue.get_queue_size()) == 1
 
     conflicting = ray.cloudpickle.dumps(SimpleNamespace(sample_id="s1", value=2))
