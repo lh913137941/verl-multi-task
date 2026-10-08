@@ -1,7 +1,9 @@
 """Static acceptance-runner validation for CI without Ray/VERL."""
 
 import ast
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -27,6 +29,39 @@ def test_e2e_python_drivers_parse_without_importing_runtime_dependencies():
     assert drivers
     for path in drivers:
         ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+
+
+def test_e2e_common_exposes_checkout_package_to_standalone_drivers(tmp_path):
+    # The control-plane and exactly-once drivers run as plain Python scripts,
+    # unlike recovery tests which inherit pytest's pythonpath=src setting.
+    for inherited in ("", "/existing/project/site-packages"):
+        env = dict(os.environ)
+        env["PYTHON_BIN"] = sys.executable
+        if inherited:
+            env["PYTHONPATH"] = inherited
+        else:
+            env.pop("PYTHONPATH", None)
+        script = (
+            '. "$1"; '
+            '"$PYTHON_BIN" -c '
+            "'import importlib.util; "
+            "print(importlib.util.find_spec(\"multi_task_scheduler\").submodule_search_locations[0])' "
+            '; printf "PYTHONPATH=%s\\n" "$PYTHONPATH"'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script, "bash", str(E2E / "common.sh")],
+            cwd=tmp_path,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        module_path, pythonpath_line = result.stdout.strip().splitlines()
+        assert Path(module_path).resolve() == ROOT / "src" / "multi_task_scheduler"
+        expected_path = str(ROOT / "src") + (":" + inherited if inherited else "")
+        assert pythonpath_line == "PYTHONPATH=" + expected_path
 
 
 def _load_live_fixture_under_test():
