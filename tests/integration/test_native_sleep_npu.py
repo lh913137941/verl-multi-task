@@ -549,6 +549,11 @@ def _runtime_env() -> dict:
     }
     if not _ascend_supports_rl_config():
         env_vars["VLLM_ASCEND_ENABLE_NZ"] = "0"
+    # Ray CE Workers must get the exact same acceptance audit flags as the
+    # driver, rather than depending on implicit worker environment inheritance.
+    for key in ("MULTITASK_PARAMETER_VALIDATION", "MULTITASK_SOURCE_VALIDATION"):
+        if key in os.environ:
+            env_vars[key] = os.environ[key]
     return {"env_vars": env_vars}
 
 
@@ -1553,6 +1558,66 @@ def test_real_npu_force_remove_continues_on_another_replica():
         ray.shutdown()
 
 
+def _zero_and_verify_restore_output_weights(engine) -> dict:
+    """Mutate the *exported* Vpub tensor, not just an FSDP module accessor.
+
+    Qwen3-0.6B ties lm_head to input embeddings. vLLM can reconstruct the
+    logits projection from model.embed_tokens.weight and disregard a separate
+    lm_head entry. Therefore mutate and verify both sides of that tie before
+    the HCCL collective starts; otherwise unchanged generation is ambiguous.
+    """
+    import torch
+
+    module = getattr(engine.module, "_fsdp_wrapped_module", engine.module)
+    get_output = getattr(module, "get_output_embeddings", None)
+    if not callable(get_output):
+        raise RuntimeError("RESTORE acceptance model has no output embedding accessor")
+    output = get_output()
+    output_weight = getattr(output, "weight", None)
+    if output_weight is None:
+        raise RuntimeError("RESTORE acceptance model has no output embedding weight")
+
+    hf_config = getattr(getattr(engine, "model_config", None), "hf_config", None)
+    if hf_config is None:
+        raise RuntimeError("RESTORE acceptance cannot determine weight tying")
+    tied = bool(getattr(hf_config, "tie_word_embeddings", False))
+
+    with torch.no_grad():
+        output_weight.zero_()
+        if tied:
+            get_input = getattr(module, "get_input_embeddings", None)
+            if not callable(get_input):
+                raise RuntimeError("tied RESTORE model has no input embedding accessor")
+            input_layer = get_input()
+            input_weight = getattr(input_layer, "weight", None)
+            if input_weight is None:
+                raise RuntimeError("tied RESTORE model has no input embedding weight")
+            input_weight.zero_()
+
+    # VERL's native HCCL sender exports this iterator, not the model accessor.
+    # Verify the exact export *before* building the collective. Failing during
+    # an HCCL broadcast can hang the receiver rather than produce a useful
+    # source-side assertion.
+    exported, _ = engine.get_per_tensor_param()
+    seen = {}
+    for name, tensor in exported:
+        is_head = name.endswith("lm_head.weight")
+        is_input = name.endswith("embed_tokens.weight")
+        if is_head or (tied and is_input):
+            seen[name] = int(torch.count_nonzero(tensor).item())
+
+    if tied and not any(name.endswith("embed_tokens.weight") for name in seen):
+        raise RuntimeError("tied RESTORE model export omitted canonical input embeddings")
+    if not seen:
+        raise RuntimeError("RESTORE acceptance cannot find output projection in Vpub export")
+    if any(seen.values()):
+        raise RuntimeError(
+            "RESTORE mutation did not reach the actual Vpub export: "
+            + repr(seen)
+        )
+    return {"tied": tied, "export_nonzero": seen}
+
+
 def _training_sender_class():
     import torch
 
@@ -1584,37 +1649,7 @@ def _training_sender_class():
 
         @register(dispatch_mode=Dispatch.ONE_TO_ALL)
         def zero_output_weights_for_restore_acceptance(self):
-            module = getattr(
-                self.engine.module,
-                "_fsdp_wrapped_module",
-                self.engine.module,
-            )
-            get_output_embeddings = getattr(
-                module,
-                "get_output_embeddings",
-                None,
-            )
-            if get_output_embeddings is None:
-                raise RuntimeError(
-                    "acceptance model does not expose output embeddings"
-                )
-            output = get_output_embeddings()
-            weight = getattr(output, "weight", None)
-            if weight is None:
-                raise RuntimeError(
-                    "acceptance model output embedding has no weight"
-                )
-            with torch.no_grad():
-                weight.zero_()
-            local_weight = (
-                weight.to_local() if hasattr(weight, "to_local") else weight
-            )
-            return {
-                "shape": tuple(weight.shape),
-                "abs_sum": float(
-                    local_weight.detach().float().abs().sum().item()
-                ),
-            }
+            return _zero_and_verify_restore_output_weights(self.engine)
 
         @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
         async def update_weights(
@@ -1667,8 +1702,11 @@ def test_real_npu_restore_reinstalls_current_vpub_and_generates_again(monkeypatc
 
     model_path = _require_model_path()
     _require_npu(2)
-    monkeypatch.setenv("MULTITASK_PARAMETER_VALIDATION", "0")
-    monkeypatch.setenv("MULTITASK_SOURCE_VALIDATION", "0")
+    # This acceptance must prove HCCL payload equality, not merely check the
+    # server's global_steps metadata. The opt-in manifest audit compares the
+    # real trainer source to every receiver, and never permits silent bypass.
+    monkeypatch.setenv("MULTITASK_PARAMETER_VALIDATION", "1")
+    monkeypatch.setenv("MULTITASK_SOURCE_VALIDATION", "1")
     _print_npu_runtime_diagnostics()
 
     import ray
@@ -1832,7 +1870,14 @@ def test_real_npu_restore_reinstalls_current_vpub_and_generates_again(monkeypatc
             actor_wg.zero_output_weights_for_restore_acceptance()
         )
         assert all(
-            receipt["abs_sum"] == 0.0 for receipt in mutation_receipts
+            receipt["export_nonzero"]
+            and all(count == 0 for count in receipt["export_nonzero"].values())
+            for receipt in mutation_receipts
+        )
+        print(
+            "NPU_RESTORE_STAGE "
+            + json.dumps({"stage": "source-export-verified", "receipts": mutation_receipts}, sort_keys=True),
+            flush=True,
         )
 
         checkpoint_manager = MultiTaskCheckpointEngineManager(
