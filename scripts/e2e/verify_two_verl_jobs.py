@@ -13,6 +13,7 @@ writes a verified Lease fixture for the existing E2E lifecycle driver.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import os
 from pathlib import Path
@@ -83,6 +84,15 @@ def log(message):
 
 def record(path, **details):
     path.write_text(json.dumps(details, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+
+
+def driver_log_tail(path, max_lines=100):
+    """Return a bounded failure excerpt without loading a potentially huge driver log."""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
+            return "".join(deque(stream, maxlen=max_lines)).rstrip()
+    except OSError as exc:
+        return f"<could not read driver log: {exc}>"
 
 
 def validate_lease(path, donor_session, ray, namespace):
@@ -366,7 +376,20 @@ def main():
             last_error = None
             while time.monotonic() < deadline:
                 if proc.poll() is not None:
-                    raise RuntimeError(f"{role} native VERL exited early with rc={proc.returncode}; check {logs / (role + '.log')}")
+                    driver_log = logs / (role + ".log")
+                    tail = driver_log_tail(driver_log)
+                    state["failed_driver"] = role
+                    state["failed_driver_exit_code"] = proc.returncode
+                    state["failed_driver_log"] = str(driver_log)
+                    state["failed_driver_log_tail"] = tail
+                    log(f"----- {role} native VERL error log (last 100 lines) -----")
+                    for line in tail.splitlines():
+                        print(line, flush=True)
+                    log(f"----- End {role} log; full file: {driver_log} -----")
+                    raise RuntimeError(
+                        f"{role} native VERL exited early with rc={proc.returncode}; "
+                        f"see {driver_log} and the log excerpt above"
+                    )
                 try:
                     registered = ray.get(gs.get_task_runners.remote(), timeout=10)
                     fresh = set(registered) - previous
