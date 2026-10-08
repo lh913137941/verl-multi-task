@@ -13,6 +13,9 @@ from verl.utils.device import get_device_name, get_resource_name
 from verl.workers.rollout.replica import RolloutMode
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
+from multi_task_scheduler.checkpoint.checkpoint_engine_worker import (
+    MultiTaskCheckpointEngineWorker,
+)
 from multi_task_scheduler.orchestration.contracts import (
     FIRST_RELEASE_MAX_COLOCATE_COUNT,
     Lease,
@@ -41,6 +44,15 @@ class MultiTaskvLLMReplica(vLLMReplica):
             )
         super().__init__(*args, **kwargs)
         self.server_class = ray.remote(MultiTaskvLLMHttpServer)
+
+    def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
+        """Use the native CE worker with optional receiver-side manifest auditing."""
+        return RayClassWithInitArgs(
+            cls=ray.remote(MultiTaskCheckpointEngineWorker),
+            rollout_config=self.config,
+            model_config=self.model_config,
+            replica_rank=self.replica_rank,
+        )
 
     @staticmethod
     def _runtime_placement_probe(_worker) -> dict:
