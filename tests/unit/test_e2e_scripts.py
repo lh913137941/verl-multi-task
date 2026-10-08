@@ -394,3 +394,75 @@ def test_two_real_jobs_launches_bridge_setup_before_importing_verl():
     imported = source.index("import verl.experimental.fully_async_policy.fully_async_main as entry")
     assert setup < imported
     assert "--no-auto-bridge" in source
+
+def _load_ray_connector():
+    """Test Ray connection logic without requiring Ray on GitHub Actions."""
+    source = E2E.joinpath("verify_two_verl_jobs.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    fn = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef)
+        and n.name == "connect_ray"
+    )
+    namespace = {}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "ray_connector", "exec"), namespace)
+    return namespace["connect_ray"]
+
+
+def test_two_real_jobs_missing_ray_is_blocked_with_one_command_hint():
+    import pytest
+    connect = _load_ray_connector()
+
+    class MissingRay:
+        def init(self, **kwargs):
+            raise ConnectionError("no running Ray instance")
+
+    with pytest.raises(RuntimeError, match="--start-local-ray"):
+        connect(MissingRay(), address="auto", namespace="multitask-jobs")
+    with pytest.raises(ValueError, match="requires --ray-address auto"):
+        connect(MissingRay(), address="ray-head:6379", namespace="multitask-jobs", start_local=True)
+
+
+def test_two_real_jobs_optional_local_ray_passes_real_address_to_children():
+    connect = _load_ray_connector()
+
+    class LocalRay:
+        def __init__(self, resources):
+            self.calls = []
+            self.resources = resources
+
+        def init(self, **kwargs):
+            self.calls.append(kwargs["address"])
+            if kwargs["address"] == "auto":
+                raise ConnectionError("no running Ray instance")
+            return type("LocalContext", (), {"address_info": {"address": "127.0.0.1:6379"}})()
+
+        def get_runtime_context(self):
+            return type("Context", (), {"gcs_address": "127.0.0.1:6379"})()
+
+        def cluster_resources(self):
+            return self.resources
+
+    ray = LocalRay({"NPU": 8, "CPU": 32})
+    address, started = connect(ray, address="auto", namespace="multitask-jobs", start_local=True)
+    assert (address, started) == ("127.0.0.1:6379", True)
+    assert ray.calls == ["auto", "local"]
+    import pytest
+
+    with pytest.raises(RuntimeError, match="no GPU/NPU resources"):
+        connect(LocalRay({"CPU": 32}), address="auto", namespace="multitask-jobs", start_local=True)
+
+
+def test_two_real_jobs_existing_ray_not_restarted_even_if_local_opt_in():
+    connect = _load_ray_connector()
+
+    class ExistingRay:
+        def __init__(self):
+            self.calls = []
+
+        def init(self, **kwargs):
+            self.calls.append(kwargs["address"])
+            return object()
+
+    ray = ExistingRay()
+    assert connect(ray, address="auto", namespace="multitask-jobs", start_local=True) == ("auto", False)
+    assert ray.calls == ["auto"]
