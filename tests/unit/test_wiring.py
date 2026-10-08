@@ -6184,3 +6184,49 @@ def test_lb_settled_gc_count_survives_reacquire_and_forced_finish():
     lb.acquire_server("request")
     assert lb._settled_count == 0
     assert lb.query_attempt("request") is AttemptState.ADMITTED
+
+
+def test_taskrunner_concurrent_unknown_replay_launches_only_one_worker():
+    runner = taskrunner_class()()
+    runner.task_session = "task-a"
+    runner._control_ready = True
+    key = ReplicaKey("task-a", "native-0")
+    command = OperationCommand("op-racing-unknown", OperationKind.DONATE, key, "l1")
+    runner._operation_journal.begin(command)
+    runner._operation_journal.mark_running(command.operation_id)
+    runner._operation_journal.finish(
+        command.operation_id, OperationStatus.UNKNOWN, "lost acknowledgement"
+    )
+    launch_started = threading.Event()
+    release_launch = threading.Event()
+    second_started = threading.Event()
+    launched = []
+    returned = []
+
+    def stalled_launch(operation_id):
+        launched.append(operation_id)
+        launch_started.set()
+        assert release_launch.wait(timeout=5)
+        runner._operation_threads[operation_id] = threading.current_thread()
+
+    runner._launch_operation = stalled_launch
+
+    def submit(*, second=False):
+        if second:
+            second_started.set()
+        returned.append(runner.submit_operation(command))
+
+    first = threading.Thread(target=submit)
+    second = threading.Thread(target=lambda: submit(second=True))
+    first.start()
+    assert launch_started.wait(timeout=5)
+    second.start()
+    assert second_started.wait(timeout=5)
+    # Give the concurrent retry an opportunity to observe the UNKNOWN record.
+    time.sleep(0.05)
+    release_launch.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+    assert not first.is_alive() and not second.is_alive()
+    assert launched == [command.operation_id]
+    assert len(returned) == 2
