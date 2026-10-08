@@ -2331,6 +2331,116 @@ def test_http_server_health_and_shutdown_use_real_engine_boundaries():
     asyncio.run(scenario())
 
 
+
+def test_borrowed_shutdown_cancels_drained_vllm_output_handler_before_engine_core():
+    """EngineCore teardown must not race vLLM's still-polling output handler."""
+    events = []
+
+    class Engine:
+        def __init__(self):
+            self.output_handler = None
+
+        async def wait_for_requests_to_drain(self):
+            events.append("drained")
+
+        def shutdown(self):
+            # Simulate an engine which would signal EngineDeadError to the
+            # polling output handler if the core were shut down first.
+            assert self.output_handler is not None
+            assert self.output_handler.cancelled()
+            events.append("engine-core-shutdown")
+
+    class Parent:
+        pass
+
+    cls = isolated(
+        "rollout/http_server.py",
+        "MultiTaskvLLMHttpServer",
+        Parent,
+        asyncio=asyncio,
+    )
+
+    async def scenario():
+        server = cls()
+        server.nnodes = 1
+        server.node_rank = 0
+        server._server_port = 11223
+        server._submission_paused = False
+        server._resume_event = asyncio.Event()
+        server._resume_event.set()
+        server._server_task = asyncio.create_task(asyncio.sleep(3600))
+        engine = Engine()
+        server.engine = engine
+
+        async def output_polling():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                events.append("output-handler-cancelled")
+
+        engine.output_handler = asyncio.create_task(output_polling())
+        await asyncio.sleep(0)
+        await server.shutdown_runtime()
+        assert events == [
+            "drained",
+            "output-handler-cancelled",
+            "engine-core-shutdown",
+        ]
+        assert server.engine is None
+        assert server._server_task.done()
+
+    asyncio.run(scenario())
+
+
+def test_borrowed_shutdown_does_not_cancel_output_polling_before_drain():
+    """A failed drain must not hide an active EngineCore error or kill requests."""
+    events = []
+
+    class Engine:
+        def __init__(self):
+            self.output_handler = None
+
+        async def wait_for_requests_to_drain(self):
+            events.append("drain")
+            raise RuntimeError("requests still active")
+
+        def shutdown(self):
+            raise AssertionError("cannot destroy an undrained engine")
+
+    cls = isolated(
+        "rollout/http_server.py",
+        "MultiTaskvLLMHttpServer",
+        type("Parent", (), {}),
+        asyncio=asyncio,
+    )
+
+    async def scenario():
+        server = cls()
+        server.nnodes = 1
+        server.node_rank = 0
+        server._submission_paused = False
+        server._resume_event = asyncio.Event()
+        server._resume_event.set()
+        server.engine = Engine()
+        server._server_task = asyncio.create_task(asyncio.sleep(3600))
+        server.engine.output_handler = asyncio.create_task(asyncio.sleep(3600))
+        try:
+            with pytest.raises(RuntimeError, match="requests still active"):
+                await server.shutdown_runtime()
+            assert events == ["drain"]
+            assert not server.engine.output_handler.cancelled()
+        finally:
+            server.engine.output_handler.cancel()
+            server._server_task.cancel()
+            await asyncio.gather(
+                server.engine.output_handler,
+                server._server_task,
+                return_exceptions=True,
+            )
+
+    asyncio.run(scenario())
+
+
 def replica_class():
     class Parent:
         def __init__(
