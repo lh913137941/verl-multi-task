@@ -49,6 +49,8 @@ def arguments():
     p.add_argument("--require-inflight-force", action="store_true",
                    help="also require a matching positive in-flight FORCE handoff receipt in the borrower log")
     p.add_argument("--keep-running", action="store_true", help="do not stop drivers after verification")
+    p.add_argument("--no-auto-bridge", action="store_true",
+                   help="verify VERL entry read-only; do not patch imported VERL sources automatically")
     p.add_argument("--logs", type=Path, default=Path.cwd() / "logs" / "two_real_jobs")
     p.add_argument("native_overrides", nargs="*", help="Hydra overrides after --; same for both jobs")
     args = p.parse_args()
@@ -204,6 +206,12 @@ def main():
             raise ValueError(f"unknown/empty scenario list: {a.scenarios!r}")
         if a.require_inflight_force and "force" not in chosen:
             raise ValueError("--require-inflight-force requires scenario force")
+
+        # Fix the specific VERL source imported by this Python, not a guessed
+        # checkout. Default: standard repo patch, then AST-guided safe fallback;
+        # --no-auto-bridge keeps the preflight strictly read-only.
+        from ensure_verl_multitask_bridge import ensure_current_verl_bridge
+        ensure_current_verl_bridge(check_only=a.no_auto_bridge)
 
         import ray
         import verl.experimental.fully_async_policy.fully_async_main as entry
