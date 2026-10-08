@@ -447,7 +447,7 @@ def _parse_npu_smi_memory(output: str, visible: tuple[str, ...]) -> tuple[dict, 
     records = []
     current_id = None
     for line in output.splitlines():
-        card = re.match(r"^\\|\\s*(\\d+)\\s+\\S+\\s*\\|", line)
+        card = re.match(r"^\|\s*(\d+)\s+\S+\s*\|", line)
         if card:
             current_id = card.group(1)
             continue
@@ -455,11 +455,11 @@ def _parse_npu_smi_memory(output: str, visible: tuple[str, ...]) -> tuple[dict, 
             continue
         # The chip row contains a PCI Bus-Id; unlike the card row it reports
         # actual HBM usage. Never misread power/temperature as memory.
-        if not re.match(r"^\\|\\s*\\d+\\s*\\|\\s*[0-9a-fA-F:.]+\\s*\\|", line):
+        if not re.match(r"^\|\s*\d+\s*\|\s*[0-9a-fA-F:.]+\s*\|", line):
             continue
         pairs = [
             (int(used), int(total))
-            for used, total in re.findall(r"(\\d+)\\s*/\\s*(\\d+)", line)
+            for used, total in re.findall(r"(\d+)\s*/\s*(\d+)", line)
             if int(total) > 0
         ]
         if pairs:
