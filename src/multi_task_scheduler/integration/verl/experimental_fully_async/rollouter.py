@@ -321,17 +321,39 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                 self._idle_report_signature = None
                 self._idle_report_last_sent = None
                 continue
-            if not getattr(self, "paused", False) or self.group_scheduler is None:
+            if self.group_scheduler is None:
                 self._idle_report_signature = None
                 self._idle_report_last_sent = None
                 continue
 
+            # collect_idle_candidates() is already empty when native production
+            # resumes or the surplus disappears. Retract the previous report
+            # immediately rather than leaving GS a still-fresh (<=10s) false
+            # DONATE authorization. GS already accepts an empty candidate list.
             candidates = self.collect_idle_candidates()
             signature = tuple(
                 (key.task_session, key.replica_id, key.runtime_epoch, kind.value)
                 for key, kind in candidates
             )
             if not signature:
+                if self._idle_report_signature is not None:
+                    try:
+                        await self.group_scheduler.submit_idle_report.remote({
+                            "task_session": self.task_session,
+                            "candidates": (),
+                        })
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # An unacknowledged retraction is not safe to forget.
+                        # Retry next tick; GS also enforces bounded report age.
+                        print(
+                            "[MultiTaskRollouter] idle report retraction failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        continue
+                self._idle_report_signature = None
+                self._idle_report_last_sent = None
                 continue
             now = asyncio.get_running_loop().time()
             if (
