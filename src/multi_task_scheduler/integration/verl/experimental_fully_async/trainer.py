@@ -72,10 +72,9 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
         try:
             result = await lease.guard(super()._fit_update_weights)
             if result is not None and self.checkpoint_manager is not None:
-                await lease.guard(
-                    self.checkpoint_manager.mark_all_loaded_version,
-                    self.current_param_version,
-                )
+                # E records a published version only after all enabled
+                # receiver/source checks have succeeded. On validation failure
+                # the gate stays BLOCKED and E must not claim this version.
                 if getattr(
                     self.checkpoint_manager,
                     "parameter_validation_enabled",
@@ -108,6 +107,10 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
                         "CE_PARAMETER_VALIDATION "
                         + json.dumps(validation, sort_keys=True)
                     )
+                await lease.guard(
+                    self.checkpoint_manager.mark_all_loaded_version,
+                    self.current_param_version,
+                )
             return result
         except BaseException as exc:
             gate.block(
