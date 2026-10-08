@@ -2609,6 +2609,7 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
         RayClassWithInitArgs=FakeCIA,
         RayWorkerGroup=FakeWG,
+        MultiTaskCheckpointEngineWorker=object,
         ResourcePoolManager=object,
         RolloutMode=object,
         PlacementGroupSchedulingStrategy=object,
