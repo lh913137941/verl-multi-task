@@ -234,16 +234,35 @@ def test_real_restore_acceptance_loads_opt_in_backend_on_both_sides():
     )
     assert fields["engine_kwargs"]["multitask_hccl"]["rebuild_group"] is True
 
+    # The custom Ray actor must be an importable class in the installed
+    # package, not an in-test nested class that cloudpickle might fail to
+    # deserialize (producing an unrelated TemporaryActor async-flag error).
+    sender_source = (
+        Path(__file__).resolve().parents[2]
+        / "src/multi_task_scheduler/testing/npu_restore_sender.py"
+    )
+    sender_tree = ast.parse(sender_source.read_text(encoding="utf-8"))
     sender = next(
+        node for node in sender_tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "RestoreTrainingWorker"
+    )
+    sender_loader = next(
         node for node in tree.body
         if isinstance(node, ast.FunctionDef)
         and node.name == "_training_sender_class"
     )
-    setup_calls = [
-        node
-        for node in ast.walk(sender)
-        if isinstance(node, ast.Call)
+    loader_imports = [
+        node for node in ast.walk(sender_loader)
+        if isinstance(node, ast.ImportFrom)
     ]
+    assert any(
+        node.module == "multi_task_scheduler.testing.npu_restore_sender"
+        and any(alias.name == "RestoreTrainingWorker" for alias in node.names)
+        for node in loader_imports
+    )
+    assert not any(isinstance(node, ast.ClassDef) for node in ast.walk(sender_loader))
+    setup_calls = [node for node in ast.walk(sender) if isinstance(node, ast.Call)]
     import_calls = [
         node for node in setup_calls
         if isinstance(node.func, ast.Name)
