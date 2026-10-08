@@ -484,16 +484,23 @@ python scripts/e2e/verify_two_verl_jobs.py \
   --repo . \
   --ray-address "$RAY_ADDRESS" \
   --namespace multitask-jobs \
-  --native-args /tmp/native_args.txt \
-  --lease /tmp/lease.json \
-  --interactive-lease
+  --native-args /tmp/native_args.txt
 ```
 
 脚本启动两个独立的原生 VERL Fully Async driver，强制启用 MultiTask 并使用相同的
 Ray 地址和 job namespace；等待两个新的 task_session 附着到同一个 named detached GS，
-然后检查真实 donor PG。首次启动时选择 `--interactive-lease`，根据启动后生成的
-`placement_groups.json` 以及 donor CE worker 的真实设备身份更新 Lease，并按回车继续。
-没有真实 donor GPU/NPU placement 时不能把示例 Lease 直接用于真实借还。
+然后通过 donor TaskRunner → Rollouter → CE Worker 只读采集真实 GPU/NPU 身份，
+结合原生 Replica 所持有的 named Placement Group 验证 bundle、node、设备及 namespace。
+验证通过后自动生成 `logs/two_real_jobs/<运行时间>/auto_lease.json` 并交给已有 E2E
+驱动使用。默认选择 donor native rank 0；可用 `--donor-replica-rank` 明确指定。
+若事实不完整、PG 无法验证或任务未就绪，直接 BLOCKED，不猜测 PG/卡号。
+已有的 `--lease /tmp/lease.json --interactive-lease` 仍支持手工诊断。
+
+这个自动 Lease 是 **E2E 编排产生的真实资源快照**，不是业务侧需要维护的配置项；
+生产调度中仍由 GS 根据 idle report、容量、安全边界及资源归属选择 donor/borrower，
+使用内部 `open_lease` 记账，不能仅凭自动发现便视为资源已获借出许可。
+为避免两个真实任务在同一 Ray namespace 内产生相同 native rollout PG/CE/server 名，
+MultiTask 对原生 Replica 的资源名称增加 task_session 作用域。
 
 随后复用现有 `run_all.sh` 验证 control_plane、exactly_once、recovery、lifecycle 和 force。
 可用 `--scenarios "lifecycle force"` 缩小范围；`--keep-running` 可保留两个 driver。
