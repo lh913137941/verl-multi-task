@@ -41,6 +41,9 @@ def arguments():
                    help="legacy manual mode: pause after startup to edit --lease before E2E")
     p.add_argument("--native-args", type=Path,
                    help="optional native Fully Async Hydra overrides file (one argument per line)")
+    p.add_argument("--model-path", help="actual local HF model directory or Hugging Face repo ID; overrides fixture placeholder")
+    p.add_argument("--train-files", help="optional real training Parquet path overriding native-args")
+    p.add_argument("--val-files", help="optional real validation Parquet path overriding native-args")
     p.add_argument("--donor-args", type=Path, help="optional donor-only Hydra overrides")
     p.add_argument("--borrower-args", type=Path, help="optional borrower-only Hydra overrides")
     p.add_argument("--trainer-gpus", type=int, default=1, help="trainer GPUs per node per job")
@@ -76,6 +79,54 @@ def read_args(path):
             raise ValueError(f"{path}:{n}: expected one key=value Hydra override per line")
         args.append(line)
     return args
+
+
+def _effective_override(overrides, name):
+    """Hydra applies repeated key=value overrides in argument order; last wins."""
+    result = None
+    for item in overrides:
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        if key.lstrip("+") == name:
+            result = value.strip().strip("'\\\"")
+    return result
+
+
+def validate_training_inputs(overrides, *, role):
+    """Fail early on template paths; never launch Ray just to find missing files."""
+    model = _effective_override(overrides, "actor_rollout_ref.model.path")
+    if not model:
+        raise ValueError(
+            f"{role}: actor_rollout_ref.model.path is missing. "
+            "Pass --model-path /absolute/path/to/model or set it in --native-args."
+        )
+    if "REPLACE_WITH" in model or "/path/to/" in model:
+        raise ValueError(
+            f"{role}: placeholder model path {model!r}. "
+            "Pass --model-path /real/model/directory; a local model needs config.json and tokenizer files."
+        )
+    if model.startswith(("/", "./", "../", "~")):
+        local = Path(model).expanduser()
+        if not local.is_dir() or not (local / "config.json").is_file():
+            raise ValueError(
+                f"{role}: local model directory is missing or lacks config.json: {model!r}. "
+                "Set --model-path to a real Hugging Face model directory."
+            )
+
+    for key, flag in (("data.train_files", "--train-files"), ("data.val_files", "--val-files")):
+        value = _effective_override(overrides, key)
+        if not value:
+            raise ValueError(f"{role}: {key} is missing; pass {flag} /real/file.parquet")
+        if "REPLACE_WITH" in value or "/path/to/" in value:
+            raise ValueError(f"{role}: {key} still contains a placeholder: {value!r}")
+        # Check ordinary absolute local-file overrides; Hydra lists, globs and
+        # remote dataset URIs are handled by native VERL instead of guessed here.
+        if value.startswith("/") and not any(c in value for c in "[],*?") and not Path(value).is_file():
+            raise ValueError(
+                f"{role}: {key} points to a nonexistent local file: {value!r}. "
+                f"Set {flag} to a real parquet file."
+            )
 
 
 def log(message):
@@ -297,6 +348,18 @@ def main():
             if "=" not in item:
                 raise ValueError(f"expected Hydra key=value after --, got: {item!r}")
         local_args = {"donor": read_args(a.donor_args), "borrower": read_args(a.borrower_args)}
+        input_overrides = [
+            f"{key}={value}" for key, value in (
+                ("actor_rollout_ref.model.path", a.model_path),
+                ("data.train_files", a.train_files),
+                ("data.val_files", a.val_files),
+            ) if value is not None
+        ]
+        for role in ("donor", "borrower"):
+            validate_training_inputs(
+                shared_args + local_args[role] + input_overrides, role=role
+            )
+        log("Validated donor/borrower model and local dataset paths before Ray startup")
         env = dict(os.environ)
         env.update(RAY_ADDRESS=a.ray_address, PYTHONUNBUFFERED="1",
                    MT_E2E_LOG_ROOT=str(e2e_root), MT_E2E_ATTACH_ONLY="1",
@@ -359,7 +422,7 @@ def main():
         # The native args file can override various model, trainer, dataset and
         # algorithm settings, but cannot silently disable MultiTask/Ray wiring.
         def start(role, token):
-            overrides = shared_args + local_args[role] + fixed + [f"trainer.experiment_name=two_real_{role}_{token}"]
+            overrides = shared_args + local_args[role] + input_overrides + fixed + [f"trainer.experiment_name=two_real_{role}_{token}"]
             cmd = [sys.executable, "-m", "verl.experimental.fully_async_policy.fully_async_main", *overrides]
             (logs / f"{role}_command.json").write_text(
                 json.dumps(cmd, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
