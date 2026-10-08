@@ -5,9 +5,10 @@ Runs *native* VERL entrypoint twice; delegates acceptance to the repository's
 scripts/e2e/run_all.sh. Does not create fake jobs, fake leases, or synthetic
 lifecycle success evidence.
 
-Input: a real donor Lease fixture plus native Fully Async Hydra overrides
-(one override per line in a file, or pass overrides after --). For newly
-started jobs, use --interactive-lease to fill the PG ID after registration.
+Input: native Fully Async Hydra overrides (one per line or after --).
+Without --lease, discovers the real donor CE placement and automatically
+writes a verified Lease fixture for the existing E2E lifecycle driver.
+--lease and --interactive-lease remain available for legacy/manual runs.
 """
 from __future__ import annotations
 
@@ -28,9 +29,13 @@ def arguments():
     p.add_argument("--repo", type=Path, default=Path.cwd(), help="verl-multi-task checkout root")
     p.add_argument("--ray-address", default=os.environ.get("RAY_ADDRESS", "auto"))
     p.add_argument("--namespace", default="multitask-jobs", help="same namespace for both VERL jobs and donor PG")
-    p.add_argument("--lease", type=Path, required=True, help="real donor Lease JSON (may be populated after job startup with --interactive-lease)")
+    p.add_argument("--lease", type=Path, help="optional manual donor Lease JSON; omit for automatic lease discovery")
+    p.add_argument("--auto-lease", action="store_true",
+                   help="explicitly select automatic discovery (default when --lease is omitted)")
+    p.add_argument("--donor-replica-rank", type=int, default=0,
+                   help="native donor replica rank selected for automatic Lease (default: 0)")
     p.add_argument("--interactive-lease", action="store_true",
-                   help="pause after both tasks start, print PGs and let you fill the real Lease before E2E")
+                   help="legacy manual mode: pause after startup to edit --lease before E2E")
     p.add_argument("--native-args", type=Path,
                    help="optional native Fully Async Hydra overrides file (one argument per line)")
     p.add_argument("--donor-args", type=Path, help="optional donor-only Hydra overrides")
@@ -128,6 +133,40 @@ def validate_lease(path, donor_session, ray, namespace):
     return payload
 
 
+def build_auto_lease(donor_session, candidates, donor_rank, token, ttl_s, namespace):
+    """Build a first-release Lease solely from donor-owned CE/PG evidence."""
+    matches = [c for c in candidates if c.get("donor_replica_rank") == donor_rank]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"expected one verified ACTIVE native rank {donor_rank}; "
+            f"found {len(matches)} (candidates={candidates!r})"
+        )
+    c = matches[0]
+    required = ("pg_id", "node_id", "gpu_uuid", "bundle_index", "resource_name")
+    if any(not isinstance(c.get(k), (str, int)) or c[k] == "" for k in required):
+        raise RuntimeError("native candidate lacks verified CE and Ray PG placement facts")
+    if c["resource_name"] not in ("GPU", "NPU") or c["bundle_index"] != 0:
+        raise RuntimeError("first release supports only one whole GPU/NPU in bundle zero")
+    return {
+        "lease_id": f"auto-real-e2e-{token}",
+        "expires_in_s": ttl_s,
+        "borrower_replica_id": f"borrowed-e2e-{token}",
+        "claims": [{
+            "claim_id": f"native-{donor_session}-{donor_rank}-{token}",
+            "source_lease_id": f"native-{donor_session}-{donor_rank}",
+            "donor_task_id": donor_session,
+            "donor_replica_rank": donor_rank,
+            "pg_id": c["pg_id"],
+            "node_id": c["node_id"],
+            "gpu_uuid": c["gpu_uuid"],
+            "pg_namespace": namespace,
+            "bundle_index": c["bundle_index"],
+            "gpu_fraction": 0.5,
+            "cpu_request": 1.0,
+        }],
+    }
+
+
 def main():
     a = arguments()
     repo = a.repo.resolve()
@@ -143,8 +182,18 @@ def main():
     try:
         if not (repo / "scripts/e2e/run_all.sh").is_file():
             raise ValueError(f"not a verl-multi-task checkout: {repo}")
-        if not a.interactive_lease and not a.lease.is_file():
-            raise ValueError(f"Lease fixture not found: {a.lease}; use --interactive-lease to fill it after startup")
+        if a.auto_lease and a.lease is not None:
+            raise ValueError("--auto-lease cannot be combined with --lease; generated Lease lives in run logs")
+        if a.interactive_lease and (a.lease is None or a.auto_lease):
+            raise ValueError("--interactive-lease requires --lease and is incompatible with auto discovery")
+        auto_lease = a.auto_lease or a.lease is None
+        lease_path = logs / "auto_lease.json" if auto_lease else a.lease.resolve()
+        if not auto_lease and not a.interactive_lease and not lease_path.is_file():
+            raise ValueError(f"manual Lease fixture not found: {lease_path}")
+        if a.donor_replica_rank < 0:
+            raise ValueError("--donor-replica-rank must be >= 0")
+        state["lease_mode"] = "auto" if auto_lease else "manual"
+        state["lease_file"] = str(lease_path)
         if not (a.native_args or a.donor_args or a.borrower_args or a.native_overrides):
             raise ValueError("provide native VERL Hydra args after -- or via --native-args (model/data/etc)")
         if a.trainer_gpus <= 0 or a.rollout_gpus <= 0:
@@ -274,6 +323,29 @@ def main():
         log("PASS: two real tasks registered under ONE shared GroupScheduler")
         state["registration"] = "PASS"
 
+        if auto_lease:
+            try:
+                candidates = ray.get(
+                    registered[donor].native_placement_candidates.remote(), timeout=45
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "donor CE placement could not be proven; refusing to invent pg_id/gpu_uuid: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            lease = build_auto_lease(
+                donor, candidates, a.donor_replica_rank, tag,
+                max(7200, a.e2e_timeout + 600), a.namespace,
+            )
+            record(lease_path, **lease)
+            state["donor_placement"] = lease["claims"][0]
+            log(
+                "Auto Lease from actual donor CE + named PG: "
+                f"rank={a.donor_replica_rank}, "
+                f"PG={lease['claims'][0]['pg_id']}, "
+                f"device={lease['claims'][0]['gpu_uuid']}"
+            )
+            log(f"Generated Lease fixture: {lease_path}")
         if a.interactive_lease:
             candidate_pgs = {}
             for pg_id, info in ray.util.placement_group_table().items():
@@ -287,11 +359,12 @@ def main():
             )
             log(f"Ray PG snapshot: {logs / 'placement_groups.json'}")
             log("Use the donor CE worker placement to identify exact pg_id, node_id, GPU UUID/NPU ID, bundle_index.")
-            log(f"Write/replace the Lease file: {a.lease}")
+            log(f"Write/replace the Lease file: {lease_path}")
             log("Neither rank=0 nor placement group name alone proves physical accelerator ownership.")
             input("Press Enter after you have saved the correct Lease JSON (Ctrl+C to cancel): ")
-        validate_lease(a.lease, donor, ray, a.namespace)
+        validate_lease(lease_path, donor, ray, a.namespace)
         state["lease_preflight"] = "PASS"
+        env["MT_E2E_LEASE_FILE"] = str(lease_path)
         for proc in procs:
             if proc.poll() is not None:
                 raise RuntimeError(f"training driver exited before E2E: pid={proc.pid}, rc={proc.returncode}")
