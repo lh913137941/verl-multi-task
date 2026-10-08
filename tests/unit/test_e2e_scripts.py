@@ -239,3 +239,66 @@ def test_exactly_once_timeout_records_failing_ray_stage(tmp_path, monkeypatch):
         assert stage in result["detail"]
         assert "timed out" in result["detail"]
         assert observed[-1] == (timeout_stage, expected_budget)
+
+
+def _load_auto_lease_builder():
+    """Execute the pure fixture builder without importing Ray or VERL."""
+    path = E2E / "verify_two_verl_jobs.py"
+    parsed = ast.parse(path.read_text(encoding="utf-8"))
+    target = next(
+        node for node in parsed.body
+        if isinstance(node, ast.FunctionDef) and node.name == "build_auto_lease"
+    )
+    scope = {}
+    exec(compile(ast.Module(body=[target], type_ignores=[]), str(path), "exec"), scope)
+    return scope["build_auto_lease"]
+
+
+def test_two_real_jobs_can_generate_lease_from_verified_donor_candidate():
+    builder = _load_auto_lease_builder()
+    candidate = {
+        "donor_replica_rank": 0,
+        "pg_id": "real-pg-id",
+        "node_id": "real-node-id",
+        "gpu_uuid": "NPU:real-node-id:3",
+        "bundle_index": 0,
+        "resource_name": "NPU",
+    }
+    result = builder("session-donor", [candidate], 0, "unique123", 7200, "multitask-jobs")
+    assert result["expires_in_s"] == 7200
+    assert result["lease_id"] == "auto-real-e2e-unique123"
+    assert len(result["claims"]) == 1
+    claim = result["claims"][0]
+    assert claim["donor_task_id"] == "session-donor"
+    assert claim["donor_replica_rank"] == 0
+    assert claim["pg_id"] == "real-pg-id"
+    assert claim["gpu_uuid"] == "NPU:real-node-id:3"
+    assert claim["pg_namespace"] == "multitask-jobs"
+    assert claim["gpu_fraction"] == 0.5
+    assert claim["cpu_request"] == 1.0
+
+
+def test_two_real_jobs_auto_lease_rejects_missing_or_ambiguous_placements():
+    builder = _load_auto_lease_builder()
+    candidate = {
+        "donor_replica_rank": 0,
+        "pg_id": "real-pg-id",
+        "node_id": "real-node-id",
+        "gpu_uuid": "GPU-uuid",
+        "bundle_index": 0,
+        "resource_name": "GPU",
+    }
+    for invalid_candidates, rank in (
+        ([], 0),
+        ([candidate], 1),
+        ([candidate, candidate], 0),
+        ([dict(candidate, gpu_uuid="")], 0),
+        ([dict(candidate, resource_name="CPU")], 0),
+        ([dict(candidate, bundle_index=1)], 0),
+    ):
+        try:
+            builder("session-donor", invalid_candidates, rank, "unique123", 7200, "multitask-jobs")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("auto Lease accepted an unverified or ambiguous physical placement")
