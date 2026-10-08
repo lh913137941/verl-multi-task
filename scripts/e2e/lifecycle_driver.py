@@ -130,7 +130,14 @@ def _load_fixture(
         if donor in (None, "", "__TASK_SESSION__", "$TASK_SESSION"):
             claim["donor_task_id"] = donor_session
         claim.setdefault("source_lease_id", f"e2e-source-{run_id}")
-        claim.setdefault("claim_id", f"e2e-claim-{run_id}-{index}")
+        # GS retains claim_id ownership for its entire lifetime, even after
+        # RESTORE closes the previous lease. Full E2E runs the natural and
+        # FORCE cycles against the same GS; give each new lease a distinct
+        # logical claim id while keeping its actual physical placement fixed.
+        claim_id = str(claim.get("claim_id") or f"e2e-claim-{index}")
+        if not raw.get("reuse_lease_id"):
+            claim_id = f"{claim_id}-{run_id}"
+        claim["claim_id"] = claim_id
         claim.setdefault("gpu_fraction", 0.5)
         claim.setdefault("cpu_request", 1.0)
         claims.append(claim)
