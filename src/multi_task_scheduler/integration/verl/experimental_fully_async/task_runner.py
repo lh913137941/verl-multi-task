@@ -483,6 +483,20 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                     )
                 self._attached_to_gs = False
 
+    def native_placement_candidates(self) -> tuple[dict, ...]:
+        """Read-only relay: donor-owned rollout/CE evidence for lease selection."""
+        if not self._control_ready or not self.task_session:
+            raise RuntimeError("TaskRunner is not ready for placement inspection")
+        rollouter = self.components.get("rollouter")
+        if rollouter is None:
+            raise RuntimeError("TaskRunner has no initialized Rollouter")
+        return tuple(
+            ray.get(
+                rollouter.native_placement_candidates.remote(),
+                timeout=CONTROL_RPC_TIMEOUT_S,
+            )
+        )
+
     def _replace_message_queue(self, config) -> None:
         """Swap the native empty startup queue for the queue-owned idempotent variant."""
         old_queue = self.components["message_queue"]
