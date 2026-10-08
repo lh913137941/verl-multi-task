@@ -498,8 +498,18 @@ python scripts/e2e/verify_two_verl_jobs.py \
   --repo . \
   --ray-address "$RAY_ADDRESS" \
   --namespace multitask-jobs \
-  --native-args /tmp/native_args.txt
+  --native-args /tmp/native_args.txt \
+  --start-local-ray
 ```
+
+在**单机真实 GPU/NPU E2E** 中，若没有启动 Ray，可附带 `--start-local-ray`：
+脚本先连接现有 Ray；连接不到时才创建**临时单节点** Ray，将实际 GCS 地址传给
+两个 VERL driver，并在结束时关闭。需要 `--keep-running` 或跨节点执行时，
+应自行启动持久 Ray head（如 `ray start --head`）/连接现有集群，
+**不要**添加 `--start-local-ray`。Ray 必须真实注册 `GPU` 或 `NPU`
+资源；若 NPU 检测不到，脚本会明确报错，不能伪造物理卡数量。
+不添加 `--start-local-ray` 时继续采用安全的只连接模式；
+当无运行中的 Ray 时会提示具体的处理方式。
 
 脚本启动两个独立的原生 VERL Fully Async driver，强制启用 MultiTask 并使用相同的
 Ray 地址和 job namespace；等待两个新的 task_session 附着到同一个 named detached GS，
