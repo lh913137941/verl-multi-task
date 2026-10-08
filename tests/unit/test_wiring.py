@@ -6230,3 +6230,60 @@ def test_taskrunner_concurrent_unknown_replay_launches_only_one_worker():
     assert not first.is_alive() and not second.is_alive()
     assert launched == [command.operation_id]
     assert len(returned) == 2
+
+
+
+@pytest.mark.parametrize("lost_retraction_ack", [False, True])
+def test_rollouter_retracts_idle_candidates_on_resume(lost_retraction_ack):
+    cls = rollouter_class()
+    rollouter = cls(object(), object())
+    rollouter.task_session = "task-a"
+    rollouter.running = True
+    rollouter.paused = False
+    rollouter._idle_report_signature = (("task-a", "native-0", 0, "NATIVE"),)
+    rollouter._idle_report_last_sent = 1.0
+
+    received = []
+
+    def report_to_gs(report):
+        received.append(report)
+        if lost_retraction_ack and len(received) == 1:
+            raise TimeoutError("lost idle retraction ACK")
+        return {"accepted": True, "candidate_count": 0}
+
+    class GS:
+        submit_idle_report = AsyncRemoteMethod(report_to_gs)
+
+    rollouter.group_scheduler = GS()
+
+    # Speed up only this AST-isolated class's 1s monitor tick.
+    async def immediate_tick(_delay):
+        await asyncio.sleep(0)
+
+    cls._idle_report_loop.__globals__["asyncio"] = type(
+        "TestAsyncio",
+        (),
+        {
+            "sleep": staticmethod(immediate_tick),
+            "get_running_loop": staticmethod(asyncio.get_running_loop),
+            "CancelledError": asyncio.CancelledError,
+        },
+    )
+
+    async def run():
+        task = asyncio.create_task(rollouter._idle_report_loop())
+        try:
+            target_count = 2 if lost_retraction_ack else 1
+            for _ in range(300):
+                if len(received) >= target_count and rollouter._idle_report_signature is None:
+                    break
+                await asyncio.sleep(0)
+            assert len(received) == target_count
+            assert rollouter._idle_report_signature is None
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+    assert all(report == {"task_session": "task-a", "candidates": ()}
+               for report in received)
