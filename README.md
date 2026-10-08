@@ -499,8 +499,18 @@ python scripts/e2e/verify_two_verl_jobs.py \
   --ray-address "$RAY_ADDRESS" \
   --namespace multitask-jobs \
   --native-args /tmp/native_args.txt \
-  --start-local-ray
+  --start-local-ray \
+  --model-path /实际模型路径/Qwen3-0.6B
 ```
+
+上面的 `--model-path` 是真实的模型路径，请替换为机器上的实际目录。
+样例 `examples/e2e/native_args.txt` 中的
+`/REPLACE_WITH_VERL_REPO_DIR/Qwen3-0.6B` **只是占位符**，不能直接训练。
+脚本现在会在启动 Ray 和 donor 之前检测该占位符、缺失的本地模型
+`config.json` 以及不存在的本地数据集路径，并直接打印具体参数错误。
+如果示例中的 GSM8K 路径也与机器不符，可额外传入
+`--train-files /真实数据/train.parquet --val-files /真实数据/test.parquet`，
+不需要修改 `/tmp/native_args.txt`。
 
 在**单机真实 GPU/NPU E2E** 中，若没有启动 Ray，可附带 `--start-local-ray`：
 脚本先连接现有 Ray；连接不到时才创建**临时单节点** Ray，将实际 GCS 地址传给
