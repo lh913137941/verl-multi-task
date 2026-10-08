@@ -215,17 +215,17 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             )
             launch = existing is None or reconciliation_launch
 
-        if launch:
-            try:
-                self._launch_operation(command.operation_id)
-            except BaseException as exc:
-                with self._journal_lock:
+            # Reserve/start under the journal lock. Otherwise concurrent
+            # exact-op UNKNOWN retries can both observe no worker, then each
+            # launch a lifecycle thread and repeat side effects.
+            if launch:
+                try:
+                    self._launch_operation(command.operation_id)
+                except BaseException as exc:
                     self._operation_threads.pop(command.operation_id, None)
                     if reconciliation_launch:
-                        # The prior UNKNOWN owner outcome still exists. A local
-                        # thread-launch failure creates no new owner fact and must
-                        # not erase preserved reconciliation inputs or rewrite
-                        # the old UNKNOWN into a resolved FAILED result.
+                        # A local thread-launch failure adds no owner fact and
+                        # must not rewrite the prior UNKNOWN into FAILED.
                         pass
                     else:
                         self._operation_leases.pop(command.operation_id, None)
@@ -234,8 +234,8 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                             OperationStatus.FAILED,
                             f"failed to launch lifecycle worker: {type(exc).__name__}: {exc}",
                         )
-                raise
-        return snapshot
+                    raise
+            return snapshot
 
     def query_operation(self, operation_id: str) -> OperationRecord:
         if not isinstance(operation_id, str) or not operation_id:
