@@ -264,7 +264,14 @@ class GroupScheduler:
         if existing is not None:
             if existing != lease:
                 raise ValueError("conflicting lease replay")
-            return existing
+            # Lease is frozen but each claim is a mutable mapping. Never give
+            # callers a reference into the GS ownership ledger.
+            return Lease(existing.lease_id, existing.claims, existing.expires_at)
+
+        # Detach from caller-owned claim mappings before checking and storing
+        # authorization. A later in-process mutation must not silently change
+        # the lease while active_*_owner still holds the original claim keys.
+        lease = Lease(lease.lease_id, lease.claims, lease.expires_at)
 
         for claim_id in lease.claim_ids:
             owner = self.claim_id_owner.get(claim_id)
@@ -293,7 +300,7 @@ class GroupScheduler:
             self.active_bundle_owner[bundle_key] = lease.lease_id
         for gpu_uuid in lease.gpu_uuids:
             self.active_gpu_owner[gpu_uuid] = lease.lease_id
-        return lease
+        return Lease(lease.lease_id, lease.claims, lease.expires_at)
 
     def advance_lease(self, lease_id: str, evidence: OperationEvidence) -> dict:
         """GS-internal lease progression after exact operation evidence validation."""
