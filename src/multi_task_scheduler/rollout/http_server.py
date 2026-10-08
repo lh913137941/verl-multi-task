@@ -189,13 +189,7 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
             raise RuntimeError("vLLM engine did not enter level-2 sleep")
         self._set_multitask_sleep_stage("level2")
 
-        return {
-            "replica_rank": self.replica_rank,
-            "node_rank": self.node_rank,
-            "sleep_level": 2,
-            "sleeping": True,
-            "global_steps": self.global_steps,
-        }
+        return self._receipt(sleep_level=2, sleeping=True)
 
     async def wake_up(self, tags: list[str] | None = None) -> dict:
         """Wake selected vLLM allocations while keeping admission fenced.

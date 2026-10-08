@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from multi_task_scheduler.orchestration.contracts import (
+    CONTROL_RPC_TIMEOUT_S,
     EvidenceType,
     AttemptState,
     FIRST_RELEASE_MAX_COLOCATE_COUNT,
@@ -20,6 +21,8 @@ from multi_task_scheduler.orchestration.contracts import (
     ReplicaKey,
     ReplicaKind,
     ReplicaState,
+    native_replica_key,
+    require_evidence,
 )
 from multi_task_scheduler.orchestration.operation_journal import OperationJournal
 from multi_task_scheduler.orchestration.replica_sync_gate import GateKind, ReplicaSyncGate
@@ -70,16 +73,6 @@ class AsyncRemoteMethod:
         return self.fn(*args, **kwargs)
 
 
-def _test_require_evidence(value, operation_id, expected, label):
-    if not isinstance(value, OperationEvidence):
-        raise TypeError(f"{label} did not return OperationEvidence")
-    if value.operation_id != operation_id:
-        raise ValueError(f"{label} evidence belongs to another operation")
-    if value.type is not expected:
-        raise ValueError(f"expected {expected.value}, got {value.type.value}")
-    return value
-
-
 class FakeRay:
     class exceptions:
         class GetTimeoutError(Exception):
@@ -113,6 +106,8 @@ def taskrunner_class():
         threading=threading,
         ray=FakeRay,
         FIRST_RELEASE_MAX_COLOCATE_COUNT=FIRST_RELEASE_MAX_COLOCATE_COUNT,
+        CONTROL_RPC_TIMEOUT_S=CONTROL_RPC_TIMEOUT_S,
+        require_evidence=require_evidence,
         logger=type("Logger", (), {"exception": lambda *args, **kwargs: None})(),
     )
 
@@ -131,11 +126,11 @@ def trainer_class():
         OperationRecord=OperationRecord,
         OperationEvidence=OperationEvidence,
         EvidenceType=EvidenceType,
-        ReplicaKey=ReplicaKey,
         ReplicaKind=ReplicaKind,
         GateKind=GateKind,
         ReplicaSyncGate=ReplicaSyncGate,
-        _require_evidence=_test_require_evidence,
+        native_replica_key=native_replica_key,
+        require_evidence=require_evidence,
     )
 
 
@@ -1895,6 +1890,7 @@ def test_manager_owns_state_kind_and_runtime_inventory_separately():
         ReplicaKey=ReplicaKey,
         ReplicaKind=ReplicaKind,
         ReplicaState=ReplicaState,
+        native_replica_key=native_replica_key,
         Lease=Lease,
         EvidenceType=EvidenceType,
         OperationEvidence=OperationEvidence,
@@ -3484,6 +3480,7 @@ def native_manager_class():
         ReplicaState=ReplicaState,
         EvidenceType=EvidenceType,
         OperationEvidence=OperationEvidence,
+        native_replica_key=native_replica_key,
         asyncio=asyncio,
     )
 
@@ -4106,6 +4103,8 @@ def _isolated_group_scheduler_class():
         "EvidenceType": EvidenceType,
         "_RELEASE_KINDS": {OperationKind.DONATE, OperationKind.REMOVE},
         "_IDLE_REPORT_MAX_AGE_S": 10.0,
+        "CONTROL_RPC_TIMEOUT_S": CONTROL_RPC_TIMEOUT_S,
+        "native_replica_key": native_replica_key,
         "time": time,
         "ray": FakeRay,
     }
@@ -4372,6 +4371,8 @@ def test_group_scheduler_binds_donate_to_lease_donor_rank():
         "EvidenceType": EvidenceType,
         "_RELEASE_KINDS": {OperationKind.DONATE, OperationKind.REMOVE},
         "_IDLE_REPORT_MAX_AGE_S": 10.0,
+        "CONTROL_RPC_TIMEOUT_S": CONTROL_RPC_TIMEOUT_S,
+        "native_replica_key": native_replica_key,
         "time": time,
         "ray": type("Ray", (), {"remote": staticmethod(lambda **kwargs: (lambda cls: cls))}),
     }
@@ -4420,6 +4421,8 @@ def test_group_scheduler_restore_requires_original_donor_and_returned_claims():
         "EvidenceType": EvidenceType,
         "_RELEASE_KINDS": {OperationKind.DONATE, OperationKind.REMOVE},
         "_IDLE_REPORT_MAX_AGE_S": 10.0,
+        "CONTROL_RPC_TIMEOUT_S": CONTROL_RPC_TIMEOUT_S,
+        "native_replica_key": native_replica_key,
         "time": time,
         "ray": FakeRay,
     }
@@ -4603,7 +4606,7 @@ def rollouter_class():
         OperationRecord=OperationRecord,
         OperationEvidence=OperationEvidence,
         EvidenceType=EvidenceType,
-        _require_evidence=_test_require_evidence,
+        require_evidence=require_evidence,
         asyncio=asyncio,
         ray=FakeRay,
     )

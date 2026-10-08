@@ -13,20 +13,11 @@ from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
     OperationEvidence,
     OperationRecord,
-    ReplicaKey,
     ReplicaKind,
+    native_replica_key,
+    require_evidence,
 )
 from multi_task_scheduler.orchestration.replica_sync_gate import GateKind, ReplicaSyncGate
-
-
-def _require_evidence(value, operation_id: str, expected: EvidenceType, label: str):
-    if not isinstance(value, OperationEvidence):
-        raise TypeError(f"{label} did not return OperationEvidence")
-    if value.operation_id != operation_id:
-        raise ValueError(f"{label} evidence belongs to another operation")
-    if value.type is not expected:
-        raise ValueError(f"expected {expected.value}, got {value.type.value}")
-    return value
 
 
 @ray.remote(num_cpus=10)
@@ -51,7 +42,7 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
 
         for index, replica in enumerate(replicas):
             rank = getattr(replica, "replica_rank", index)
-            key = ReplicaKey(self.task_session, f"native-{rank}", 0)
+            key = native_replica_key(self.task_session, rank)
             self.checkpoint_manager.add_effective(
                 key,
                 [replica],
@@ -91,6 +82,18 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
         finally:
             await lease.release()
 
+    @staticmethod
+    def _gate_fences(gate: ReplicaSyncGate, operation_id: str) -> bool:
+        """True only when G's fence names this exact operation as its owner.
+
+        A BLOCKED gate owned by another operation must never authorize
+        reconciling this one; both reconcile entry points need the same check.
+        """
+        return (
+            gate.health == "BLOCKED"
+            and gate.blocked_operation_id == operation_id
+        )
+
     async def _reconcile_blocked_publish(
         self,
         operation: OperationRecord,
@@ -99,10 +102,7 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
     ) -> OperationEvidence | None:
         """Resolve a BLOCKED ADD/RESTORE publication from owner facts under G."""
         gate = self.replica_sync_gate
-        if (
-            gate.health != "BLOCKED"
-            or gate.blocked_operation_id != operation.operation_id
-        ):
+        if not self._gate_fences(gate, operation.operation_id):
             return None
 
         target = await self.rollouter.get_pending_target.remote(operation.operation_id)
@@ -111,7 +111,7 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
             # This was not a post-E publication failure; keep the existing fence.
             return None
 
-        replicas, loaded_version = member
+        replicas, _loaded_version = member
         result = {}
 
         async def reconcile():
@@ -129,7 +129,7 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                 release_evidence = await self.rollouter.finalize_release.remote(
                     operation
                 )
-                result["evidence"] = _require_evidence(
+                result["evidence"] = require_evidence(
                     release_evidence,
                     operation.operation_id,
                     EvidenceType.RELEASED,
@@ -144,7 +144,7 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                 # Compatibility with a worker that completed rollback before the
                 # Trainer observed the response.
                 self.checkpoint_manager.remove_effective(target)
-                result["evidence"] = _require_evidence(
+                result["evidence"] = require_evidence(
                     service_evidence,
                     operation.operation_id,
                     EvidenceType.RELEASED,
@@ -152,7 +152,7 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                 )
                 return
 
-            result["evidence"] = _require_evidence(
+            result["evidence"] = require_evidence(
                 service_evidence,
                 operation.operation_id,
                 EvidenceType.SERVICE_COMMITTED,
@@ -211,7 +211,7 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                 operation_id=operation.operation_id,
                 loaded_version=self.current_param_version,
             )
-            _require_evidence(
+            require_evidence(
                 weight_evidence,
                 operation.operation_id,
                 EvidenceType.WEIGHT_READY,
@@ -240,7 +240,7 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                     self.rollouter.finalize_release.remote,
                     operation,
                 )
-                _require_evidence(
+                require_evidence(
                     release_evidence,
                     operation.operation_id,
                     EvidenceType.RELEASED,
@@ -252,7 +252,7 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                 isinstance(service_evidence, OperationEvidence)
                 and service_evidence.type is EvidenceType.RELEASED
             ):
-                _require_evidence(
+                require_evidence(
                     service_evidence,
                     operation.operation_id,
                     EvidenceType.RELEASED,
@@ -264,7 +264,7 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                 )
                 e_committed = False
                 return service_evidence
-            return _require_evidence(
+            return require_evidence(
                 service_evidence,
                 operation.operation_id,
                 EvidenceType.SERVICE_COMMITTED,
@@ -286,7 +286,7 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                         self.rollouter.finalize_release.remote,
                         operation,
                     )
-                    _require_evidence(
+                    require_evidence(
                         release_evidence,
                         operation.operation_id,
                         EvidenceType.RELEASED,
@@ -321,10 +321,7 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
     ) -> OperationEvidence | None:
         """Resolve a BLOCKED DONATE/REMOVE service commit from owner facts under G."""
         gate = self.replica_sync_gate
-        if (
-            gate.health != "BLOCKED"
-            or gate.blocked_operation_id != operation.operation_id
-        ):
+        if not self._gate_fences(gate, operation.operation_id):
             return None
 
         target = await self.rollouter.get_pending_target.remote(operation.operation_id)
@@ -338,7 +335,7 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
             service_evidence = await self.rollouter.commit_service_change.remote(
                 operation
             )
-            result["evidence"] = _require_evidence(
+            result["evidence"] = require_evidence(
                 service_evidence,
                 operation.operation_id,
                 EvidenceType.SERVICE_COMMITTED,
@@ -404,7 +401,7 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                 self.rollouter.commit_service_change.remote,
                 operation,
             )
-            return _require_evidence(
+            return require_evidence(
                 evidence,
                 operation.operation_id,
                 EvidenceType.SERVICE_COMMITTED,
@@ -478,13 +475,13 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                 isinstance(weight_evidence, OperationEvidence)
                 and weight_evidence.type is EvidenceType.RELEASED
             ):
-                return _require_evidence(
+                return require_evidence(
                     weight_evidence,
                     operation.operation_id,
                     EvidenceType.RELEASED,
                     "RESTORE bootstrap rollback",
                 )
-            _require_evidence(
+            require_evidence(
                 weight_evidence,
                 operation.operation_id,
                 EvidenceType.WEIGHT_READY,
@@ -521,13 +518,13 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                     self.rollouter.finalize_release.remote,
                     operation,
                 )
-                return _require_evidence(
+                return require_evidence(
                     release_evidence,
                     operation.operation_id,
                     EvidenceType.RELEASED,
                     "RESTORE no-route rollback",
                 )
-            return _require_evidence(
+            return require_evidence(
                 service_evidence,
                 operation.operation_id,
                 EvidenceType.SERVICE_COMMITTED,
