@@ -317,7 +317,7 @@ def _load_bridge_installer():
 def _fake_verl_entry(tmp_path, *, custom_runner=False, with_bridge=False):
     entry = tmp_path / "verl" / "experimental" / "fully_async_policy" / "fully_async_main.py"
     config = entry.parent / "config" / "fully_async_ppo_trainer.yaml"
-    config.parent.mkdir(parents=True)
+    config.parent.mkdir(parents=True, exist_ok=True)
     config.write_text(
         "defaults:\n  - ppo_trainer\n  - _self_\n\nasync_training:\n"
         .replace("\\\n", "\n"), encoding="utf-8"
