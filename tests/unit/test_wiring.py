@@ -2627,6 +2627,9 @@ def test_worker_gpu_uuid_probe_uses_native_worker_ray_call_context():
         def get_node_id(self):
             return "node-a"
 
+        def get_placement_group_id(self):
+            return "pg-native-a"
+
     fake_ray = type(
         "ProbeRay",
         (),
@@ -2657,7 +2660,9 @@ def test_worker_gpu_uuid_probe_uses_native_worker_ray_call_context():
         get_visible_devices_keyword=lambda: "CUDA_VISIBLE_DEVICES",
     )
 
-    assert cls._runtime_placement_probe(None)["gpu_uuid"] == "GPU-b"
+    placement = cls._runtime_placement_probe(None)
+    assert placement["gpu_uuid"] == "GPU-b"
+    assert placement["pg_id"] == "pg-native-a"
     accelerator["value"] = "GPU-direct"
     assert cls._runtime_placement_probe(None)["gpu_uuid"] == "GPU-direct"
     accelerator["value"] = "MIG-abc"
