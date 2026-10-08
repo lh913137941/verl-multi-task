@@ -295,6 +295,10 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
             if len(placements) != 1:
                 raise RuntimeError(f"native replica {key} has ambiguous CE placement")
             physical = placements[0]
+            if physical.get("pg_id") != pg_id:
+                raise RuntimeError(
+                    f"native CE worker is not a member of its replica-owned PG: {key}"
+                )
             bundle = (info.get("bundles") or {})
             bundle = bundle.get(0, bundle.get("0"))
             nodes = info.get("bundles_to_node_id") or {}
