@@ -28,6 +28,8 @@ def arguments():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--repo", type=Path, default=Path.cwd(), help="verl-multi-task checkout root")
     p.add_argument("--ray-address", default=os.environ.get("RAY_ADDRESS", "auto"))
+    p.add_argument("--start-local-ray", action="store_true",
+                   help="if auto cannot find Ray, start a temporary single-node cluster for this E2E only")
     p.add_argument("--namespace", default="multitask-jobs", help="same namespace for both VERL jobs and donor PG")
     p.add_argument("--lease", type=Path, help="optional manual donor Lease JSON; omit for automatic lease discovery")
     p.add_argument("--auto-lease", action="store_true",
@@ -169,6 +171,53 @@ def build_auto_lease(donor_session, candidates, donor_rank, token, ttl_s, namesp
     }
 
 
+def connect_ray(ray, *, address, namespace, start_local=False):
+    """Connect existing Ray or opt-in to temporary, single-node Ray.
+
+    Auto never silently starts a different Ray cluster in production.
+    Children must receive the concrete GCS address, never 'local'.
+    """
+    if start_local and address != "auto":
+        raise ValueError("--start-local-ray requires --ray-address auto")
+    try:
+        context = ray.init(
+            address=address, namespace=namespace, ignore_reinit_error=False,
+            log_to_driver=False,
+        )
+        return address, False
+    except ConnectionError as exc:
+        if address != "auto":
+            raise RuntimeError(
+                f"Cannot connect to Ray at {address!r}; check head address and network"
+            ) from exc
+        if not start_local:
+            raise RuntimeError(
+                "No running Ray cluster found. For a single-node run, add "
+                "--start-local-ray; alternatively run 'ray start --head' once "
+                "or provide --ray-address <head-ip>:<port> for an existing cluster."
+            ) from exc
+
+    context = ray.init(
+        address="local", namespace=namespace, ignore_reinit_error=False,
+        log_to_driver=False,
+    )
+    # Ray 'local' is an instruction to CREATE a cluster, not a connectable
+    # address. Use the real GCS endpoint for both external VERL processes.
+    runtime_context = ray.get_runtime_context()
+    resolved = getattr(runtime_context, "gcs_address", None)
+    if not resolved:
+        resolved = getattr(context, "address_info", {}).get("address")
+    if not isinstance(resolved, str) or not resolved or resolved in ("auto", "local"):
+        raise RuntimeError("temporary Ray started but no concrete GCS address is available")
+    resources = ray.cluster_resources()
+    if not (float(resources.get("GPU", 0)) > 0 or float(resources.get("NPU", 0)) > 0):
+        raise RuntimeError(
+            "temporary Ray has no GPU/NPU resources; check Ascend Ray NPU "
+            "discovery and start the node with a properly configured NPU resource"
+        )
+    return resolved, True
+
+
 def main():
     a = arguments()
     repo = a.repo.resolve()
@@ -181,6 +230,7 @@ def main():
     state = {"state": "BLOCKED", "detail": "not started", "log_dir": str(logs),
              "ray_address": a.ray_address, "namespace": a.namespace, "scenarios": a.scenarios}
     result_code = 2
+    temporary_ray = False
     try:
         if not (repo / "scripts/e2e/run_all.sh").is_file():
             raise ValueError(f"not a verl-multi-task checkout: {repo}")
@@ -194,6 +244,11 @@ def main():
             raise ValueError(f"manual Lease fixture not found: {lease_path}")
         if a.donor_replica_rank < 0:
             raise ValueError("--donor-replica-rank must be >= 0")
+        if a.start_local_ray and a.keep_running:
+            raise ValueError(
+                "--keep-running requires a persistent Ray cluster; "
+                "start Ray with 'ray start --head' instead"
+            )
         state["lease_mode"] = "auto" if auto_lease else "manual"
         state["lease_file"] = str(lease_path)
         if not (a.native_args or a.donor_args or a.borrower_args or a.native_overrides):
@@ -242,8 +297,16 @@ def main():
         env.pop("MT_E2E_REQUIRE_INFLIGHT_FORCE", None)
 
         log(f"Connect Ray {a.ray_address}, namespace={a.namespace}")
-        ray.init(address=a.ray_address, namespace=a.namespace, ignore_reinit_error=False,
-                 log_to_driver=False)
+        connected_address, temporary_ray = connect_ray(
+            ray, address=a.ray_address, namespace=a.namespace,
+            start_local=a.start_local_ray,
+        )
+        if temporary_ray:
+            log(f"Started isolated local Ray: {connected_address}")
+        a.ray_address = connected_address
+        state["ray_address"] = connected_address
+        state["temporary_ray"] = temporary_ray
+        env["RAY_ADDRESS"] = connected_address
         gs = get_or_create_group_scheduler()
         gs_actor_id = str(gs._actor_id)  # audit-only identity, not placement authority
         baseline = set(ray.get(gs.get_task_runners.remote(), timeout=15))
@@ -509,6 +572,13 @@ def main():
                             pass
         else:
             log("--keep-running: leaving real VERL drivers alive; manage with PIDs above")
+        if temporary_ray:
+            # ray.init(address="local") owns the cluster and shuts it down with
+            # this parent process; do not leave it running after the drivers stop.
+            try:
+                ray.shutdown()
+            except Exception as exc:
+                log(f"Local Ray shutdown warning: {exc}")
         record(summary_file, **state)
         log(f"STATE={state['state']} ({state['detail']})")
         log(f"Summary: {summary_file}")
