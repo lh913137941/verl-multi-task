@@ -43,6 +43,7 @@ def replica_class(*, list_actors, kill):
         "ray": ray,
         "list_actors": list_actors,
         "ReplicaKind": SimpleNamespace(NATIVE="native", BORROWED="borrowed"),
+        "FIRST_RELEASE_MAX_COLOCATE_COUNT": 2,
     }
     exec(compile(ast.fix_missing_locations(module), str(SOURCE), "exec"), scope)
     return scope["MultiTaskvLLMReplica"]
