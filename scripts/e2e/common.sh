@@ -3,6 +3,9 @@ set -eu
 
 E2E_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${E2E_DIR}/../.." && pwd)"
+# Standalone Python drivers do not inherit pytest's `pythonpath = ["src"]`.
+# Make source-checkout E2E entrypoints importable without requiring an editable install.
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 E2E_LOG_ROOT="${MT_E2E_LOG_ROOT:-${REPO_ROOT}/logs/multitask_e2e}"
 
