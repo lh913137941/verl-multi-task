@@ -6380,3 +6380,25 @@ def test_ce_failed_native_removal_preserves_membership_for_reconciliation(monkey
     assert key not in ce.effective_replicas
     assert key not in ce._bootstrap_ready_map
     assert ce.replicas == []
+
+
+
+def test_gs_open_lease_copies_mutable_claims_and_defends_replay_return():
+    gs = _isolated_group_scheduler_class()()
+    external = _scheduler_test_lease()
+    original = _scheduler_test_lease()
+    opened = gs.open_lease(external)
+
+    external.claims[0]["gpu_uuid"] = "GPU-forged"
+    opened.claims[0]["pg_id"] = "PG-forged"
+    assert gs.leases[original.lease_id] == original
+    assert gs.active_gpu_owner == {"u0": original.lease_id}
+    assert gs.active_bundle_owner == {("pg", 0): original.lease_id}
+
+    replay = gs.open_lease(_scheduler_test_lease())
+    assert replay == original
+    assert replay is not gs.leases[original.lease_id]
+    replay.claims[0]["claim_id"] = "claim-forged"
+    assert gs.leases[original.lease_id].claim_ids == original.claim_ids
+    with pytest.raises(ValueError, match="conflicting lease replay"):
+        gs.open_lease(external)
