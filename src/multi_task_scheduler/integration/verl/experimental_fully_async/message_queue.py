@@ -161,24 +161,10 @@ class MultiTaskMessageQueue(_unwrap_ray_remote(MessageQueue)):
             self._completion_db.commit()
             self._next_completion_seq += 1
 
-            try:
-                original_return_value = await super().put_sample(sample)
-            except BaseException:
-                try:
-                    self._completion_db.execute(
-                        """
-                        DELETE FROM completion_evidence
-                        WHERE task_session = ? AND logical_sample_id = ?
-                          AND dropped_oldest IS NULL
-                        """,
-                        (self.task_session, logical_sample_id),
-                    )
-                    self._completion_db.commit()
-                except BaseException:
-                    # Keep the provisional row fail-closed if cleanup itself
-                    # cannot be proven.
-                    pass
-                raise
+            # Native enqueue may have mutated the queue before raising.
+            # An uncertain result must retain the provisional ledger row
+            # so an exact replay cannot enqueue this logical sample again.
+            original_return_value = await super().put_sample(sample)
 
             dropped_oldest = not original_return_value
             try:
