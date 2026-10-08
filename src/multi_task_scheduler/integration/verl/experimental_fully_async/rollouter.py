@@ -255,6 +255,78 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
         ):
             self._idle_report_task = asyncio.create_task(self._idle_report_loop())
 
+    async def native_placement_candidates(self) -> tuple[dict, ...]:
+        """Read-only snapshot from owned native replica and live CE worker.
+
+        Never infer GPU/NPU identity from a rank or from another task's PG.
+        Candidate eligibility (idle/bubble/lease ownership) remains a separate
+        GroupScheduler decision; this method does not donate any resource.
+        """
+        manager = getattr(self, "llm_server_manager", None)
+        if manager is None or not self.task_session:
+            raise RuntimeError("native placement is unavailable before rollout initialization")
+        table = ray.util.placement_group_table()
+        candidates = []
+        for key, kind in manager.replica_kind.items():
+            if (
+                key.task_session != self.task_session
+                or kind is not ReplicaKind.NATIVE
+                or manager.replica_state[key] is not ReplicaState.ACTIVE
+            ):
+                continue
+            runtime = manager.inspect_runtime(key)
+            if runtime is None or runtime.world_size != 1 or len(runtime.workers) != 1:
+                raise RuntimeError(f"native replica {key} lacks a verifiable TP=1 CE worker")
+            pool = runtime.resource_pool
+            pgs = getattr(pool, "pgs", None)
+            if not pgs or len(pgs) != 1 or pgs[0].bundle_count != 1:
+                raise RuntimeError(f"native replica {key} lacks a unique single-bundle PG")
+            pg = pgs[0]
+            pg_id = pg.id.hex()
+            info = table.get(pg_id)
+            if not info or info.get("state") != "CREATED":
+                raise RuntimeError(f"native replica {key} PG is not CREATED: {pg_id}")
+            name = info.get("name")
+            if not isinstance(name, str) or not name:
+                raise RuntimeError(f"native replica {key} PG is not named")
+            if ray.util.get_placement_group(name).id.hex() != pg_id:
+                raise RuntimeError(f"native replica {key} named PG identity changed")
+            placements = await runtime.worker_placements()
+            if len(placements) != 1:
+                raise RuntimeError(f"native replica {key} has ambiguous CE placement")
+            physical = placements[0]
+            bundle = (info.get("bundles") or {})
+            bundle = bundle.get(0, bundle.get("0"))
+            nodes = info.get("bundles_to_node_id") or {}
+            node = nodes.get(0, nodes.get("0"))
+            device = physical.get("resource_name")
+            if device not in ("GPU", "NPU"):
+                raise RuntimeError(f"unsupported CE resource type: {device!r}")
+            if not isinstance(bundle, dict) or float(bundle.get(device, 0)) != 1.0:
+                raise RuntimeError(f"native PG bundle lacks one whole {device} allocation")
+            if float(bundle.get("CPU", 0)) < 1.0:
+                raise RuntimeError("native PG bundle lacks CPU for a borrowed CE actor")
+            if node != physical.get("node_id"):
+                raise RuntimeError(f"native CE node does not match PG bundle: {key}")
+            physical_id = physical.get("gpu_uuid")
+            if not isinstance(physical_id, str) or not physical_id:
+                raise RuntimeError(f"native CE did not prove physical accelerator identity: {key}")
+            if not isinstance(key.replica_id, str) or not key.replica_id.startswith("native-"):
+                raise RuntimeError(f"unexpected native replica ID: {key.replica_id!r}")
+            rank = runtime.replica_rank
+            if key.replica_id != f"native-{rank}":
+                raise RuntimeError(f"native replica rank mismatch: {key}")
+            candidates.append({
+                "donor_replica_rank": rank,
+                "pg_id": pg_id,
+                "pg_name": name,
+                "node_id": node,
+                "gpu_uuid": physical_id,
+                "bundle_index": 0,
+                "resource_name": device,
+            })
+        return tuple(sorted(candidates, key=lambda item: item["donor_replica_rank"]))
+
     def collect_idle_candidates(self) -> tuple[tuple[ReplicaKey, ReplicaKind], ...]:
         """Return only ACTIVE replicas whose removal preserves committed C.
 
