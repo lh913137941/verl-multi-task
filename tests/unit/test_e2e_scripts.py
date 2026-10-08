@@ -466,3 +466,63 @@ def test_two_real_jobs_existing_ray_not_restarted_even_if_local_opt_in():
     ray = ExistingRay()
     assert connect(ray, address="auto", namespace="multitask-jobs", start_local=True) == ("auto", False)
     assert ray.calls == ["auto"]
+
+
+def _load_training_inputs_validator():
+    """Extract pure preflight functions without importing VERL, Ray or NPU."""
+    path = E2E / "verify_two_verl_jobs.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    target = [
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef)
+        and n.name in {"_effective_override", "validate_training_inputs"}
+    ]
+    assert len(target) == 2
+    ns = {"Path": Path}
+    exec(compile(ast.Module(body=target, type_ignores=[]), str(path), "exec"), ns)
+    return ns["validate_training_inputs"]
+
+
+def test_two_real_jobs_inputs_catch_placeholder_before_ray(tmp_path):
+    import pytest
+
+    validate = _load_training_inputs_validator()
+    model = tmp_path / "real-model"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    train = tmp_path / "train.parquet"
+    validation = tmp_path / "test.parquet"
+    train.touch()
+    validation.touch()
+    args = [
+        "actor_rollout_ref.model.path=/REPLACE_WITH_VERL_REPO_DIR/Qwen3-0.6B",
+        f"data.train_files={train}",
+        f"data.val_files={validation}",
+    ]
+    with pytest.raises(ValueError, match="placeholder model"):
+        validate(args, role="donor")
+    with pytest.raises(ValueError, match="placeholder model"):
+        validate(args, role="borrower")
+
+    # An explicit real model override takes precedence without editing fixture.
+    validate(args + [f"actor_rollout_ref.model.path={model}"], role="donor")
+    with pytest.raises(ValueError, match="lacks config.json"):
+        validate(args + [f"actor_rollout_ref.model.path={tmp_path}"], role="donor")
+    with pytest.raises(ValueError, match="nonexistent local file"):
+        validate(args + [
+            f"actor_rollout_ref.model.path={model}",
+            f"data.train_files={tmp_path / 'missing.parquet'}",
+        ], role="donor")
+
+
+def test_two_real_jobs_inputs_support_huggingface_id_without_forcing_local_download(tmp_path):
+    validate = _load_training_inputs_validator()
+    train = tmp_path / "train.parquet"
+    validation = tmp_path / "val.parquet"
+    train.touch()
+    validation.touch()
+    validate([
+        "actor_rollout_ref.model.path=Qwen/Qwen3-0.6B",
+        f"data.train_files={train}",
+        f"data.val_files={validation}",
+    ], role="borrower")
