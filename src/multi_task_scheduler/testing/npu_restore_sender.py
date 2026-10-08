@@ -15,44 +15,57 @@ from verl.workers.engine_workers import TrainingWorker
 
 
 def zero_and_verify_restore_output_weights(engine) -> dict:
-    """Mutate and inspect the exact FSDP-exported output projection.
+    """Mutate *live FSDP1 parameters*, then verify VERL's export.
 
-    Tied input/output embeddings may be represented by a single canonical
-    parameter in the weight stream. Verify before the HCCL collective starts:
-    raising an exception halfway through send_weights can strand the receiver.
+    FSDP1 may replace/flatten its original Parameter objects. In particular,
+    get_output_embeddings().weight on the wrapped module can be a stale view:
+    zero_() succeeds locally but FSDP's get_per_tensor_param() still exports
+    the unchanged flattened parameter. summon_full_params(writeback=True)
+    exposes the authoritative unflattened parameters and commits the edits
+    back to their shards on context exit.
+
+    This acceptance uses strategy='fsdp', fsdp_size=1. Other strategies must
+    fail closed rather than silently treating accessor writes as source Vpub.
     """
-    module = getattr(engine.module, "_fsdp_wrapped_module", engine.module)
-    get_output = getattr(module, "get_output_embeddings", None)
-    if not callable(get_output):
-        raise RuntimeError("RESTORE acceptance model has no output embedding accessor")
-    output = get_output()
-    output_weight = getattr(output, "weight", None)
-    if output_weight is None:
-        raise RuntimeError("RESTORE acceptance model has no output embedding weight")
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+    if not isinstance(engine.module, FSDP):
+        raise NotImplementedError(
+            "NPU RESTORE Vpub mutation requires the FSDP1 training module"
+        )
     hf_config = getattr(getattr(engine, "model_config", None), "hf_config", None)
     if hf_config is None:
         raise RuntimeError("RESTORE acceptance cannot determine weight tying")
     tied = bool(getattr(hf_config, "tie_word_embeddings", False))
 
-    with torch.no_grad():
-        output_weight.zero_()
-        if tied:
-            get_input = getattr(module, "get_input_embeddings", None)
-            if not callable(get_input):
-                raise RuntimeError("tied RESTORE model has no input embedding accessor")
-            input_layer = get_input()
-            input_weight = getattr(input_layer, "weight", None)
-            if input_weight is None:
-                raise RuntimeError("tied RESTORE model has no input embedding weight")
-            input_weight.zero_()
+    # Never mutate accessor objects outside the FSDP full-param context:
+    # FSDP1 may hold the actual values in flat_param instead.
+    with torch.no_grad(), FSDP.summon_full_params(
+        engine.module, recurse=True, writeback=True
+    ):
+        modified = []
+        # named_parameters() resolves the actual model storage while summoned;
+        # remove_duplicate=False is unnecessary: tied aliases share storage.
+        for name, parameter in engine.module.named_parameters():
+            is_head = name.endswith("lm_head.weight")
+            is_input = tied and name.endswith("embed_tokens.weight")
+            if is_head or is_input:
+                parameter.zero_()
+                modified.append(name)
 
+    if tied and not any(name.endswith("embed_tokens.weight") for name in modified):
+        raise RuntimeError("tied RESTORE model lacks live input embedding parameter")
+    if not modified:
+        raise RuntimeError("RESTORE acceptance cannot locate live output projection")
+
+    # The sender exports this stream, not a HF accessor. Perform the check
+    # *before* HCCL group construction so failed mutation cannot strand ranks.
     exported, _ = engine.get_per_tensor_param()
     seen = {}
     for name, tensor in exported:
         is_head = name.endswith("lm_head.weight")
-        is_input = name.endswith("embed_tokens.weight")
-        if is_head or (tied and is_input):
+        is_input = tied and name.endswith("embed_tokens.weight")
+        if is_head or is_input:
             seen[name] = int(torch.count_nonzero(tensor).item())
 
     if tied and not any(name.endswith("embed_tokens.weight") for name in seen):
@@ -63,7 +76,7 @@ def zero_and_verify_restore_output_weights(engine) -> dict:
         raise RuntimeError(
             "RESTORE mutation did not reach the actual Vpub export: " + repr(seen)
         )
-    return {"tied": tied, "export_nonzero": seen}
+    return {"tied": tied, "modified_parameters": modified, "export_nonzero": seen}
 
 
 class RestoreTrainingWorker(TrainingWorker):
