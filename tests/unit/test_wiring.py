@@ -2668,7 +2668,9 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
         MultiTaskvLLMHttpServer=object,
         MultiTaskCheckpointEngineWorker=object,
         asyncio=asyncio,
-        list_actors=lambda **kwargs: [],
+        # A killed worker must have a visible Ray DEAD record before cleanup
+        # is considered verified; an empty State API result is not proof.
+        list_actors=lambda **kwargs: [{"state": "DEAD"}] if killed else [{"state": "ALIVE"}],
         ray=fake_ray,
     )
     config = type(
