@@ -2,6 +2,7 @@ import hashlib
 """Native Fully Async server manager plus the Manager-owned M view."""
 
 import asyncio
+from functools import partial
 import time
 
 import ray
@@ -49,7 +50,15 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         task_session=None,
     ):
         self.task_session = task_session
-        self.rollout_replica_class = MultiTaskvLLMReplica
+        # Native VERL otherwise gives independent jobs identical named PGs
+        # (rollout_pool_0verl_group_1:0) in the shared Ray namespace.
+        # Scope native PG/CE/server names to the actual TaskRunner session.
+        # Borrowed creates override name_suffix with their lease/epoch identity.
+        self.rollout_replica_class = (
+            partial(MultiTaskvLLMReplica, name_suffix=f"mt_{task_session}")
+            if task_session
+            else MultiTaskvLLMReplica
+        )
         super().__init__(config, worker_group, rollout_resource_pool)
         self._load_balancer_cls = MultiTaskGlobalRequestLoadBalancer
         self.replica_state: dict[ReplicaKey, ReplicaState] = {}
