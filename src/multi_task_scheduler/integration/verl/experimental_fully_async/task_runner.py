@@ -362,7 +362,16 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
                             ray.get(
                                 rollouter.get_pending_target.remote(operation_id)
                             )
-                        except BaseException:
+                        except BaseException as query_exc:
+                            # Only an authoritative "no pending target" result
+                            # proves prepare_exit did not enter the owner path.
+                            # Query timeout / actor failure is not negative
+                            # evidence: preserve UNKNOWN for exact-op replay.
+                            cause = getattr(query_exc, "cause", None)
+                            if not isinstance(query_exc, KeyError) and not isinstance(cause, KeyError):
+                                raise RuntimeError(
+                                    "exit target binding query is inconclusive"
+                                ) from query_exc
                             self._finish(
                                 operation_id,
                                 OperationStatus.FAILED,
