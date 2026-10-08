@@ -319,22 +319,22 @@ def _fake_verl_entry(tmp_path, *, custom_runner=False, with_bridge=False):
     config = entry.parent / "config" / "fully_async_ppo_trainer.yaml"
     config.parent.mkdir(parents=True)
     config.write_text(
-        "defaults:\\n  - ppo_trainer\\n  - _self_\\n\\nasync_training:\\n"
-        .replace("\\\\n", "\\n"), encoding="utf-8"
+        "defaults:\n  - ppo_trainer\n  - _self_\n\nasync_training:\n"
+        .replace("\\\n", "\n"), encoding="utf-8"
     )
     runner = "OtherTaskRunner" if custom_runner else "FullyAsyncTaskRunner"
     source = (
-        "class FullyAsyncTaskRunner: pass\\n"
-        "@hydra.main(config_path='config', config_name='fully_async_ppo_trainer')\\n"
-        "def main(config):\\n"
-        "    config = migrate_legacy_reward_impl(config)\\n"
-        "    run_ppo(config, task_runner_class=" + runner + ")\\n"
-    ).replace("\\\\n", "\\n")
+        "class FullyAsyncTaskRunner: pass\n"
+        "@hydra.main(config_path='config', config_name='fully_async_ppo_trainer')\n"
+        "def main(config):\n"
+        "    config = migrate_legacy_reward_impl(config)\n"
+        "    run_ppo(config, task_runner_class=" + runner + ")\n"
+    ).replace("\\\n", "\n")
     if with_bridge:
         installer = _load_bridge_installer()
         patch = (ROOT / "patches" / "verl-v0.10-fully-async-multitask-entry.patch").read_text()
         helper = installer._added_block(patch, "def _resolve_task_runner_class(config):")
-        source = source.replace("@hydra.main(", helper + "\\n@hydra.main(")
+        source = source.replace("@hydra.main(", helper + "\n@hydra.main(")
         source = source.replace(
             "task_runner_class=FullyAsyncTaskRunner",
             "task_runner_class=_resolve_task_runner_class(config)",
@@ -353,7 +353,7 @@ def test_verl_bridge_automatic_fallback_and_idempotence(tmp_path):
     yaml = config.read_text()
     assert py.count("def _resolve_task_runner_class(config):") == 1
     assert "task_runner_class=_resolve_task_runner_class(config)" in py
-    assert "multitask:\\n" in yaml.replace("\\\\n", "\\n")
+    assert "multitask:\n" in yaml.replace("\\\n", "\n")
     assert "  enabled: false" in yaml
     assert list(entry.parent.glob("*.mtbridge-*.bak"))
     assert tool.ensure_current_verl_bridge(entry_path=entry) is False
