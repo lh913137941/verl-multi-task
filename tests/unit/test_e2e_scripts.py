@@ -381,6 +381,7 @@ def test_verl_bridge_preserves_custom_runner_and_check_only(tmp_path):
     assert (entry.read_bytes(), config.read_bytes()) == before
 
     entry, config = _fake_verl_entry(tmp_path)
+    before = (entry.read_bytes(), config.read_bytes())
     with pytest.raises(tool.BridgeSetupError, match="rerun without --check-only"):
         tool.ensure_current_verl_bridge(entry_path=entry, check_only=True)
     assert (entry.read_bytes(), config.read_bytes()) == before
