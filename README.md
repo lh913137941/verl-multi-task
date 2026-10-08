@@ -471,6 +471,35 @@ examples/e2e/lease.example.json
 完整说明：
 [docs/e2e-acceptance.md](docs/e2e-acceptance.md)。
 
+
+### 两个真实 Fully Async 任务的共享 GS 一键验收
+
+先确保目标 VERL 已应用 `patches/verl-v0.10-fully-async-multitask-entry.patch`（或等价适配），
+所有 Ray 节点都能导入本包，并准备可运行的原生 Fully Async 模型、数据、训练参数。
+将这些 Hydra overrides 逐行保存为 `/tmp/native_args.txt`，不要只使用占位模型路径。
+
+```bash
+export RAY_ADDRESS=auto  # 或实际 Ray head 地址
+python scripts/e2e/verify_two_verl_jobs.py \
+  --repo . \
+  --ray-address "$RAY_ADDRESS" \
+  --namespace multitask-jobs \
+  --native-args /tmp/native_args.txt \
+  --lease /tmp/lease.json \
+  --interactive-lease
+```
+
+脚本启动两个独立的原生 VERL Fully Async driver，强制启用 MultiTask 并使用相同的
+Ray 地址和 job namespace；等待两个新的 task_session 附着到同一个 named detached GS，
+然后检查真实 donor PG。首次启动时选择 `--interactive-lease`，根据启动后生成的
+`placement_groups.json` 以及 donor CE worker 的真实设备身份更新 Lease，并按回车继续。
+没有真实 donor GPU/NPU placement 时不能把示例 Lease 直接用于真实借还。
+
+随后复用现有 `run_all.sh` 验证 control_plane、exactly_once、recovery、lifecycle 和 force。
+可用 `--scenarios "lifecycle force"` 缩小范围；`--keep-running` 可保留两个 driver。
+结果和训练日志保存在 `logs/two_real_jobs/<运行时间>/`；退出码为
+`0=PASS / 1=FAIL / 2=BLOCKED`。真实 GPU/NPU 运行结果需在实际集群上判定。
+
 ---
 
 ## 10. 关键实现原则
