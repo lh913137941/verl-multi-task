@@ -164,3 +164,78 @@ def test_live_e2e_explicit_lease_replay_preserves_original_claim_id(tmp_path):
 
     assert first.lease_id == second.lease_id == "replay-lease"
     assert first.claim_ids == second.claim_ids == ("replay-claim",)
+
+
+def test_exactly_once_timeout_records_failing_ray_stage(tmp_path, monkeypatch):
+    """No Ray/VERL required: exercise the actual driver entrypoint with fake RPCs."""
+    import importlib.util
+    import json
+    import pickle
+    from types import ModuleType, SimpleNamespace
+
+    driver_path = E2E / "exactly_once_driver.py"
+    module_name = "_e2e_exactly_once_driver_under_test"
+    spec = importlib.util.spec_from_file_location(module_name, driver_path)
+    driver = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, driver)
+    spec.loader.exec_module(driver)
+
+    class RayGetTimeout(Exception):
+        pass
+
+    class RemoteMethod:
+        def __init__(self, name):
+            self.name = name
+
+        def remote(self, *args, **kwargs):
+            return self.name
+
+    class QueueHandle:
+        get_queue_size = RemoteMethod("ready")
+        put_sample_once = RemoteMethod("enqueue")
+
+    class QueueClass:
+        @staticmethod
+        def remote(*args, **kwargs):
+            return QueueHandle()
+
+    queue_module = ModuleType(
+        "multi_task_scheduler.integration.verl.experimental_fully_async.message_queue"
+    )
+    queue_module.MultiTaskMessageQueue = QueueClass
+    monkeypatch.setitem(sys.modules, queue_module.__name__, queue_module)
+
+    for timeout_stage, expected_budget in (("ready", 47.0), ("enqueue", 7.0)):
+        observed = []
+        fake_ray = ModuleType("ray")
+        fake_ray.exceptions = SimpleNamespace(GetTimeoutError=RayGetTimeout)
+        fake_ray.cloudpickle = SimpleNamespace(dumps=pickle.dumps)
+        fake_ray.is_initialized = lambda: False
+        fake_ray.init = lambda **kwargs: None
+        fake_ray.kill = lambda actor: None
+        fake_ray.shutdown = lambda: None
+
+        def get(ref, timeout):
+            observed.append((ref, timeout))
+            if ref == timeout_stage:
+                raise RayGetTimeout("simulated Ray startup or RPC stall")
+            assert ref == "ready"
+            return 0
+
+        fake_ray.get = get
+        monkeypatch.setitem(sys.modules, "ray", fake_ray)
+        monkeypatch.setenv("MT_E2E_ACTOR_STARTUP_TIMEOUT_S", "47")
+        monkeypatch.setenv("MT_E2E_QUEUE_RPC_TIMEOUT_S", "7")
+        result_file = tmp_path / f"{timeout_stage}.json"
+        monkeypatch.setattr(
+            sys, "argv", ["exactly_once_driver.py", "--result-file", str(result_file)]
+        )
+
+        assert driver.main() == 1
+        result = json.loads(result_file.read_text(encoding="utf-8"))
+        stage = "queue_actor_ready" if timeout_stage == "ready" else "first_enqueue"
+        assert result["state"] == "FAILED"
+        assert result["last_stage"] == stage
+        assert stage in result["detail"]
+        assert "timed out" in result["detail"]
+        assert observed[-1] == (timeout_stage, expected_budget)
