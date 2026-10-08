@@ -6,6 +6,7 @@ Real communicator destruction/recreation must be validated by D3_test.sh.
 
 import importlib.util
 import asyncio
+import ast
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -205,3 +206,55 @@ def test_non_source_rank_clears_previous_canonical_manifest(backend, monkeypatch
     assert consumed == weights
     assert engine.get_source_manifest()["global_steps"] == 4
     assert engine.get_source_manifest()["complete"] is False
+
+
+
+def test_real_restore_acceptance_loads_opt_in_backend_on_both_sides():
+    """Guard against the integration test silently selecting native nccl."""
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "tests/integration/test_native_sleep_npu.py"
+    )
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    restore = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "test_real_npu_restore_reinstalls_current_vpub_and_generates_again"
+    )
+    config_call = next(
+        node for node in ast.walk(restore)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "CheckpointEngineConfig"
+    )
+    fields = {key.arg: ast.literal_eval(key.value) for key in config_call.keywords}
+    assert fields["backend"] == "multitask_hccl"
+    assert fields["custom_backend_module"] == (
+        "multi_task_scheduler.checkpoint.hccl_checkpoint_engine"
+    )
+    assert fields["engine_kwargs"]["multitask_hccl"]["rebuild_group"] is True
+
+    sender = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_training_sender_class"
+    )
+    setup_calls = [
+        node
+        for node in ast.walk(sender)
+        if isinstance(node, ast.Call)
+    ]
+    import_calls = [
+        node for node in setup_calls
+        if isinstance(node.func, ast.Name)
+        and node.func.id == "import_external_libs"
+    ]
+    registry_calls = [
+        node for node in setup_calls
+        if isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "CheckpointEngineRegistry"
+        and node.func.attr == "new"
+    ]
+    assert len(import_calls) == len(registry_calls) == 1
+    assert import_calls[0].lineno < registry_calls[0].lineno
