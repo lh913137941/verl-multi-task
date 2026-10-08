@@ -209,8 +209,16 @@ def main():
         import verl.experimental.fully_async_policy.fully_async_main as entry
         from multi_task_scheduler.scheduler.discovery import get_or_create_group_scheduler
 
-        if not hasattr(entry, "_resolve_task_runner_class"):
-            raise ValueError("VERL Fully Async entry has no MultiTask bridge; apply compatible entry patch")
+        if not callable(getattr(entry, "_resolve_task_runner_class", None)):
+            entry_path = Path(getattr(entry, "__file__", "<unavailable>")).resolve()
+            raise ValueError(
+                "Imported VERL Fully Async entry has no MultiTask TaskRunner bridge: "
+                f"entry={entry_path}, python={sys.executable}. "
+                "Apply patches/verl-v0.10-fully-async-multitask-entry.patch to "
+                "the VERL source checkout used by THIS interpreter, or install "
+                "that patched VERL checkout with python -m pip install -e <VERL_ROOT>; "
+                "do not bypass this preflight check."
+            )
         shared_args = read_args(a.native_args) + list(a.native_overrides)
         for item in a.native_overrides:
             if "=" not in item:
