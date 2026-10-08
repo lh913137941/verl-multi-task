@@ -6287,3 +6287,96 @@ def test_rollouter_retracts_idle_candidates_on_resume(lost_retraction_ack):
     asyncio.run(run())
     assert all(report == {"task_session": "task-a", "candidates": ()}
                for report in received)
+
+
+@pytest.mark.parametrize("validation_fails", [False, True])
+def test_trainer_native_sync_records_version_only_after_manifest_validation(validation_fails):
+    events = []
+    key = ReplicaKey("task-a", "native-0")
+    replica = object()
+
+    class CE:
+        parameter_validation_enabled = True
+        source_validation_enabled = True
+
+        def __init__(self):
+            self.effective_replicas = {key: ((replica,), 7)}
+
+        async def _get_source_manifest(self):
+            events.append("source")
+            return {"complete": True}
+
+        async def validate_parameter_sync(self, replicas, version, source):
+            assert replicas == [replica]
+            assert version == 11
+            assert source == {"complete": True}
+            events.append("validate")
+            if validation_fails:
+                raise RuntimeError("manifest mismatch")
+            return {"state": "PARAMETERS_VALIDATED"}
+
+        def mark_all_loaded_version(self, version):
+            events.append("publish-version")
+            self.effective_replicas[key] = ((replica,), version)
+
+    class Parent:
+        def __init__(self):
+            self.local_trigger_step = 1
+            self.current_param_version = 11
+            self.checkpoint_manager = CE()
+
+        async def _fit_update_weights(self):
+            events.append("native-transfer")
+            return {"timing": 1}
+
+    cls = isolated(
+        f"{INTEGRATION}/trainer.py",
+        "MultiTaskFullyAsyncTrainer",
+        Parent,
+        GateKind=GateKind,
+        ReplicaSyncGate=ReplicaSyncGate,
+        asyncio=asyncio,
+        json=__import__("json"),
+    )
+    trainer = cls()
+    if validation_fails:
+        with pytest.raises(RuntimeError, match="manifest mismatch"):
+            asyncio.run(trainer._fit_update_weights())
+        assert trainer.replica_sync_gate.health == "BLOCKED"
+        assert trainer.checkpoint_manager.effective_replicas[key][1] == 7
+        assert events == ["native-transfer", "source", "validate"]
+    else:
+        assert asyncio.run(trainer._fit_update_weights()) == {"timing": 1}
+        assert trainer.replica_sync_gate.health == "HEALTHY"
+        assert trainer.checkpoint_manager.effective_replicas[key][1] == 11
+        assert events == ["native-transfer", "source", "validate", "publish-version"]
+
+
+def test_ce_failed_native_removal_preserves_membership_for_reconciliation(monkeypatch):
+    cls = checkpoint_manager_class()
+    ce = cls(replicas=[])
+    key = ReplicaKey("task-a", "native-0")
+    ce.add_effective(key, ["runtime"], loaded_version=7)
+    ready = ("op-original", 7, OperationEvidence(
+        "op-original", EvidenceType.WEIGHT_READY, 1
+    ))
+    ce._bootstrap_ready_map[key] = ready
+
+    native_parent = cls.__mro__[1]
+    original_remove = native_parent.remove_replicas
+
+    def failed_remove(_self, _replicas):
+        raise RuntimeError("native membership removal failed")
+
+    monkeypatch.setattr(native_parent, "remove_replicas", failed_remove)
+    with pytest.raises(RuntimeError, match="native membership removal failed"):
+        ce.remove_effective(key)
+    assert ce.effective_replicas[key] == (("runtime",), 7)
+    assert ce._bootstrap_ready_map[key] == ready
+    assert ce.replicas == ["runtime"]
+
+    monkeypatch.setattr(native_parent, "remove_replicas", original_remove)
+    ce.remove_effective(key)
+    assert key not in ce.effective_replicas
+    assert key not in ce._bootstrap_ready_map
+    assert ce.replicas == []
