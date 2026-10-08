@@ -153,12 +153,17 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         self._effective_replica_map[key] = entry
 
     def remove_effective(self, key: ReplicaKey) -> None:
-        self.discard_pending(key)
-        entry = self._effective_replica_map.pop(key, None)
+        entry = self._effective_replica_map.get(key)
         if entry is None:
+            self.discard_pending(key)
             return
         replicas, _loaded_version = entry
+        # Native effective membership must be removed before we discard CE
+        # ownership evidence. If native removal raises, preserve the E record
+        # and bootstrap receipt for exact-operation reconciliation under G.
         super().remove_replicas(list(replicas))
+        self._effective_replica_map.pop(key, None)
+        self.discard_pending(key)
 
     def mark_all_loaded_version(self, loaded_version: int) -> None:
         if type(loaded_version) is not int or loaded_version < 0:
