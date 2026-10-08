@@ -302,3 +302,94 @@ def test_two_real_jobs_auto_lease_rejects_missing_or_ambiguous_placements():
             pass
         else:
             raise AssertionError("auto Lease accepted an unverified or ambiguous physical placement")
+
+def _load_bridge_installer():
+    import importlib.util
+
+    path = E2E / "ensure_verl_multitask_bridge.py"
+    spec = importlib.util.spec_from_file_location("_mt_e2e_bridge_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _fake_verl_entry(tmp_path, *, custom_runner=False, with_bridge=False):
+    entry = tmp_path / "verl" / "experimental" / "fully_async_policy" / "fully_async_main.py"
+    config = entry.parent / "config" / "fully_async_ppo_trainer.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        "defaults:\\n  - ppo_trainer\\n  - _self_\\n\\nasync_training:\\n"
+        .replace("\\\\n", "\\n"), encoding="utf-8"
+    )
+    runner = "OtherTaskRunner" if custom_runner else "FullyAsyncTaskRunner"
+    source = (
+        "class FullyAsyncTaskRunner: pass\\n"
+        "@hydra.main(config_path='config', config_name='fully_async_ppo_trainer')\\n"
+        "def main(config):\\n"
+        "    config = migrate_legacy_reward_impl(config)\\n"
+        "    run_ppo(config, task_runner_class=" + runner + ")\\n"
+    ).replace("\\\\n", "\\n")
+    if with_bridge:
+        installer = _load_bridge_installer()
+        patch = (ROOT / "patches" / "verl-v0.10-fully-async-multitask-entry.patch").read_text()
+        helper = installer._added_block(patch, "def _resolve_task_runner_class(config):")
+        source = source.replace("@hydra.main(", helper + "\\n@hydra.main(")
+        source = source.replace(
+            "task_runner_class=FullyAsyncTaskRunner",
+            "task_runner_class=_resolve_task_runner_class(config)",
+        )
+    entry.write_text(source, encoding="utf-8")
+    return entry, config
+
+
+def test_verl_bridge_automatic_fallback_and_idempotence(tmp_path):
+    tool = _load_bridge_installer()
+    entry, config = _fake_verl_entry(tmp_path)
+    # No .git checkout: force surgical fallback while reusing the .patch contract.
+    changed = tool.ensure_current_verl_bridge(entry_path=entry)
+    assert changed is True
+    py = entry.read_text()
+    yaml = config.read_text()
+    assert py.count("def _resolve_task_runner_class(config):") == 1
+    assert "task_runner_class=_resolve_task_runner_class(config)" in py
+    assert "multitask:\\n" in yaml.replace("\\\\n", "\\n")
+    assert "  enabled: false" in yaml
+    assert list(entry.parent.glob("*.mtbridge-*.bak"))
+    assert tool.ensure_current_verl_bridge(entry_path=entry) is False
+    assert entry.read_text() == py
+    assert config.read_text() == yaml
+
+
+def test_verl_bridge_partial_install_only_adds_missing_config(tmp_path):
+    tool = _load_bridge_installer()
+    entry, config = _fake_verl_entry(tmp_path, with_bridge=True)
+    before = entry.read_text()
+    assert tool.ensure_current_verl_bridge(entry_path=entry) is True
+    assert entry.read_text() == before
+    assert "multitask:" in config.read_text()
+
+
+def test_verl_bridge_preserves_custom_runner_and_check_only(tmp_path):
+    tool = _load_bridge_installer()
+    entry, config = _fake_verl_entry(tmp_path, custom_runner=True)
+    before = (entry.read_bytes(), config.read_bytes())
+    import pytest
+
+    with pytest.raises(tool.BridgeSetupError, match="custom run_ppo"):
+        tool.ensure_current_verl_bridge(entry_path=entry)
+    assert (entry.read_bytes(), config.read_bytes()) == before
+
+    entry, config = _fake_verl_entry(tmp_path)
+    with pytest.raises(tool.BridgeSetupError, match="rerun without --check-only"):
+        tool.ensure_current_verl_bridge(entry_path=entry, check_only=True)
+    assert (entry.read_bytes(), config.read_bytes()) == before
+
+
+def test_two_real_jobs_launches_bridge_setup_before_importing_verl():
+    path = E2E / "verify_two_verl_jobs.py"
+    source = path.read_text()
+    setup = source.index("ensure_current_verl_bridge(check_only=a.no_auto_bridge)")
+    imported = source.index("import verl.experimental.fully_async_policy.fully_async_main as entry")
+    assert setup < imported
+    assert "--no-auto-bridge" in source
