@@ -86,6 +86,50 @@ MessageQueue 约束完整样本恰好一次提交；重复提交的幂等性、�
 
 **2026-10-09 NPU E2E 历史失败（08:43 轮次）**：`logs/two_real_jobs/20261009-084341/` 的 `force_cycle` 实际在第二次 ADD 失败，报 `ADD bootstrap failed; hidden runtime was verified RELEASED`，因此未进入 FORCE。日志显示 `checkpoint-finalize-complete` 与 `kv-resume-complete`，随后有 EngineCore shutdown 和 SIGTERM，但尚不足以确定底层根因。已在本分支 Trainer `bootstrap_and_publish` 异常捕获处增加包含 `operation_id`、`target`、`e_committed` 和 traceback 的日志（提交 `35ed25a`）；**仅增强诊断；后续 09:42 轮次的 5/5 PASS 说明该次未复现，但不能据此判定 ADD 的历史根因已经消除**。
 
+## 1.8 各模块核心字段、方法与原生复用点
+
+本节以代码中的类成员和方法名称为依据；**字段只列影响跨组件合同或生命周期的核心成员**。以下表格中的内部属性和以下划线开头的方法不构成新增公共 API；部分字段为基类继承或属性访问器，调用方应通过已有 Owner 方法读取。返回值只在已确认的现有接口中列出。
+
+### 1.8.1 GS、发现与操作合同
+
+| 组件 | 核心字段 / 状态（Owner） | 关键方法（作用 / 返回） | 复用点 |
+| --- | --- | --- | --- |
+| `scheduler/group_scheduler.py` | 任务与 TaskRunner 注册映射、空闲上报、Lease claims/进度账本、操作路由记录（GS 内部） | `attach_task(task_id, task_runner) -> None` 注册；`detach_task(task_id) -> None` 注销；`get_task_runners() -> dict`；`submit_idle_report(report)` 收集候选；`submit_operation(command) -> OperationRecord`；`open_lease(lease) -> Lease`；`advance_lease(lease_id, evidence) -> dict` | Ray detached Actor、`ActorHandle`、真实 PG/claims；不代替 ResourcePool |
+| `scheduler/discovery.py` | GS 命名发现入口，无另设跨任务状态 Owner | `get_or_create_group_scheduler()`：发现或创建共享 GS | Ray named/detached actor |
+| `orchestration/contracts.py` | `ReplicaKey(task_session, replica_id, runtime_epoch)`；`OperationCommand(operation_id, kind, target, lease_id, force)`；`OperationRecord`；`OperationEvidence`；`Lease(lease_id, claims, expires_at)`；`ReplicaKind / ReplicaState / AttemptState / OperationStatus / EvidenceType` | 各类型的 `__post_init__` 校验；`OperationEvidence.now(...)`；Lease 的 `claim_ids()`、`source_lease_ids()`、`bundle_keys()`、`gpu_uuids()` | 标准 `dataclass` / Enum 和 VERL/Ray 传参；不重复定义设备实体 |
+| `orchestration/operation_journal.py` | 按 `operation_id` 维护 command 与 record（OperationJournal 内部） | `begin(command) -> OperationRecord`；`query(id) -> OperationRecord | None`；`command(id) -> OperationCommand`；`mark_running(id)`、`reopen_unknown(id)`、`finish(...)` | 同一 command 幂等重放、终态保留；不重复执行设备操作 |
+| `orchestration/replica_sync_gate.py` | `_lock`、`_epoch`、`_owner`、`_blocked_reason`、`_blocked_operation_id` | `acquire(...)` 返回 GateLease；`GateLease.guard(call, ...)` 串行执行；`release()`；`block(owner, reason)`；`reconcile(...)`；`health / owner / blocked_reason` 查询 | `asyncio.Lock` 与原生 Trainer 参数同步时序；不新增第二套权重传输 |
+
+### 1.8.2 VERL 插件与任务、训练编排
+
+| 组件 | 核心字段 / 状态 | 关键方法 | 复用点 |
+| --- | --- | --- | --- |
+| `integration/verl/runtime_profile.py` | 唯一受支持 Fully Async STANDALONE profile 的能力条件（非持久状态） | `resolve_runtime_profile(config)`、`validate_runtime_profile(config)`；非法组合抛 `ProfileConfigurationError` | VERL 原生 Hydra 配置与运行时配置字段 |
+| `integration/verl/ray_actor.py` | 无额外生命周期账本 | `unwrap_native_actor_class(actor_class)` 解析原生 Actor 类型 | VERL/Ray 原生 Actor 类包装 |
+| `task_runner.py` | `task_session`、`group_scheduler`、`_control_ready`、`_attached_to_gs`、`_operation_journal`、`_journal_lock`；按操作保存 Lease 快照与执行绑定 | `run(config)`；`submit_operation(...)` 受理；`query_operation(operation_id) -> OperationRecord`；`native_placement_candidates() -> tuple[dict,...]`；内部 `_execute_operation()`、`_advance_lease()`、`_attach_task_with_reconciliation()` | 继承 `FullyAsyncTaskRunner`，复用其组件生命周期与原生训练主循环，借助 Ray 调用 Trainer/Rollouter |
+| `trainer.py` | `task_session`、`_replica_sync_gate`、`checkpoint_manager`，复用基类 `current_param_version`、`rollouter`、`actor_wg` | `_setup_checkpoint_manager()`；`_fit_update_weights()`；`bootstrap_and_publish(operation) -> OperationEvidence`；`remove_and_commit(operation) -> OperationEvidence`；`restore_and_publish(operation) -> OperationEvidence`；`reconcile_exit(...)` | 继承 `FullyAsyncTrainer`；复用原生 optimizer/weight update、CE group 和 Rollouter，扩展目标集/安全门而非重写 PPO |
+| `message_queue.py` | `task_session`、`_completion_db`、`_next_completion_seq`、`_completion_lock`、`_completion_tmpdir` | `put_sample_once(sample) -> CompletionEvidence`；`put_sample(sample) -> bool`；`shutdown()`；`_decode_identity(sample)`、`_lookup_completion(...)` | 继承原生 `MessageQueue`，延续消费队列与提交路径，附加完成事实去重和冲突检查 |
+
+### 1.8.3 Rollouter、Manager 与 Replica Runtime
+
+| 组件 | 核心字段 / 状态 | 关键方法 | 复用点 |
+| --- | --- | --- | --- |
+| `rollouter.py` | `group_scheduler`、`task_session`、`llm_server_manager`、`async_rollout_manager`、`_idle_report_signature`、`_idle_report_last_sent`、`_force_handoff_timeout_s`、`_natural_drain_timeout_s` | `native_placement_candidates()`、`collect_idle_candidates()`、`submit_idle_report()`；`prepare_replica(...)`、`get_pending_target(id)`、`get_pending_replicas(id)`；`prepare_exit(...)`、`commit_service_change(operation)`、`finalize_release(operation) -> OperationEvidence`、`query_release_operation(...)` | 继承 `FullyAsyncRollouter`；复用原生 `FullyAsyncLLMServerClient`、`RewardLoopManager`、async rollout 处理器；局部包装 continuation 与 task-scoped RewardLoop |
+| `llm_server_manager.py` | `task_session`、`next_replica_rank`、`replica_operation_lock`、`global_load_balancer`；按 ReplicaKey 保存 kind/state、放置及 release 事实（内部账本） | `register_replica(...)`、`transition_replica(key, state) -> ReplicaState`、`replica_meta(key) -> (ReplicaKind, ReplicaState)`、`inspect_runtime(key)`、`validate_borrowed_spec(spec) -> dict`、`create_borrowed_replica(spec) -> dict`、`sleep(...)`、`destroy(...)`、`query_release_evidence(...)`、`activate_service(key)`、`deactivate_service(key)` | 继承 `FullyAsyncLLMServerManager`；复用 Ray PG/bundle、VERL Server 管理、vLLM sleep/wake |
+| `rollout/replica.py` | `replica_kind`、`runtime_epoch`、`placement_claims`、`borrowed_worker_names`、`borrowed_server_names`、`workers`、`servers`、`borrowed_cleanup_verified` | `validate_placement(spec)`、`build_borrowed_worker_plan(spec)`、`worker_placements()`、`validate_worker_placement()`、`validate_server_runtime()`、`init_from_lease(...)`、`cleanup_borrowed_runtime()`、`sleep()`、`wake_up(tags)` | 继承原生 `vLLMReplica`；复用 Ray WorkerGroup/PG、vLLM Worker 与原生 Runtime 创建机制 |
+| `rollout/http_server.py` | `engine`、`_submission_paused`、`_multitask_sleep_stage_value`、`_server_port` | `runtime_health() -> dict`、`shutdown_runtime() -> dict`、`sleep() -> dict`、`wake_up(tags) -> dict`；`_wait_admission_barrier()`、`_validate_multitask_engine_capabilities()` | 继承 `vLLMHttpServer`；复用 vLLM EngineCore、真实模型生成和 sleep/wake 原语，不以模拟回执替代设备状态 |
+
+### 1.8.4 LB、Checkpoint Engine 与后端
+
+| 组件 | 核心字段 / 状态 | 关键方法 | 复用点 |
+| --- | --- | --- | --- |
+| `rollout/load_balancer.py` | 基类路由/服务端集合及 request→server 事实；本类 `_awaiting_service_restore`、`_settled_retention`、`_settled_count`；内部 attempt 和操作关联账本 | `acquire_server(request_id,...)`、`release_server(server_id, request_id)`、`query_attempt(request_id)`、`confirm_continuation(request_id, client_id,...)`、`continuation_handoff_requests(operation_id)`、`requests_for_server(server_id)`、`begin_drain(key, operation_id)`、`commit_ready(...)`、`finish_remove(key)` | 继承 `GlobalRequestLoadBalancer`，复用原生 HTTP Server 选择与请求释放；新增安全 fencing/attempt 证明 |
+| `checkpoint/checkpoint_engine_manager.py` | `_effective_replica_map`（`effective_replicas` 属性）、`_pending_bootstrap_map`（`pending_bootstrap` 属性）、`_bootstrap_ready_map`、`parameter_validation_enabled`、`source_validation_enabled`、`backend` | `register_pending(...)`、`bootstrap_target(...)`、`commit_pending(...)`、`discard_pending(key)`、`add_effective(...)`、`remove_effective(key)`、`mark_all_loaded_version(version)`、`validate_parameter_sync(...)` | 继承原生 `CheckpointEngineManager`；复用 `RayWorkerGroup`、原生通信组/参数广播和版本同步，仅控制目标集合与证据 |
+| `checkpoint/checkpoint_engine_worker.py` | 原生 Worker 权重加载状态、带 suffix 的 ServerAdapter、参数 Manifest / digest | `update_weights(global_steps)`、`get_parameter_manifest() -> dict`，内部 tensor SHA256 | 继承 `CheckpointEngineWorker`；复用 VERL 原生 Worker 与接收端，附加传输审计 |
+| `checkpoint/hccl_checkpoint_engine.py` | 源端 manifest、训练步/权重摘要相关事实 | `send_weights(weights, global_steps)`、`get_source_manifest() -> dict`、`finalize()` | 继承原生 `HCCLCheckpointEngine`；复用 Ascend/HCCL 真实通信与 finalize，不创建虚构权重成功证据 |
+
+**跨模块复用边界**：原生 VERL 仍负责训练循环、WorkerGroup、参数发送接收、Rollout 主循环和 Runtime 原语；Ray 负责 Actor/PG 放置；MultiTask 主要增加 GS/Lease、Owner 独立事实、任务级编排、目标集同步、证据校验和 fail-closed。查询操作/证据应通过现有方法，不直接从别的组件读内部 map。
+
 # 第二部分：测试与综合验收
 
 ## 2.1 分层与测试文件清单
