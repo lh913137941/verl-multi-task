@@ -475,7 +475,11 @@ examples/e2e/lease.example.json
 ### 两个真实 Fully Async 任务的共享 GS 一键验收
 
 准备可运行的原生 Fully Async 模型、数据和训练参数，将 Hydra overrides
-逐行写入 `/tmp/native_args.txt`，所有 Ray 节点须能导入本包。
+逐行写入 `/tmp/native_args.txt`。E2E 会自动把本仓 `src/` 加入主进程、
+两个 VERL driver 的 `PYTHONPATH`，并通过 Ray `runtime_env` 传给新建的
+Ray Worker，因此无需手动导出 `PYTHONPATH` 或为了这个启动器执行 `pip install -e .`。
+多机 Ray 上每个节点仍必须能访问**同一路径**的源码；现存的 detached Actor
+无法被这次启动器自动更新。
 
 **无需手动设置 `VERL_ROOT`、`git apply` 或安装额外补丁。** 默认启动时，
 `verify_two_verl_jobs.py` 会自动定位当前 Python **实际导入**的 VERL：
