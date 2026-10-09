@@ -26,11 +26,6 @@ def _jsonable(value):
     return value
 
 
-def _blocked(message: str) -> int:
-    print(f"MULTITASK_E2E_BLOCKED {message}", file=sys.stderr)
-    return 2
-
-
 def _init_ray(timeout_s: float):
     try:
         import ray
