@@ -23,6 +23,10 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         self.active_request_server: dict[str, str] = {}
         self.attempt_state: dict[str, AttemptState] = {}
         self.draining_operations: dict[str, str] = {}
+        # Closing admission on the last server is a lifecycle transition, not
+        # proof that future service can never return. Keep this fact after
+        # finish_remove until an ADD/RESTORE publishes a replacement.
+        self._awaiting_service_restore = False
         self.ready_operations: dict[str, tuple[ReplicaKey, str, OperationEvidence]] = {}
         # request_id -> (client_id, prefix_digest, operation_id, evidence).
         # This remains LB-internal request truth: exact retries are idempotent,
@@ -112,6 +116,10 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
     def query_attempt(self, request_id: str):
         return self.attempt_state.get(request_id)
 
+    def is_service_restore_pending(self) -> bool:
+        """Read-only reason for an empty pool; never infer it from emptiness."""
+        return self._awaiting_service_restore and not self._servers
+
     def confirm_continuation(self, request_id: str, client_id: str,
                              prefix_digest: str) -> OperationEvidence:
         if not request_id or not client_id or not prefix_digest:
@@ -193,6 +201,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
                 raise ValueError("server_id is already owned by another ReplicaKey")
 
         self.add_servers({server_id: server_handle})
+        self._awaiting_service_restore = False
         self.routes[key] = server_id
         evidence = OperationEvidence.now(
             operation_id,
@@ -233,6 +242,8 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             raise ValueError("server is already draining under another operation")
         self.draining_operations[server_id] = operation_id
         self.remove_servers([server_id])
+        if not self._servers:
+            self._awaiting_service_restore = True
         return server_id
 
     def finish_remove(self, key: ReplicaKey):
