@@ -1,5 +1,8 @@
 # D0–D4 真实 E2E 验收开发记录
 
+> **历史记录（非当前执行入口）**：文中 `testing/e2e_verdict.py`、`test_e2e_verdict.py` 与 `D0_D4_E2E_RESULT` 属于旧 verl_expansion/D0–D4 验收协议，当前分支已移除无调用方的旧校验器和对应单测。现行验收请使用 `scripts/e2e/verify_two_verl_jobs.py`、`run_all.sh` 和 `validate_*` 五场景。
+
+
 日期：2026-09-25。状态：同机正例测试夹具与严格回执判定已实现，本机未运行真实 NPU
 验收。本文记录实现和验证方法；场景完整门槛见
 [综合验收测试设计](comprehensive_acceptance_test.md)。
