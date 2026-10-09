@@ -130,6 +130,22 @@ def _effective_override(overrides, name):
     return result
 
 
+def checkpoint_backend_overrides(device):
+    """Use native NCCL on CUDA and opt-in HCCL teardown on Ascend NPU."""
+    if device == "npu":
+        return [
+            "actor_rollout_ref.rollout.checkpoint_engine.backend=multitask_hccl",
+            "++actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.multitask_hccl.rebuild_group=true",
+            "++actor_rollout_ref.rollout.checkpoint_engine.custom_backend_module=multi_task_scheduler.checkpoint.hccl_checkpoint_engine",
+        ]
+    if device == "cuda":
+        return [
+            "actor_rollout_ref.rollout.checkpoint_engine.backend=nccl",
+            "++actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nccl.rebuild_group=true",
+        ]
+    raise ValueError(f"Unsupported checkpoint backend device: {device!r}")
+
+
 def validate_training_inputs(overrides, *, role):
     """Fail early on template paths; never launch Ray just to find missing files."""
     model = _effective_override(overrides, "actor_rollout_ref.model.path")
@@ -461,15 +477,10 @@ def main():
             "++actor_rollout_ref.rollout.enable_sleep_mode=true",
             "actor_rollout_ref.rollout.free_cache_engine=true",
             "actor_rollout_ref.rollout.calculate_log_probs=true",
-            # The 'nccl' name maps to VERL's native HCCL on NPU, whose
-            # finalize() calls a missing PyHcclCommunicator.destroyComm.
-            # Use the existing opt-in compatible HCCL backend only on NPU.
-            f"actor_rollout_ref.rollout.checkpoint_engine.backend={'multitask_hccl' if devices['donor'] == 'npu' else 'nccl'}",
-            f"++actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.{'multitask_hccl' if devices['donor'] == 'npu' else 'nccl'}.rebuild_group=true",
-            *(
-                ["++actor_rollout_ref.rollout.checkpoint_engine.custom_backend_module=multi_task_scheduler.checkpoint.hccl_checkpoint_engine"]
-                if devices["donor"] == "npu" else []
-            ),
+            # The native 'nccl' registry entry maps to HCCL on NPU, whose
+            # finalize() uses PyHcclCommunicator.destroyComm (not implemented).
+            # Both transfer endpoints load the compatible opt-in plugin on NPU.
+            *checkpoint_backend_overrides(devices["donor"]),
             "async_training.use_trainer_do_validate=false",
             "async_training.use_dynamic_resource_scheduling=false",
             "async_training.partial_rollout=true",
