@@ -5,16 +5,65 @@ import json
 import os
 
 import torch
+import ray
 
 from verl.checkpoint_engine.base import CheckpointEngineWorker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.workers.rollout.utils import ensure_async_iterator
+from verl.workers.rollout.vllm_rollout.vllm_rollout import ServerAdapter
+
+
+class _MultiTaskServerAdapter(ServerAdapter):
+    """Resolve only the exact task-scoped native vLLM server name.
+
+    VERL's ServerAdapter has no name_suffix argument and otherwise looks for
+    vllm_server_0_0, while the MultiTask Replica creates
+    vllm_server_0_0_mt_<task_session>. Never fall back to an unscoped actor:
+    it could belong to another concurrently running VERL job.
+    """
+
+    def __init__(self, *args, server_name_suffix: str, **kwargs):
+        if not isinstance(server_name_suffix, str) or not server_name_suffix.startswith("_"):
+            raise ValueError("MultiTask vLLM server name_suffix must begin with '_'")
+        super().__init__(*args, **kwargs)
+        self._server_name_suffix = server_name_suffix
+
+    def _ensure_server_handle(self) -> bool:
+        if not self._has_server:
+            return False
+        if self.server_handle is None:
+            # MultiTask's first-release runtime is standalone TP=DP=PP=1,
+            # not PD-disaggregation; preserve a hard boundary for other layouts.
+            if self._pd_role is not None:
+                raise NotImplementedError(
+                    "MultiTask task-scoped ServerAdapter does not support PD routing"
+                )
+            actor_name = (
+                f"{self._get_server_name_prefix()}server_"
+                f"{self.replica_rank}_{self.node_rank}{self._server_name_suffix}"
+            )
+            self.server_handle = ray.get_actor(actor_name)
+        return True
 
 
 class MultiTaskCheckpointEngineWorker(CheckpointEngineWorker):
     """Record receiver-side parameter fingerprints while reusing native transport."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, server_name_suffix: str = "", **kwargs):
+        if server_name_suffix:
+            if kwargs.get("server_adapter") is not None or len(args) > 2:
+                raise ValueError("MultiTask CE requires one explicit task-scoped vLLM adapter")
+            rollout_config = kwargs.get("rollout_config", args[0] if args else None)
+            model_config = kwargs.get("model_config", args[1] if len(args) > 1 else None)
+            if rollout_config is None or model_config is None:
+                raise ValueError("MultiTask CE requires rollout_config and model_config")
+            kwargs["server_adapter"] = _MultiTaskServerAdapter(
+                config=rollout_config,
+                model_config=model_config,
+                device_mesh=None,
+                replica_rank=kwargs.get("replica_rank", -1),
+                server_name_suffix=server_name_suffix,
+            )
         try:
             super().__init__(*args, **kwargs)
         except Exception as error:
