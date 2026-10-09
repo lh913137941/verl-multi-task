@@ -10,14 +10,14 @@
 2. 使用已接入 MultiTask TaskRunner 选择逻辑的 VERL checkout；仅安装 wheel
    不会自动修改其他上游 checkout。
 3. 继续从 `python -m verl.experimental.fully_async_policy.fully_async_main` 启动，
-   将 [native_entry_overrides.txt](native_entry_overrides.txt) 中的参数追加到原有训练命令。
+   在原训练命令中设置 `multitask.enabled=true`，并确保采用独立异步 vLLM\n   和当前支持的 checkpoint backend。E2E 启动器会自动处理其支持的参数。
 4. 设置 `multitask.enabled=false` 即可关闭，新启动任务保留原生路径。
 
 `multitask.enabled=true` 默认选择唯一的
 `experimental_fully_async_standalone` profile。当前首版只支持单节点、整卡、
 DP=1、PP=1、non-PD vLLM；当前真实 GPU 验收仅覆盖 TP=1，因此 TP>1 暂时 fail-closed。
 
-示例只提供接入条件，模型、数据、算法、训练步数以及 trainer/rollout 资源参数继续
+原生手动接入常用的 Hydra overrides（按实际设备和配置调整）：\n\n```text\nmultitask.enabled=true\nactor_rollout_ref.hybrid_engine=false\nactor_rollout_ref.rollout.name=vllm\nactor_rollout_ref.rollout.mode=async\nactor_rollout_ref.rollout.calculate_log_probs=true\nactor_rollout_ref.rollout.checkpoint_engine.backend=nccl\nactor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nccl.rebuild_group=true\nasync_training.use_trainer_do_validate=false\nasync_training.use_dynamic_resource_scheduling=false\ndata.train_batch_size=0\ndata.gen_batch_size=1\n```\n\n上面是原 CUDA 原生接入示例，不是所有设备统一的运行配置；NPU 等环境必须选用适配的后端。\n\n示例只提供接入条件，模型、数据、算法、训练步数以及 trainer/rollout 资源参数继续
 使用原生配置。GS 不分配初始规模；初始 Replica 数量仍由原生 rollout 资源字段决定。
 
 ## 验收顺序
