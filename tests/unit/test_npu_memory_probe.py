@@ -17,7 +17,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = ROOT / "tests/integration/test_native_sleep_npu.py"
+SOURCE = ROOT / "tests/integration/npu/test_native_sleep_npu.py"
 
 NPU_SMI_SAMPLE = """
 +------------------------------------+
