@@ -199,6 +199,8 @@ VERL_MULTITASK_GPU_MODEL_PATH=/实际模型路径 \
 
 ## 9. E2E 验收结果与排错
 
+`verify_two_verl_jobs.py` 是唯一推荐的启动入口；内部由 `run_all.sh` 分发到五个 `validate_*` 验收脚本，用户无需逐个运行。
+
 `--scenarios` 允许选择以下场景；只需更改第 6 节命令的最后一行：
 
 | 场景 | 验证 |
