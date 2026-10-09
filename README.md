@@ -16,6 +16,7 @@ STANDALONE + vLLM 链路上增加：
 > [详细设计（092401）](docs/多RL任务共享调度对接VERL_动态流程编排融合设计精简优化版092401.md) 用于流程与接口评审，
 > 最新实现与设计存在差异时以代码和验收证据为准；
 > 完整验收规则见 [e2e-acceptance.md](docs/e2e-acceptance.md)。
+> 交付文件职责与分层验证见 [开发与综合验收](docs/development-and-comprehensive-acceptance.md)。
 
 ---
 
