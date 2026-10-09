@@ -5,13 +5,8 @@ import ast
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
-import ast
-from pathlib import Path
-from types import SimpleNamespace
-import pytest
 import threading
 import time
-import pytest
 from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
     Lease,
