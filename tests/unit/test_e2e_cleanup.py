@@ -36,7 +36,7 @@ def test_all_five_validate_scripts_still_reachable_from_real_two_job_runner():
     expected = {
         "control_plane": ("validate_control_plane.sh", "control_plane_recovery.py"),
         "exactly_once": ("validate_exactly_once.sh", "exactly_once_driver.py"),
-        "recovery": ("validate_recovery_faults.sh", "test_wiring.py"),
+        "recovery": ("validate_recovery_faults.sh", "test_taskrunner_wiring.py"),
         "lifecycle": ("validate_lifecycle_cycle.sh", "lifecycle_driver.py"),
         "force": ("validate_force_remove.sh", "lifecycle_driver.py"),
     }
