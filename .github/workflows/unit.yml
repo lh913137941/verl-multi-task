@@ -20,7 +20,7 @@ jobs:
         run: python -m pip install -e '.[test]'
       - name: Compile opt-in integration entrypoints
         run: |
-          python -m py_compile tests/integration/test_native_sleep_npu.py
+          python -m py_compile tests/integration/npu/test_native_sleep_npu.py
           python -m py_compile scripts/e2e/diagnose_npu_runtime.py
 
       - name: Run unit suite
