@@ -7,8 +7,8 @@ lifecycle success evidence.
 
 Input: native Fully Async Hydra overrides (one per line or after --).
 Without --lease, discovers the real donor CE placement and automatically
-writes a verified Lease fixture for the existing E2E lifecycle driver.
---lease and --interactive-lease remain available for legacy/manual runs.
+writes a verified Lease fixture for the E2E lifecycle driver.
+--lease can supply a previously verified manual fixture for diagnostics.
 """
 from __future__ import annotations
 
@@ -70,12 +70,8 @@ def arguments():
                    help="if auto cannot find Ray, start a temporary single-node cluster for this E2E only")
     p.add_argument("--namespace", default="multitask-jobs", help="same namespace for both VERL jobs and donor PG")
     p.add_argument("--lease", type=Path, help="optional manual donor Lease JSON; omit for automatic lease discovery")
-    p.add_argument("--auto-lease", action="store_true",
-                   help="explicitly select automatic discovery (default when --lease is omitted)")
     p.add_argument("--donor-replica-rank", type=int, default=0,
                    help="native donor replica rank selected for automatic Lease (default: 0)")
-    p.add_argument("--interactive-lease", action="store_true",
-                   help="legacy manual mode: pause after startup to edit --lease before E2E")
     p.add_argument("--native-args", type=Path,
                    help="optional native Fully Async Hydra overrides file (one argument per line)")
     p.add_argument("--model-path", help="actual local HF model directory or Hugging Face repo ID; overrides fixture placeholder")
@@ -349,13 +345,9 @@ def main():
             raise ValueError(f"not a verl-multi-task checkout: {repo}")
         pythonpath = configure_multitask_import(repo)
         log(f"MultiTask source: {repo / 'src'}")
-        if a.auto_lease and a.lease is not None:
-            raise ValueError("--auto-lease cannot be combined with --lease; generated Lease lives in run logs")
-        if a.interactive_lease and (a.lease is None or a.auto_lease):
-            raise ValueError("--interactive-lease requires --lease and is incompatible with auto discovery")
-        auto_lease = a.auto_lease or a.lease is None
+        auto_lease = a.lease is None
         lease_path = logs / "auto_lease.json" if auto_lease else a.lease.resolve()
-        if not auto_lease and not a.interactive_lease and not lease_path.is_file():
+        if not auto_lease and not lease_path.is_file():
             raise ValueError(f"manual Lease fixture not found: {lease_path}")
         if a.donor_replica_rank < 0:
             raise ValueError("--donor-replica-rank must be >= 0")
@@ -431,9 +423,6 @@ def main():
                    MT_E2E_LOG_ROOT=str(e2e_root), MT_E2E_ATTACH_ONLY="1",
                    MT_E2E_REQUIRE_COMPLETE="1")
         env["PYTHONPATH"] = pythonpath
-        # Avoid inherited FORCE proof flag: in existing attach-mode script it
-        # only supports launcher logs; our optional proof checker scans task logs.
-        env.pop("MT_E2E_REQUIRE_INFLIGHT_FORCE", None)
 
         log(f"Connect Ray {a.ray_address}, namespace={a.namespace}")
         connected_address, temporary_ray = connect_ray(
@@ -584,22 +573,6 @@ def main():
                 f"device={lease['claims'][0]['gpu_uuid']}"
             )
             log(f"Generated Lease fixture: {lease_path}")
-        if a.interactive_lease:
-            candidate_pgs = {}
-            for pg_id, info in ray.util.placement_group_table().items():
-                if info.get("state") == "CREATED":
-                    candidate_pgs[pg_id] = {
-                        "name": info.get("name"), "bundles": info.get("bundles"),
-                        "bundles_to_node_id": info.get("bundles_to_node_id"),
-                    }
-            (logs / "placement_groups.json").write_text(
-                json.dumps(candidate_pgs, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8"
-            )
-            log(f"Ray PG snapshot: {logs / 'placement_groups.json'}")
-            log("Use the donor CE worker placement to identify exact pg_id, node_id, GPU UUID/NPU ID, bundle_index.")
-            log(f"Write/replace the Lease file: {lease_path}")
-            log("Neither rank=0 nor placement group name alone proves physical accelerator ownership.")
-            input("Press Enter after you have saved the correct Lease JSON (Ctrl+C to cancel): ")
         validate_lease(lease_path, donor, ray, a.namespace)
         state["lease_preflight"] = "PASS"
         env["MT_E2E_LEASE_FILE"] = str(lease_path)
@@ -607,9 +580,8 @@ def main():
             if proc.poll() is not None:
                 raise RuntimeError(f"training driver exited before E2E: pid={proc.pid}, rc={proc.returncode}")
 
-        # Execute the repository's existing actual Ray/evidence validators.
-        # This intentionally does NOT set MT_E2E_REQUIRE_INFLIGHT_FORCE=1, as
-        # validate_force_remove.sh expects launcher-mode runtime.log.
+        # Run the five scenario validators on the same real Ray cluster.
+        # Strict FORCE receipts are verified here from the borrower actor log.
         env.update(MT_E2E_DONOR_SESSION=donor, MT_E2E_BORROWER_SESSION=borrower,
                    MT_E2E_SCENARIOS=" ".join(chosen), RAY_ADDRESS=a.ray_address,
                    MT_E2E_ATTACH_ONLY="1")
