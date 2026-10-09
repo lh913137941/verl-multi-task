@@ -1,64 +1,61 @@
-# 原生入口配置与真实环境验收
+# 原生 VERL Fully Async 接入
 
-当前接入使用 `multitask.enabled` 开关，并以 092203 simplified fusion contract
-作为实现合同。
+本目录说明如何通过 VERL 原生 `fully_async_main` 启用 MultiTask。**不会提供第二套训练入口**；模型、数据、资源规模和训练超参数仍由原生 VERL 配置决定。
 
-## 使用方法
+日常双任务共享调度 E2E 请使用 [examples/e2e](../e2e/) 和 [统一启动器](../../scripts/e2e/verify_two_verl_jobs.py)，无需手动组合下面的参数。
 
-1. 在已经可以运行原生 Fully Async 的训练环境中安装 `verl-multitask`；driver、
-   Ray 节点和子进程必须能导入同一版本。
-2. 使用已接入 MultiTask TaskRunner 选择逻辑的 VERL checkout；仅安装 wheel
-   不会自动修改其他上游 checkout。
-3. 继续从 `python -m verl.experimental.fully_async_policy.fully_async_main` 启动，
-   在原训练命令中设置 `multitask.enabled=true`，并确保采用独立异步 vLLM\n   和当前支持的 checkpoint backend。E2E 启动器会自动处理其支持的参数。
-4. 设置 `multitask.enabled=false` 即可关闭，新启动任务保留原生路径。
+## 1. 启用条件
 
-`multitask.enabled=true` 默认选择唯一的
-`experimental_fully_async_standalone` profile。当前首版只支持单节点、整卡、
-DP=1、PP=1、non-PD vLLM；当前真实 GPU 验收仅覆盖 TP=1，因此 TP>1 暂时 fail-closed。
+1. 先确认目标 VERL 的 Fully Async + 独立 vLLM Rollout 能正常运行；driver、Ray worker 和子进程均能导入同一版本的 `multi_task_scheduler`。
+2. 使用已安装 MultiTask TaskRunner 选择桥接的 VERL checkout。仅安装本仓包不会自动改动上游 VERL。
+3. 从仓库根目录检查当前 Python 实际导入的 VERL 入口：
 
-原生手动接入常用的 Hydra overrides（按实际设备和配置调整）：\n\n```text\nmultitask.enabled=true\nactor_rollout_ref.hybrid_engine=false\nactor_rollout_ref.rollout.name=vllm\nactor_rollout_ref.rollout.mode=async\nactor_rollout_ref.rollout.calculate_log_probs=true\nactor_rollout_ref.rollout.checkpoint_engine.backend=nccl\nactor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nccl.rebuild_group=true\nasync_training.use_trainer_do_validate=false\nasync_training.use_dynamic_resource_scheduling=false\ndata.train_batch_size=0\ndata.gen_batch_size=1\n```\n\n上面是原 CUDA 原生接入示例，不是所有设备统一的运行配置；NPU 等环境必须选用适配的后端。\n\n示例只提供接入条件，模型、数据、算法、训练步数以及 trainer/rollout 资源参数继续
-使用原生配置。GS 不分配初始规模；初始 Replica 数量仍由原生 rollout 资源字段决定。
-
-## 验收顺序
-
-1. 在每个执行环境打印 `multi_task_scheduler.__file__`，核对安装位置与部署版本。
-   先通过原生入口的 `--cfg job` 检查组合结果；这一步本身不证明 Actor 能运行。
-2. 同一模型/数据/资源配置先关闭开关，再启用开关。核对根 TaskRunner、Trainer、
-   Rollouter、Manager、Replica、LB、HTTP Server、CE Manager/Worker 的实际类型。
-3. 检查 TaskRunner 在原生长时间 `run()` 期间仍能响应 `query_operation`，确认
-   MultiTask Actor 的有限并发没有破坏原生训练循环。
-4. 检查原生 STANDALONE replicas 初始化后都进入 Manager 的 M：
-   `replica_kind=NATIVE`、`replica_state=ACTIVE`。
-5. 检查 LB 的逐 request 状态：自然完成进入 `SETTLED`；FORCE 路径只有在真实
-   continuation 证明成立后才允许 `TERMINATED`，迟到 release 不得覆盖该终态。
-6. 启动两个隔离的训练 job，检查它们发现同一 detached GS；一个正常退出不影响另一个。
-7. GPU 借还、target-only bootstrap、DONATE sleep、RESTORE wake、FORCE targeted abort
-   和真实 RELEASED 逐卡核验必须单独做 GPU 验收。当前 level-2 sleep/staged wake、
-   borrowed create/destroy、ADD/DONATE/RESTORE/FORCE 控制面编排均已接入 TaskRunner；
-   这些入口可执行不等于真实 GPU 闭环已经验收，不可把 unit/mock/CPU Ray 测试当成借还完成。
-8. 可先运行真实 DONATE primitive 验收（单卡、真实本地模型）：
    ```bash
-   VERL_MULTITASK_GPU_MODEL_PATH=/path/to/local/model \
-   python -m pytest -q -s -m gpu_integration \
-     tests/integration/cuda/test_native_sleep_gpu.py
+   python scripts/e2e/ensure_verl_multitask_bridge.py --check-only
    ```
-   同一文件包含两层验收：1 GPU 用例要求 native 真实生成成功、CE worker 报告物理
-   GPU UUID、Manager 生成精确 `RELEASED`、level-2 sleep 后 `nvidia-smi` 显存显著
-   下降，并继续在 donor 的同一 PG bundle/同一 GPU UUID 创建 borrower runtime、完成真实
-   生成和 verified destroy，最后确认 donor weights-only wake 仍处于 partial sleeping；
-   若至少有 2 张 GPU，还会运行 current-Vpub
-   RESTORE 用例，用真实 FSDP TrainingWorker + NCCL sender；donor 睡眠并完成同卡 borrower
-   借还后，测试 sender 会实际修改 output weights，再由 CE 在 G 内完成 weights-only wake、
-   current-Vpub 全量传输与 KV 恢复，验证 `global_steps == 17`，并证明生成请求在 final wake
-   前保持 parked、final wake 后才继续。只有第二个用例成功才可作为 RESTORE 数据路径的
-   GPU 证据，但它仍不等价于完整 GS→TaskRunner 借还业务闭环。
 
-记录完整命令、组合配置、两仓源码版本、环境依赖、实际导入路径、节点/GPU 数量、
-Actor 类型、GPU UUID、sleep 前后显存和日志。若没有实际触发中断/续推或 current-Vpub
-重装，只记录已实际覆盖的能力。
+   检查失败表示桥接尚未就绪；可参照 [项目 README](../../README.md#5-安装与准备) 的安装说明处理，不要将其当作训练成功。
+4. 继续以 `python -m verl.experimental.fully_async_policy.fully_async_main` 启动原训练命令。设置 `multitask.enabled=true` 启用，改为 `false` 则新任务使用原生路径。
 
-GitHub Actions 只自动执行 [CPU Unit](../../tests/unit/README.md)；真实 Ray、VERL、
-CUDA/NPU 验收需要在对应环境单独运行，不能将单测通过视作硬件验收通过。
-完整测试目录与环境要求见 [tests/README.md](../../tests/README.md)，
-安装说明、状态 Owner 与能力边界见 [项目 README](../../README.md)。
+启用后自动选择受支持的运行 profile，无需显式指定名称。当前范围为**单节点、整卡、独立 non-PD vLLM、DP=1、PP=1**；真实 CUDA 验收覆盖 TP=1，其他未经验证的组合保持 fail-closed。
+
+## 2. 手动启动参数
+
+以下为 **CUDA / NCCL 示例 overrides**，追加到已经可运行的原生训练命令（不是一份可直接执行的完整训练配置）：
+
+```text
+multitask.enabled=true
+actor_rollout_ref.hybrid_engine=false
+actor_rollout_ref.rollout.name=vllm
+actor_rollout_ref.rollout.mode=async
+actor_rollout_ref.rollout.calculate_log_probs=true
+actor_rollout_ref.rollout.checkpoint_engine.backend=nccl
+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nccl.rebuild_group=true
+async_training.use_trainer_do_validate=false
+async_training.use_dynamic_resource_scheduling=false
+data.train_batch_size=0
+data.gen_batch_size=1
+```
+
+NPU 环境必须使用匹配的设备与权重同步后端，不能照搬 CUDA 的 `nccl` 参数。E2E 启动器会按支持的设备设置相关参数。初始 Replica 数量仍由原生 rollout 资源配置决定，GS 不负责分配初始规模。
+
+## 3. 如何验收
+
+按证据层级依次检查：
+
+1. **配置与接线**：用原生入口 `--cfg job` 检查参数组合；分别关闭、开启 `multitask.enabled`，确认实际 TaskRunner、Trainer、Rollouter、Manager、LB、Replica 与 Checkpoint Engine 类型符合预期。
+2. **单任务运行**：确认原生训练循环不受影响、TaskRunner 可响应 `query_operation`，原生 Replica 注册为 `NATIVE/ACTIVE`，自然完成请求最终结清。
+3. **双任务控制面**：启动两个独立训练任务，验证共享 detached GS、任务隔离与异常退出的互不影响。
+4. **真实设备生命周期**：验证 DONATE 释放的物理 GPU UUID、同卡 Borrowed 创建/销毁、RESTORE 最新权重和 FORCE 的真实 targeted abort/continuation。仅有控制面 ACK、Mock 或 CPU Ray PASS 不能证明设备闭环。
+
+CUDA 真实原语验收可在仓库根目录运行：
+
+```bash
+VERL_MULTITASK_GPU_MODEL_PATH=/path/to/local/model \
+  python -m pytest -q -s -m gpu_integration \
+  tests/integration/cuda/test_native_sleep_gpu.py
+```
+
+测试覆盖 native sleep/借还等能力；满足设备条件时还会检查 RESTORE 的权重重装路径。**这些原语测试不等价于完整 GS → TaskRunner 双任务 E2E 验收**。如需完整链路，使用 [双任务启动器](../../scripts/e2e/verify_two_verl_jobs.py) 并按 [E2E 验收标准](../../docs/e2e-acceptance.md) 检查日志、操作证据、参数版本与请求交接回执；真实 FORCE 在途续推需额外验证，不能从普通 `force: PASS` 推断。
+
+记录运行命令、源码和依赖版本、实际导入路径、设备 UUID、显存变化及场景日志。测试环境与执行命令参见 [tests/README.md](../../tests/README.md)；设计和能力边界参见 [项目 README](../../README.md)。
