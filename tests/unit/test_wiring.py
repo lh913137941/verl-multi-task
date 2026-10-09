@@ -6517,3 +6517,134 @@ def test_gs_open_lease_copies_mutable_claims_and_defends_replay_return():
     assert gs.leases[original.lease_id].claim_ids == original.claim_ids
     with pytest.raises(ValueError, match="conflicting lease replay"):
         gs.open_lease(external)
+
+
+
+def test_task_scoped_checkpoint_adapter_uses_exact_vllm_actor_name():
+    """Two concurrent tasks must never route a weight transfer to each other."""
+    lookups = []
+    registry = {
+        "vllm_server_0_0_mt_taskA": object(),
+        "vllm_server_0_0_mt_taskB": object(),
+    }
+
+    class NativeServerAdapter:
+        def __init__(self, *args, **kwargs):
+            self._has_server = True
+            self.server_handle = None
+            self._pd_role = None
+            self.replica_rank = kwargs["replica_rank"]
+            self.node_rank = 0
+
+        def _get_server_name_prefix(self):
+            return "vllm_"
+
+    class ScopedRay:
+        @staticmethod
+        def get_actor(name):
+            lookups.append(name)
+            return registry[name]
+
+    cls = isolated(
+        "checkpoint/checkpoint_engine_worker.py",
+        "_MultiTaskServerAdapter",
+        NativeServerAdapter,
+        ray=ScopedRay,
+    )
+    a = cls(replica_rank=0, server_name_suffix="_mt_taskA")
+    b = cls(replica_rank=0, server_name_suffix="_mt_taskB")
+    assert a._ensure_server_handle() is True
+    assert b._ensure_server_handle() is True
+    assert a.server_handle is registry["vllm_server_0_0_mt_taskA"]
+    assert b.server_handle is registry["vllm_server_0_0_mt_taskB"]
+    assert lookups == ["vllm_server_0_0_mt_taskA", "vllm_server_0_0_mt_taskB"]
+    # Weight updates reuse the correct cached server; never fall back to
+    # unsuffixed "vllm_server_0_0" if the scoped actor is absent.
+    assert a._ensure_server_handle() is True
+    assert len(lookups) == 2
+    with pytest.raises(KeyError, match="vllm_server_1_0_mt_taskA"):
+        cls(replica_rank=1, server_name_suffix="_mt_taskA")._ensure_server_handle()
+    assert "vllm_server_0_0" not in lookups
+
+
+def test_task_scoped_checkpoint_adapter_fails_closed_for_unsupported_routes():
+    class NativeServerAdapter:
+        def __init__(self, *args, **kwargs):
+            self._has_server = kwargs.get("has_server", True)
+            self.server_handle = None
+            self._pd_role = kwargs.get("pd_role")
+            self.replica_rank = 0
+            self.node_rank = 0
+
+        def _get_server_name_prefix(self):
+            return "vllm_"
+
+    class ScopedRay:
+        @staticmethod
+        def get_actor(name):
+            raise AssertionError(f"not allowed to look up {name}")
+
+    cls = isolated(
+        "checkpoint/checkpoint_engine_worker.py",
+        "_MultiTaskServerAdapter",
+        NativeServerAdapter,
+        ray=ScopedRay,
+    )
+    with pytest.raises(ValueError, match="name_suffix"):
+        cls(server_name_suffix="")
+    assert cls(server_name_suffix="_mt_A", has_server=False)._ensure_server_handle() is False
+    with pytest.raises(NotImplementedError, match="PD routing"):
+        cls(server_name_suffix="_mt_A", pd_role="decode")._ensure_server_handle()
+
+
+def test_checkpoint_worker_receives_replica_server_name_suffix():
+    """Replica supplies the exact suffix; Worker injects adapter into native CE."""
+    from types import SimpleNamespace
+
+    class NativeCheckpointWorker:
+        def __init__(self, *args, **kwargs):
+            self.received_adapter = kwargs.get("server_adapter")
+
+    class Adapter:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    cls = isolated(
+        "checkpoint/checkpoint_engine_worker.py",
+        "MultiTaskCheckpointEngineWorker",
+        NativeCheckpointWorker,
+        _MultiTaskServerAdapter=Adapter,
+        os=__import__("os"),
+        register=lambda **kwargs: lambda f: f,
+        Dispatch=SimpleNamespace(ONE_TO_ALL=0),
+    )
+    cfg, model = object(), object()
+    worker = cls(
+        rollout_config=cfg,
+        model_config=model,
+        replica_rank=0,
+        server_name_suffix="_mt_taskA",
+    )
+    assert worker.received_adapter.kwargs["server_name_suffix"] == "_mt_taskA"
+    assert worker.received_adapter.kwargs["replica_rank"] == 0
+    assert worker.received_adapter.kwargs["config"] is cfg
+    assert worker.received_adapter.kwargs["model_config"] is model
+    with pytest.raises(ValueError, match="explicit task-scoped"):
+        cls(
+            rollout_config=cfg, model_config=model,
+            server_name_suffix="_mt_A", server_adapter=object()
+        )
+    worker_native = cls(rollout_config=cfg, model_config=model)
+    assert worker_native.received_adapter is None
+
+    root = SOURCE / "rollout" / "replica.py"
+    tree = ast.parse(root.read_text(encoding="utf-8"))
+    replica = next(x for x in tree.body if isinstance(x, ast.ClassDef)
+                   and x.name == "MultiTaskvLLMReplica")
+    method = next(x for x in replica.body if isinstance(x, ast.FunctionDef)
+                  and x.name == "get_ray_class_with_init_args")
+    init = next(x for x in ast.walk(method) if isinstance(x, ast.Call)
+                and isinstance(x.func, ast.Name) and x.func.id == "RayClassWithInitArgs")
+    suffix_arg = next(x.value for x in init.keywords if x.arg == "server_name_suffix")
+    assert isinstance(suffix_arg, ast.Attribute)
+    assert suffix_arg.attr == "name_suffix"
