@@ -393,22 +393,43 @@ def _isolated_group_scheduler_class():
     return env["GroupScheduler"]
 
 
-def _scheduler_test_lease(lease_id="l1"):
-    return Lease(
-        lease_id,
-        ({
-            "claim_id": f"claim-{lease_id}",
-            "source_lease_id": f"source-{lease_id}",
-            "donor_task_id": "task-a",
-            "donor_replica_rank": 0,
-            "pg_id": "pg",
-            "bundle_index": 0,
-            "node_id": "n0",
-            "gpu_uuid": "u0",
-            "gpu_fraction": 0.5,
-            "cpu_request": 1.0,
-        },),
-    )
+def _scheduler_test_lease(lease_id="l1", **claim_overrides):
+    """Return a new Lease; overrides isolate the fact under test."""
+    claim = {
+        "claim_id": f"claim-{lease_id}",
+        "source_lease_id": f"source-{lease_id}",
+        "donor_task_id": "task-a",
+        "donor_replica_rank": 0,
+        "pg_id": "pg",
+        "bundle_index": 0,
+        "node_id": "n0",
+        "gpu_uuid": "u0",
+        "gpu_fraction": FIRST_RELEASE_RAY_GPU_FRACTION,
+        "cpu_request": 1.0,
+    }
+    claim.update(claim_overrides)
+    return Lease(lease_id, (claim,))
+
+
+def _borrowed_test_claim(**changes):
+    """Fresh single-rank physical claim for borrowed worker-plan cases."""
+    claim = {
+        "claim_id": "claim-0",
+        "source_lease_id": "source-lease-0",
+        "donor_task_id": "donor-task",
+        "donor_replica_rank": 0,
+        "rank": 0,
+        "pg_id": "pg",
+        "bundle_index": 0,
+        "node_id": "node",
+        "gpu_uuid": "GPU-x",
+        "node_rank": 0,
+        "local_rank": 0,
+        "gpu_fraction": FIRST_RELEASE_RAY_GPU_FRACTION,
+        "cpu_request": 1.0,
+    }
+    claim.update(changes)
+    return claim
 
 
 
