@@ -526,3 +526,82 @@ def test_two_real_jobs_inputs_support_huggingface_id_without_forcing_local_downl
         f"data.train_files={train}",
         f"data.val_files={validation}",
     ], role="borrower")
+
+
+
+def _load_e2e_src_bootstrap():
+    """Test parent-process import bootstrap without importing heavy VERL/Ray."""
+    import importlib
+
+    source = (E2E / "verify_two_verl_jobs.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    func = next(node for node in tree.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "configure_multitask_import")
+    scope = {"os": os, "sys": sys, "Path": Path, "importlib": importlib}
+    exec(compile(ast.Module(body=[func], type_ignores=[]),
+                 "e2e_src_bootstrap", "exec"), scope)
+    return scope["configure_multitask_import"]
+
+
+def test_two_real_jobs_bootstraps_multitask_source_before_imports(monkeypatch):
+    import importlib.util
+
+    setup = _load_e2e_src_bootstrap()
+    expected = str((ROOT / "src").resolve())
+    previous = os.environ.get("PYTHONPATH")
+    monkeypatch.setenv("PYTHONPATH", "/other/python/files")
+    monkeypatch.setattr(sys, "path", [x for x in sys.path if x != expected])
+    pythonpath = setup(ROOT)
+    assert pythonpath == expected + os.pathsep + "/other/python/files"
+    assert os.environ["PYTHONPATH"] == pythonpath
+    assert sys.path[0] == expected
+    spec = importlib.util.find_spec("multi_task_scheduler")
+    assert Path(spec.origin).resolve().is_relative_to(ROOT / "src")
+
+    # Running twice must not duplicate the checkout on either path.
+    setup(ROOT)
+    assert sys.path.count(expected) == 1
+    assert os.environ["PYTHONPATH"].split(os.pathsep).count(expected) == 1
+    if previous is None:
+        monkeypatch.delenv("PYTHONPATH")
+    else:
+        monkeypatch.setenv("PYTHONPATH", previous)
+
+
+def test_two_real_jobs_bootstrap_rejects_wrong_checkout(tmp_path):
+    import pytest
+
+    setup = _load_e2e_src_bootstrap()
+    with pytest.raises(ValueError, match="MultiTask source checkout is missing"):
+        setup(tmp_path)
+
+
+def test_two_real_jobs_propagates_multitask_source_to_ray_runtime_env():
+    connect = _load_ray_connector()
+
+    class ExistingRay:
+        def __init__(self):
+            self.calls = []
+
+        def init(self, **kwargs):
+            self.calls.append(kwargs)
+            return object()
+
+    ray = ExistingRay()
+    import_path = "/mounted/checkout/src:/global/site-packages"
+    assert connect(ray, address="auto", namespace="multitask-jobs",
+                   pythonpath=import_path) == ("auto", False)
+    assert ray.calls[0]["runtime_env"] == {
+        "env_vars": {"PYTHONPATH": import_path}
+    }
+
+
+def test_two_real_jobs_runs_source_bootstrap_before_verl_or_ray_imports():
+    code = (E2E / "verify_two_verl_jobs.py").read_text(encoding="utf-8")
+    assert code.index("pythonpath = configure_multitask_import(repo)") < code.index(
+        "import ray"
+    )
+    assert code.index("pythonpath = configure_multitask_import(repo)") < code.index(
+        "from multi_task_scheduler.scheduler.discovery import get_or_create_group_scheduler"
+    )
