@@ -170,32 +170,39 @@ VERL_MULTITASK_NPU_MODEL_PATH=/实际模型路径/Qwen3-0.6B \
 
 ---
 
-## 8. 测试：按需执行
+## 8. 测试：按运行环境选择
 
-一般修改先跑 Unit；改动 Ray 控制面或原生 VERL 接线时，再分别运行对应测试：
+`tests/` 只有两类：[unit](tests/unit/)（CPU 快速回归）和 [integration](tests/integration/)（真实 Ray、VERL 或 GPU/NPU）。
+在仓库根目录按需要运行：
 
 ```bash
+# 日常必跑：无需原生 VERL 或加速卡
 python -m pytest -q tests/unit
-python -m pytest -q -m ray_integration tests/integration
-python -m pytest -q -m native tests/native_unit
+
+# CPU Ray 控制面（需要 Ray）
+python -m pytest -q tests/integration/ray
+
+# VERL 原生接线（需要真实 VERL、Ray 等 Python 依赖）
+python -m pytest -q tests/integration/verl
 ```
 
-真实硬件相关测试（选择对应设备）：
+CUDA/NPU 硬件测试需在对应实机运行；以下以已配置的本地模型路径为例：
 
 ```bash
-# Ascend NPU
+# Ascend NPU：先单测真实模型加载，再按需测试 sleep / FORCE / RESTORE
 export VERL_MULTITASK_NPU_MODEL_PATH=/实际模型路径/Qwen3-0.6B
-python -m pytest -q -s -m npu_backend_smoke tests/integration/test_native_sleep_npu.py
-python -m pytest -q -s -m npu_integration tests/integration/test_native_sleep_npu.py
+python -m pytest -q -s -m npu_backend_smoke tests/integration/npu/test_native_sleep_npu.py
+python -m pytest -q -s -m npu_integration tests/integration/npu/test_native_sleep_npu.py
 
-# CUDA
+# CUDA：真实 vLLM 和模型、设备验收
 VERL_MULTITASK_GPU_MODEL_PATH=/实际模型路径 \
-  python -m pytest -q -s -m gpu_integration tests/integration/test_native_sleep_gpu.py
+  python -m pytest -q -s -m gpu_integration tests/integration/cuda/test_native_sleep_gpu.py
 ```
 
-它们验证的是底层运行时/设备能力，与双任务 E2E 互补，不要求每次修改都全部运行。
-
-单元测试的文件职责、关键覆盖边界及维护约定见 [tests/unit/README.md](tests/unit/README.md)。
+CUDA 环境基线测试位于 `tests/integration/cuda/test_baseline_environment.py`，
+运行前须设置 `MT_GPU_TEST_CONFIG`。单测及各集成层的依赖、命令与边界见
+[tests/README.md](tests/README.md)；具体 Unit 文件职责见
+[tests/unit/README.md](tests/unit/README.md)。
 
 ---
 
