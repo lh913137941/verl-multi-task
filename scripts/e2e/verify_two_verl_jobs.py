@@ -398,6 +398,18 @@ def main():
                 shared_args + local_args[role] + input_overrides, role=role
             )
         log("Validated donor/borrower model and local dataset paths before Ray startup")
+        devices = {
+            role: _effective_override(shared_args + local_args[role], "trainer.device")
+            for role in ("donor", "borrower")
+        }
+        if devices["donor"] != devices["borrower"]:
+            raise ValueError(
+                f"both jobs must use the same trainer.device for shared checkpoint backend: {devices}"
+            )
+        if devices["donor"] not in ("npu", "cuda"):
+            raise ValueError(
+                f"set trainer.device=npu or trainer.device=cuda in --native-args, got {devices}"
+            )
         env = dict(os.environ)
         env.update(RAY_ADDRESS=a.ray_address, PYTHONUNBUFFERED="1",
                    MT_E2E_LOG_ROOT=str(e2e_root), MT_E2E_ATTACH_ONLY="1",
@@ -449,14 +461,26 @@ def main():
             "++actor_rollout_ref.rollout.enable_sleep_mode=true",
             "actor_rollout_ref.rollout.free_cache_engine=true",
             "actor_rollout_ref.rollout.calculate_log_probs=true",
-            "actor_rollout_ref.rollout.checkpoint_engine.backend=nccl",
-            "++actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nccl.rebuild_group=true",
+            # The 'nccl' name maps to VERL's native HCCL on NPU, whose
+            # finalize() calls a missing PyHcclCommunicator.destroyComm.
+            # Use the existing opt-in compatible HCCL backend only on NPU.
+            f"actor_rollout_ref.rollout.checkpoint_engine.backend={'multitask_hccl' if devices['donor'] == 'npu' else 'nccl'}",
+            f"++actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.{'multitask_hccl' if devices['donor'] == 'npu' else 'nccl'}.rebuild_group=true",
+            *(
+                ["++actor_rollout_ref.rollout.checkpoint_engine.custom_backend_module=multi_task_scheduler.checkpoint.hccl_checkpoint_engine"]
+                if devices["donor"] == "npu" else []
+            ),
             "async_training.use_trainer_do_validate=false",
             "async_training.use_dynamic_resource_scheduling=false",
             "async_training.partial_rollout=true",
             "data.train_batch_size=0",
             "data.gen_batch_size=1",
         ]
+        log(
+            "Checkpoint backend: "
+            + ("multitask_hccl (NPU-compatible communicator finalize)"
+               if devices["donor"] == "npu" else "nccl (CUDA native)")
+        )
         # The native args file can override various model, trainer, dataset and
         # algorithm settings, but cannot silently disable MultiTask/Ray wiring.
         def start(role, token):
