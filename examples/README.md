@@ -4,7 +4,7 @@
 
 | 位置 | 用途 | 入口 |
 | --- | --- | --- |
-| [e2e/](e2e/) | 双任务共享调度 E2E（包括租约样例） | [native_args.txt](e2e/native_args.txt)、[lease.example.json](e2e/lease.example.json) |
+| [e2e/](e2e/) | 双任务共享调度 E2E（自动发现 Lease） | [native_args.txt](e2e/native_args.txt) |
 | [experimental_fully_async/](experimental_fully_async/) | 使用原生 VERL Fully Async 入口与 MultiTask 开关 | [使用与验收说明](experimental_fully_async/README.md) |
 
 ## 双任务 E2E
