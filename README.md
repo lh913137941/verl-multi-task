@@ -543,9 +543,10 @@ Ray 地址和 job namespace；等待两个新的 task_session 附着到同一个
 生产调度中仍由 GS 根据 idle report、容量、安全边界及资源归属选择 donor/borrower，
 使用内部 `open_lease` 记账，不能仅凭自动发现便视为资源已获借出许可。
 为避免两个真实任务在同一 Ray namespace 内发生资源名称冲突，
-MultiTask 使用 TaskRunner 的 `task_session` 同时隔离原生 Rollout PG/CE/server
-及 Trainer ResourcePool/Placement Group 的名称；Trainer 的角色映射与资源数量不变。
-不应通过清理其他任务的同名 PG 处理冲突。
+MultiTask 使用 TaskRunner 的 `task_session` 同时隔离原生 Rollout PG/CE/server、
+Trainer ResourcePool/Placement Group 和 RewardLoop Worker 的名称；Trainer 的角色映射、
+资源数量以及 RewardLoop 原生奖励计算与节点亲和调度保持不变。
+不应通过删除其他任务的同名 Actor/PG 来处理冲突。
 
 随后复用现有 `run_all.sh` 验证 control_plane、exactly_once、recovery、lifecycle 和 force。
 可用 `--scenarios "lifecycle force"` 缩小范围；`--keep-running` 可保留两个 driver。
