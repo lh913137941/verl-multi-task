@@ -259,6 +259,3 @@ grep -E 'FAIL|BLOCKED|Traceback|Error' "${RUN}e2e.log" | tail -n 40
 当前分支：[chatgpt/0928-merge-verl-expansion](https://github.com/lh913137941/verl-multi-task/tree/chatgpt/0928-merge-verl-expansion)。
 
 本仓从 simplified-fusion 合同出发，吸收了 `verl_expansion` 中与现有 Lease、Owner 和 Evidence 机制兼容的实现；[历史参考](docs/verl-expansion-reference/) 仅用于对照。发生冲突时以当前代码和 [设计合同](docs/simplified-fusion-contract.md) 为准。
-
----
-
