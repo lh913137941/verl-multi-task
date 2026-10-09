@@ -1,8 +1,8 @@
-"""Shared pytest bootstrap for source-layout and local Ray tests.
+"""Repository-wide pytest bootstrap for source-layout and local Ray tests.
 
 Pytest's `pythonpath = ["src"]` updates only the driver process's
 `sys.path`.  Local Ray workers are fresh Python processes, so propagate the
-same source root through `PYTHONPATH` before any test starts Ray.
+same source root through `PYTHONPATH` before any test starts Ray.\n\nCUDA-only fixtures intentionally live in tests/integration/cuda/conftest.py;\npytest inherits this parent conftest in that subtree.
 """
 
 from __future__ import annotations
