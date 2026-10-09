@@ -1,3 +1,0 @@
-# Run tests/integration/verl/test_native_adapters.py in the target verl/vLLM environment.
-# Use that environment's actual native dependencies; this is not an installer or lock.
-# The local CPU environment intentionally does not include torch, verl or vLLM.
