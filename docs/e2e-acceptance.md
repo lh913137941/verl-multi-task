@@ -173,9 +173,12 @@ MULTITASK_FORCE_HANDOFF {"operation_id": "...", "admitted_count": 1,
 shape/numel 与汇总计数一致，再检查版本和各 receiver 的摘要。
 
 receiver 摘要相同只证明接收清单一致。`MULTITASK_SOURCE_VALIDATION=1` 还要求 backend
-提供真实 source manifest；本分支的源端审计实现位于可选 `multitask_hccl` 扩展，原生 NCCL
-没有 `get_source_manifest` 接口。首版 CUDA/NCCL profile 仍不支持 HCCL，这次修复没有增加
-NCCL 源端审计或扩大设备支持范围；没有 source manifest 就不能声称源端到接收端校验通过。
+提供真实 source manifest。Ascend NPU 的 Fully Async E2E 自动选用已有的
+`multitask_hccl` 扩展（`custom_backend_module` 注入，`rebuild_group=true`），
+并优先调用 vLLM-Ascend communicator 的 `close()` 进行同步销毁；
+不支持时使用经过验证的底层 HCCL destroy API，未知接口则保持失败。
+CUDA 仍使用原生 NCCL，未增加 NCCL 源端审计。
+没有 source manifest 就不能声称源端到接收端校验通过。
 
 ## 综合验收
 
