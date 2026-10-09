@@ -605,3 +605,29 @@ def test_two_real_jobs_runs_source_bootstrap_before_verl_or_ray_imports():
     assert code.index("pythonpath = configure_multitask_import(repo)") < code.index(
         "from multi_task_scheduler.scheduler.discovery import get_or_create_group_scheduler"
     )
+
+
+def test_two_real_jobs_backend_overrides_keep_npu_hccl_and_cuda_nccl_separate():
+    """Regression: the NPU path must not invoke native HCCL.destroyComm."""
+    import pytest
+
+    source = (E2E / "verify_two_verl_jobs.py").read_text(encoding="utf-8")
+    parsed = ast.parse(source)
+    fn = next(node for node in parsed.body if isinstance(node, ast.FunctionDef)
+              and node.name == "checkpoint_backend_overrides")
+    namespace = {}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "checkpoint_overrides", "exec"), namespace)
+    overrides = namespace["checkpoint_backend_overrides"]
+    npu = overrides("npu")
+    cuda = overrides("cuda")
+    assert "actor_rollout_ref.rollout.checkpoint_engine.backend=multitask_hccl" in npu
+    assert "++actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.multitask_hccl.rebuild_group=true" in npu
+    assert "++actor_rollout_ref.rollout.checkpoint_engine.custom_backend_module=multi_task_scheduler.checkpoint.hccl_checkpoint_engine" in npu
+    assert "actor_rollout_ref.rollout.checkpoint_engine.backend=nccl" in cuda
+    assert "++actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nccl.rebuild_group=true" in cuda
+    assert not any("custom_backend_module" in option for option in cuda)
+    with pytest.raises(ValueError, match="Unsupported checkpoint"):
+        overrides("cpu")
+
+    # The actual E2E fixed override list must use the tested helper.
+    assert '*checkpoint_backend_overrides(devices["donor"])' in source
