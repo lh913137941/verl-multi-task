@@ -39,7 +39,7 @@ VERL_MULTITASK_GPU_MODEL_PATH=/实际模型目录 \
   python -m pytest -q -s -m gpu_integration tests/integration/cuda/test_native_sleep_gpu.py
 
 # 可选：只检查运行前的 CUDA 环境基线
-# JSON 配置见 examples/experimental_fully_async/gpu_test_config.example.json
+# MT_GPU_TEST_CONFIG 指向自备 JSON，包含 ray_address、ray_namespace、verl_source_root、\n# native_config、model_path、output_dir、nodes、gpus_per_node、timeout_s
 MT_GPU_TEST_CONFIG=/实际基线配置.json \
   python -m pytest -q tests/integration/cuda/test_baseline_environment.py
 ```
