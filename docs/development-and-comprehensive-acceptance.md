@@ -96,25 +96,47 @@ MessageQueue 约束完整样本恰好一次提交；重复提交的幂等性、�
 
 **继承与职责**：Ray Actor（无 VERL 基类）。
 
-#### 字段
+#### 字段（按设计职责分组；均为 GS 内部实现，不是新增公共状态 DTO）
 
 ```python
-task_runners: dict  # [新增] task_id -> TaskRunner 句柄
-leases: dict        # [新增] lease_id -> Lease / 进度事实
-idle_reports: dict  # [新增] 任务资源候选
-operation_commands: dict # [新增] 操作命令记录
-borrower_targets: dict   # [新增] borrower 资源目标
-release_evidence: dict   # [新增] 释放证明
-release_history: dict    # [新增] 释放历史
-handoff_ready_leases: ... # [新增] 可借入租约集合
-claim_id_owner, active_bundle_owner, active_gpu_owner: dict # [新增] 排他归属索引
+# ① 任务注册和空泡报告
+task_runners: dict[str, ActorHandle]     # task_session -> TaskRunner
+idle_reports: dict[str, object]          # task_session -> {observed_at, candidates}
+
+# ② 同一个 Lease 所有权账本及排他索引
+leases: dict[str, Lease]                 # lease_id -> Lease（授权事实）
+claim_id_owner: dict[str, str]           # claim_id -> lease_id（身份不可重用）
+active_bundle_owner: dict[tuple[str, int], str]  # (pg_id, bundle_index) -> lease_id
+active_gpu_owner: dict[str, str]         # gpu_uuid -> lease_id
+
+# ③ 操作幂等、交接及补偿（Lease 账本的内部投影）
+operation_commands: dict[str, OperationCommand]  # operation_id -> 命令意图
+borrower_targets: dict[str, ReplicaKey]  # lease_id -> 本轮 borrower
+release_evidence: dict[tuple[str, str], OperationEvidence]  # (lease_id, op_id) -> 证据
+release_history: dict[str, list[str]]    # lease_id -> 已完成操作顺序（可审视冗余）
+handoff_ready_leases: set[str]           # DONATE RELEASED 后的可交接阶段索引
 ```
+
+**单一状态 Owner**：GS 仅写跨任务 Lease/资源归属；TaskRunner 的 `OperationJournal` 是任务操作状态 Owner，Manager/CE/LB/Rollouter 各自写 M/E/R/C。以上 11 个字段不是 11 套公共数据模型。`release_history` 与 `handoff_ready_leases` 可以从历史证据/命令推导部分信息，但目前还用于 ADD 准入、RESTORE 终结、补偿及幂等回放。删除前必须验证这些路径；**本次不删字段、不改执行顺序**。
+
+**典型字段值**：`idle_reports[task_session] = {"observed_at": monotonic_time, "candidates": ({"replica_key": ReplicaKey, "kind": "NATIVE"}, ...)}`；`release_evidence[(lease_id, operation_id)]` 绑定精确操作及证据；`handoff_ready_leases` 为集合而非单独的 Lease 状态枚举。
 
 #### 方法与复用点
 
 | **方法** | **分类与功能** |
 | --- | --- |
-| `attach_task(task_id, task_runner) -> None` | **本模块现有方法**；注册任务。返回值见签名；**复用点**：见下文模块说明。 |
+| `__init__() -> None` | **新增 Actor 构造**；建立 GS 内部注册、Lease、所有权及操作对账索引；不创建独立流程服务。 |
+| `runtime_kind() -> str` | **新增发现协议**；返回兼容性标识供 TaskRunner 识别。 |
+| `attach_task(task_id, task_runner) -> None` | **新增注册入口**；验证真实 Ray ActorHandle，绑定 task_session；已有相同绑定可重放，冲突拒绝。 |
+| `detach_task(task_id) -> None` | **新增生命周期入口**；删除 task_runners 和过期 idle_reports，不代表清除运行中的 Lease。 |
+| `get_task_runners() -> dict[str, ActorHandle]` | **新增只读查询**；返回注册快照，避免外部修改内部映射。 |
+| `submit_idle_report(report) -> dict` | **新增空泡上报**；核验 task_session、ReplicaKey 与候选去重，返回 `{"accepted": True, "candidate_count": N}`。 |
+| `submit_operation(command) -> OperationRecord` | **新增操作路由**；校验 Lease、阶段与原 command 幂等；在 RPC **前**记录 operation intent、ADD borrower 或 RESTORE 预留，再转发 TaskRunner。 |
+| `_target_matches_donor(target, lease) -> bool` | **内部辅助**；核实本轮 donor identity 与 Lease claim 一致。 |
+| `open_lease(lease) -> Lease` | **GS 内部账本动作**；验证 Claim、PG bundle 和物理设备排他，登记一次 Lease；相同 Lease 可幂等返回快照。 |
+| `advance_lease(lease_id, evidence) -> dict` | **GS 内部对账动作**；仅接受同一操作的合法 evidence，推进 DONATE/REMOVE、RESTORE 成功或 ADD/RESTORE 安全补偿；精确重放保持幂等。 |
+
+**复用点**：见下文模块说明。 |
 | `detach_task(task_id) -> None` | **本模块现有方法**；解除注册。返回值见签名；**复用点**：见下文模块说明。 |
 | `get_task_runners() -> dict` | **本模块现有方法**；查询任务句柄。返回值见签名；**复用点**：见下文模块说明。 |
 | `submit_idle_report(report)` | **本模块现有方法**；接收候选。返回值与异常以源码实现为准；**复用点**：见下文模块说明。 |
