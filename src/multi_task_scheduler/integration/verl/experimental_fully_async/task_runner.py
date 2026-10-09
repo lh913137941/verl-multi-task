@@ -527,20 +527,94 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             ]
         )
 
+    def _attach_task_with_reconciliation(self) -> None:
+        """Register once; a delayed/lost Ray reply is not proof of non-delivery.
+
+        During real NPU startup Ray may take longer than the regular control
+        RPC timeout to deliver the attach acknowledgement. Re-wait the SAME
+        ObjectRef; never replay a potentially committed attach blindly.
+        """
+        task_id = self.task_session
+        actor = ray.get_runtime_context().current_actor
+        attached = self.group_scheduler.attach_task.remote(task_id, actor)
+        last_timeout = None
+        for attempt in range(3):
+            try:
+                ray.get(attached, timeout=CONTROL_RPC_TIMEOUT_S)
+                self._attached_to_gs = True
+                logger.info(
+                    "GroupScheduler registered TaskRunner %s (ack attempt %d)",
+                    task_id, attempt + 1,
+                )
+                return
+            except ray.exceptions.GetTimeoutError as exc:
+                last_timeout = exc
+                logger.warning(
+                    "GroupScheduler attach_task %s has no reply after %ds; "
+                    "waiting on original RPC (attempt %d/3)",
+                    task_id, int((attempt + 1) * CONTROL_RPC_TIMEOUT_S),
+                    attempt + 1,
+                )
+
+        # Read-only reconciliation: the attach RPC might have committed while
+        # its response was delayed. Only the same logical Ray actor can prove it.
+        try:
+            registered = ray.get(
+                self.group_scheduler.get_task_runners.remote(),
+                timeout=CONTROL_RPC_TIMEOUT_S,
+            )
+        except Exception as exc:
+            registered = None
+            logger.warning(
+                "GroupScheduler registration ledger query failed for %s: %r",
+                task_id, exc,
+            )
+
+        if isinstance(registered, dict) and task_id in registered:
+            actual = registered[task_id]
+            actor_id = getattr(actor, "_actor_id", None)
+            actual_id = getattr(actual, "_actor_id", None)
+            if actor_id is not None and actor_id == actual_id:
+                self._attached_to_gs = True
+                logger.warning(
+                    "GroupScheduler attached %s but registration ACK was delayed; "
+                    "ledger actor identity verified",
+                    task_id,
+                )
+                return
+            # Never remove a conflicting registration owned by a different actor.
+            raise RuntimeError(
+                f"GroupScheduler task_session {task_id} is bound to a different "
+                f"ActorHandle (expected={actor_id}, observed={actual_id})"
+            ) from last_timeout
+
+        # An outstanding attach could still execute after this timeout. Queue a
+        # compensating detach on the same single-writer GS actor. Its ordering
+        # after attach prevents a later ghost registration if GS becomes live.
+        try:
+            ray.get(
+                self.group_scheduler.detach_task.remote(task_id),
+                timeout=CONTROL_RPC_TIMEOUT_S,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"GroupScheduler attach_task {task_id} unconfirmed; "
+                f"compensating detach also unconfirmed ({type(exc).__name__}: {exc}); "
+                "check the GS actor's liveness and Ray scheduling"
+            ) from last_timeout
+        raise RuntimeError(
+            f"GroupScheduler attach_task {task_id} unconfirmed after "
+            "three control timeouts; compensating detach acknowledged. "
+            "Check Ray actor scheduling and GroupScheduler logs"
+        ) from last_timeout
+
     def _initialize_components(self, config) -> None:
         super()._initialize_components(config)
         # Parent initialization performs checkpoint restore, initial weight sync and
         # optional validation before training starts. At this point the training
         # sample queue must still be empty, so replacing it cannot lose samples.
         self._replace_message_queue(config)
-        ray.get(
-            self.group_scheduler.attach_task.remote(
-                self.task_session,
-                ray.get_runtime_context().current_actor,
-            ),
-            timeout=CONTROL_RPC_TIMEOUT_S,
-        )
-        self._attached_to_gs = True
+        self._attach_task_with_reconciliation()
         with self._journal_lock:
             self._control_ready = True
 
