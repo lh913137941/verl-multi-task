@@ -12,10 +12,10 @@ STANDALONE + vLLM 链路上增加：
 - 参数同步门、Exactly-once、异常恢复和 E2E 验收；
 - CUDA 与 Ascend NPU 的设备级 acceptance 入口。
 
-> 当前生产合同以
-> [docs/simplified-fusion-contract.md](docs/simplified-fusion-contract.md)
-> 为准；完整验收规则见
-> [docs/e2e-acceptance.md](docs/e2e-acceptance.md)。
+> 当前实现合同以 [simplified-fusion-contract.md](docs/simplified-fusion-contract.md) 为准；
+> [详细设计（092401）](docs/多RL任务共享调度对接VERL_动态流程编排融合设计精简优化版092401.md) 用于流程与接口评审，
+> 最新实现与设计存在差异时以代码和验收证据为准；
+> 完整验收规则见 [e2e-acceptance.md](docs/e2e-acceptance.md)。
 
 ---
 
