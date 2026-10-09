@@ -1003,45 +1003,22 @@ def test_manager_native_release_replay_returns_identical_evidence():
 
 # --- test_borrowed_cleanup_proof.py (consolidated boundary scenarios) ---
 
-_CLEANUP_REPLICA_SOURCE = (
-    Path(__file__).resolve().parents[2]
-    / "src/multi_task_scheduler/rollout/replica.py"
-)
-
-
 def _cleanup_replica_class(*, list_actors, kill):
-    """Compile just the adapter class so these tests do not need real GPUs."""
-    tree = ast.parse(_CLEANUP_REPLICA_SOURCE.read_text(encoding="utf-8"))
-    node = next(
-        n for n in tree.body
-        if isinstance(n, ast.ClassDef) and n.name == "MultiTaskvLLMReplica"
-    )
-    node.bases = [ast.Name(id="object", ctx=ast.Load())]
-    node.decorator_list = []
-    module = ast.Module(
-        body=[
-            ast.ImportFrom(
-                module="__future__",
-                names=[ast.alias(name="annotations")],
-                level=0,
-            ),
-            node,
-        ],
-        type_ignores=[],
-    )
+    """Load the actual Replica methods with a fake Ray actor inventory."""
     ray = SimpleNamespace(
         kill=kill,
         get_runtime_context=lambda: SimpleNamespace(namespace="test-namespace"),
     )
-    scope = {
-        "asyncio": asyncio,
-        "ray": ray,
-        "list_actors": list_actors,
-        "ReplicaKind": SimpleNamespace(NATIVE="native", BORROWED="borrowed"),
-        "FIRST_RELEASE_MAX_COLOCATE_COUNT": 2,
-    }
-    exec(compile(ast.fix_missing_locations(module), str(_CLEANUP_REPLICA_SOURCE), "exec"), scope)
-    return scope["MultiTaskvLLMReplica"]
+    return isolated(
+        "rollout/replica.py",
+        "MultiTaskvLLMReplica",
+        object,
+        asyncio=asyncio,
+        ray=ray,
+        list_actors=list_actors,
+        ReplicaKind=SimpleNamespace(NATIVE="native", BORROWED="borrowed"),
+        FIRST_RELEASE_MAX_COLOCATE_COUNT=2,
+    )
 
 
 def test_missing_ray_actor_state_is_not_dead_proof():
