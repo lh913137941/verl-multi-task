@@ -86,111 +86,483 @@ MessageQueue 约束完整样本恰好一次提交；重复提交的幂等性、�
 
 **2026-10-09 NPU E2E 历史失败（08:43 轮次）**：`logs/two_real_jobs/20261009-084341/` 的 `force_cycle` 实际在第二次 ADD 失败，报 `ADD bootstrap failed; hidden runtime was verified RELEASED`，因此未进入 FORCE。日志显示 `checkpoint-finalize-complete` 与 `kv-resume-complete`，随后有 EngineCore shutdown 和 SIGTERM，但尚不足以确定底层根因。已在本分支 Trainer `bootstrap_and_publish` 异常捕获处增加包含 `operation_id`、`target`、`e_committed` 和 traceback 的日志（提交 `35ed25a`）；**仅增强诊断；后续 09:42 轮次的 5/5 PASS 说明该次未复现，但不能据此判定 ADD 的历史根因已经消除**。
 
-## 1.8 各模块核心字段、方法与原生复用点
+## 1.8 各模块字段、方法与复用点（按实际代码）
 
-本节以代码中的类成员和方法名称为依据；**字段只列影响跨组件合同或生命周期的核心成员**。以下表格中的内部属性和以下划线开头的方法不构成新增公共 API；部分字段为基类继承或属性访问器，调用方应通过已有 Owner 方法读取。返回值只在已确认的现有接口中列出。
+本节按照「继承/新增字段 → 主要方法与作用 → 原生复用点」逐一说明。字段类型在代码明确声明时写类型；其余保留实际成员名并说明用途，不臆造公共结构。以下划线开头的名称及 Manager/GS 内部账本均属实现细节，不能作为新的跨组件接口。所有运行能力仍以当前 fail-closed 合同和真实 E2E 证据为准。
 
-### 1.8.1 GS、发现与操作合同
+**数据结构注意**：Lease claim 由 GS 经 spec 传至 Replica，关键字段 `claim_id / pg_id / bundle_index / node_id / gpu_uuid / cpu_request / gpu_fraction`；`build_borrowed_worker_plan()` 产生 `rank / actor_name / num_gpus / num_cpus / env_vars`，其中 `env_vars` 包含 `WORLD_SIZE / RANK / RAY_LOCAL_WORLD_SIZE / WG_PREFIX / WG_BACKEND`；Worker 实测提供 `node_id / pg_id / gpu_uuid / resource_name / accelerator_id`。当前 Borrowed 是单 claim、TP=1，不是旧草案的通用多卡 `node_layout` 结构。
 
-| 组件 | 核心字段 / 状态（Owner） | 关键方法（作用 / 返回） | 复用点 |
-| --- | --- | --- | --- |
-| `scheduler/group_scheduler.py` | 任务与 TaskRunner 注册映射、空闲上报、Lease claims/进度账本、操作路由记录（GS 内部） | `attach_task(task_id, task_runner) -> None` 注册；`detach_task(task_id) -> None` 注销；`get_task_runners() -> dict`；`submit_idle_report(report)` 收集候选；`submit_operation(command) -> OperationRecord`；`open_lease(lease) -> Lease`；`advance_lease(lease_id, evidence) -> dict` | Ray detached Actor、`ActorHandle`、真实 PG/claims；不代替 ResourcePool |
-| `scheduler/discovery.py` | GS 命名发现入口，无另设跨任务状态 Owner | `get_or_create_group_scheduler()`：发现或创建共享 GS | Ray named/detached actor |
-| `orchestration/contracts.py` | `ReplicaKey(task_session, replica_id, runtime_epoch)`；`OperationCommand(operation_id, kind, target, lease_id, force)`；`OperationRecord`；`OperationEvidence`；`Lease(lease_id, claims, expires_at)`；`ReplicaKind / ReplicaState / AttemptState / OperationStatus / EvidenceType` | 各类型的 `__post_init__` 校验；`OperationEvidence.now(...)`；Lease 的 `claim_ids()`、`source_lease_ids()`、`bundle_keys()`、`gpu_uuids()` | 标准 `dataclass` / Enum 和 VERL/Ray 传参；不重复定义设备实体 |
-| `orchestration/operation_journal.py` | 按 `operation_id` 维护 command 与 record（OperationJournal 内部） | `begin(command) -> OperationRecord`；`query(id) -> OperationRecord | None`；`command(id) -> OperationCommand`；`mark_running(id)`、`reopen_unknown(id)`、`finish(...)` | 同一 command 幂等重放、终态保留；不重复执行设备操作 |
-| `orchestration/replica_sync_gate.py` | `_lock`、`_epoch`、`_owner`、`_blocked_reason`、`_blocked_operation_id` | `acquire(...)` 返回 GateLease；`GateLease.guard(call, ...)` 串行执行；`release()`；`block(owner, reason)`；`reconcile(...)`；`health / owner / blocked_reason` 查询 | `asyncio.Lock` 与原生 Trainer 参数同步时序；不新增第二套权重传输 |
+### 1.8.1 `GroupScheduler` — `scheduler/group_scheduler.py`
 
-### 1.8.2 VERL 插件与任务、训练编排
+**继承与职责**：Ray Actor（无 VERL 基类）。
 
-| 组件 | 核心字段 / 状态 | 关键方法 | 复用点 |
-| --- | --- | --- | --- |
-| `integration/verl/runtime_profile.py` | 唯一受支持 Fully Async STANDALONE profile 的能力条件（非持久状态） | `resolve_runtime_profile(config)`、`validate_runtime_profile(config)`；非法组合抛 `ProfileConfigurationError` | VERL 原生 Hydra 配置与运行时配置字段 |
-| `integration/verl/ray_actor.py` | 无额外生命周期账本 | `unwrap_native_actor_class(actor_class)` 解析原生 Actor 类型 | VERL/Ray 原生 Actor 类包装 |
-| `task_runner.py` | `task_session`、`group_scheduler`、`_control_ready`、`_attached_to_gs`、`_operation_journal`、`_journal_lock`；按操作保存 Lease 快照与执行绑定 | `run(config)`；`submit_operation(...)` 受理；`query_operation(operation_id) -> OperationRecord`；`native_placement_candidates() -> tuple[dict,...]`；内部 `_execute_operation()`、`_advance_lease()`、`_attach_task_with_reconciliation()` | 继承 `FullyAsyncTaskRunner`，复用其组件生命周期与原生训练主循环，借助 Ray 调用 Trainer/Rollouter |
-| `trainer.py` | `task_session`、`_replica_sync_gate`、`checkpoint_manager`，复用基类 `current_param_version`、`rollouter`、`actor_wg` | `_setup_checkpoint_manager()`；`_fit_update_weights()`；`bootstrap_and_publish(operation) -> OperationEvidence`；`remove_and_commit(operation) -> OperationEvidence`；`restore_and_publish(operation) -> OperationEvidence`；`reconcile_exit(...)` | 继承 `FullyAsyncTrainer`；复用原生 optimizer/weight update、CE group 和 Rollouter，扩展目标集/安全门而非重写 PPO |
-| `message_queue.py` | `task_session`、`_completion_db`、`_next_completion_seq`、`_completion_lock`、`_completion_tmpdir` | `put_sample_once(sample) -> CompletionEvidence`；`put_sample(sample) -> bool`；`shutdown()`；`_decode_identity(sample)`、`_lookup_completion(...)` | 继承原生 `MessageQueue`，延续消费队列与提交路径，附加完成事实去重和冲突检查 |
-
-### 1.8.3 Rollouter、Manager 与 Replica Runtime
-
-| 组件 | 核心字段 / 状态 | 关键方法 | 复用点 |
-| --- | --- | --- | --- |
-| `rollouter.py` | `group_scheduler`、`task_session`、`llm_server_manager`、`async_rollout_manager`、`_idle_report_signature`、`_idle_report_last_sent`、`_force_handoff_timeout_s`、`_natural_drain_timeout_s` | `native_placement_candidates()`、`collect_idle_candidates()`、`submit_idle_report()`；`prepare_replica(...)`、`get_pending_target(id)`、`get_pending_replicas(id)`；`prepare_exit(...)`、`commit_service_change(operation)`、`finalize_release(operation) -> OperationEvidence`、`query_release_operation(...)` | 继承 `FullyAsyncRollouter`；复用原生 `FullyAsyncLLMServerClient`、`RewardLoopManager`、async rollout 处理器；局部包装 continuation 与 task-scoped RewardLoop |
-| `llm_server_manager.py` | `task_session`、`next_replica_rank`、`replica_operation_lock`、`global_load_balancer`；按 ReplicaKey 保存 kind/state、放置及 release 事实（内部账本） | `register_replica(...)`、`transition_replica(key, state) -> ReplicaState`、`replica_meta(key) -> (ReplicaKind, ReplicaState)`、`inspect_runtime(key)`、`validate_borrowed_spec(spec) -> dict`、`create_borrowed_replica(spec) -> dict`、`sleep(...)`、`destroy(...)`、`query_release_evidence(...)`、`activate_service(key)`、`deactivate_service(key)` | 继承 `FullyAsyncLLMServerManager`；复用 Ray PG/bundle、VERL Server 管理、vLLM sleep/wake |
-| `rollout/replica.py` | `replica_kind`、`runtime_epoch`、`placement_claims`、`borrowed_worker_names`、`borrowed_server_names`、`workers`、`servers`、`borrowed_cleanup_verified` | `validate_placement(spec)`、`build_borrowed_worker_plan(spec)`、`worker_placements()`、`validate_worker_placement()`、`validate_server_runtime()`、`init_from_lease(...)`、`cleanup_borrowed_runtime()`、`sleep()`、`wake_up(tags)` | 继承原生 `vLLMReplica`；复用 Ray WorkerGroup/PG、vLLM Worker 与原生 Runtime 创建机制 |
-| `rollout/http_server.py` | `engine`、`_submission_paused`、`_multitask_sleep_stage_value`、`_server_port` | `runtime_health() -> dict`、`shutdown_runtime() -> dict`、`sleep() -> dict`、`wake_up(tags) -> dict`；`_wait_admission_barrier()`、`_validate_multitask_engine_capabilities()` | 继承 `vLLMHttpServer`；复用 vLLM EngineCore、真实模型生成和 sleep/wake 原语，不以模拟回执替代设备状态 |
-
-#### 核心示例：`MultiTaskvLLMReplica(vLLMReplica)` 字段与复用明细
-
-Native 和 Borrowed **复用同一个扩展类**：Native 延续原生初始化路径；Borrowed 走 `init_from_lease()`，在 Lease 指定的已有 PG/bundle 上创建**独立** CE Worker 和 vLLM Server/Engine。Borrowed 不复用 donor 的 CE Worker，也不创建归 borrower 所有的新 PG。当前代码明确限定 **TP=1、单 claim、单 server**；以下不把多卡拓扑或旧版扩展提案当成已实现。
-
-**字段（区分继承与新增）：**
+#### 字段
 
 ```python
-# 继承 vLLMReplica（Native 沿用，Borrowed 创建路径赋值/复用）
-replica_rank                # [继承] 本任务内 Replica rank
-config, model_config        # [继承] Rollout 与模型配置
-world_size, nnodes          # [继承] 当前 Borrowed 校验 world_size=1、nnodes=1
-gpus_per_replica_node       # [继承] 每节点 Replica 设备数
-workers, servers            # [继承] 新建 Borrowed CE Workers / vLLM Servers 的句柄
-resource_pool, bundle_indices # [继承] Native 资源配置；Borrowed 不拥有 donor PG
-rollout_mode                # [继承] Borrowed 按 STANDALONE 路径运行
-_server_address, _server_handle # [继承] 主 HTTP endpoint 与句柄
-name_suffix                 # [继承] 为任务/租约命名隔离提供后缀
-
-# 当前 MultiTaskvLLMReplica 明确增加或重赋值
-replica_kind: ReplicaKind   # [新增] NATIVE/BORROWED，而非 allocation_kind 字符串
-placement_claims           # [新增] Borrowed 的归一化逐卡 claims
-runtime_epoch              # [新增] Runtime 身份代次
-server_class               # [重赋值] ray.remote(MultiTaskvLLMHttpServer)
-borrowed_worker_names      # [运行期新增] 创建的 Borrowed CE Actor 名称
-borrowed_server_names      # [运行期新增] 创建的 Borrowed Server Actor 名称
-borrowed_cleanup_verified  # [运行期新增] 清理核验事实，不能代替 RELEASED evidence
+task_runners: dict  # [新增] task_id -> TaskRunner 句柄
+leases: dict        # [新增] lease_id -> Lease / 进度事实
+idle_reports: dict  # [新增] 任务资源候选
+operation_commands: dict # [新增] 操作命令记录
+borrower_targets: dict   # [新增] borrower 资源目标
+release_evidence: dict   # [新增] 释放证明
+release_history: dict    # [新增] 释放历史
+handoff_ready_leases: ... # [新增] 可借入租约集合
+claim_id_owner, active_bundle_owner, active_gpu_owner: dict # [新增] 排他归属索引
 ```
 
-**资源规格与 Worker 实测结构：** `validate_placement(spec)` 使用 `spec["lease_id"]`、`spec["placement_epoch"]`、`spec["replica_rank"]`、`spec["claims"]`、`spec["expires_at"]` 等数据；目前单个 claim 的 `rank/node_rank/local_rank` 均要求为 0。`build_borrowed_worker_plan()` 返回的核心项为：
+#### 方法及作用
+
+- `attach_task(task_id, task_runner) -> None`：注册任务
+- `detach_task(task_id) -> None`：解除注册
+- `get_task_runners() -> dict`：查询任务句柄
+- `submit_idle_report(report)`：接收候选
+- `submit_operation(command) -> OperationRecord`：路由命令
+- `open_lease(lease) -> Lease`：登记 claims
+- `advance_lease(lease_id, evidence) -> dict`：按真实证据推进租约
+
+**复用点**：复用 Ray named/detached Actor、ActorHandle 与真实 PG 元数据；不代替 VERL ResourcePool。
+
+### 1.8.2 `Discovery` — `scheduler/discovery.py`
+
+**继承与职责**：函数入口（无实例字段）。
+
+#### 字段
 
 ```python
-{
-    "rank": 0,
-    "claim_id": "...",
-    "actor_name": "...",
-    "pg_id": "...",
-    "bundle_index": 0,
-    "node_id": "...",
-    "gpu_uuid": "...",     # 字段沿用原名，NPU 实际为 NPU:node_id:accelerator_id
-    "num_gpus": 0.5,       # Ray 分配份额，不代表物理半张卡
-    "num_cpus": 1.0,
-    "env_vars": {"WORLD_SIZE": "1", "RANK": "0",
-                 "RAY_LOCAL_WORLD_SIZE": "1",
-                 "WG_PREFIX": "...", "WG_BACKEND": "ray"}
-}
+# [新增字段] 无；GS 所有权只在 GroupScheduler 内
 ```
 
-`worker_placements()` 从**实际 CE Actor** 中获取 `node_id`、`pg_id`、`gpu_uuid`、`resource_name`、`accelerator_id`；`validate_worker_placement()` 对照 claims 检查 node 和设备身份。CUDA 的数字设备 ID 进一步通过 `nvidia-smi` 对照 UUID；NPU 使用 `NPU:node_id:accelerator_id` 身份。
+#### 方法及作用
 
-**主要方法与原生复用：**
+- `get_or_create_group_scheduler()`：发现或创建共享 GS
 
-| 方法 | 作用与结果 | 复用点 |
-| --- | --- | --- |
-| `get_ray_class_with_init_args() -> RayClassWithInitArgs` | 替换为带服务命名隔离的 `MultiTaskCheckpointEngineWorker` | 原生 `RayClassWithInitArgs` 与 CE Worker 参数 |
-| `validate_placement(spec) -> None`、`build_borrowed_worker_plan(spec) -> dict` | 验证 Lease/Replica/TP=1 约束并生成 CE Actor 的确定性放置方案 | Ray PG/bundle、Lease claims |
-| `_create_workers_from_claims(...)`、`validate_worker_placement() -> tuple[dict, ...]` | 在指定原 PG/bundle 上创建独立 CE Workers，并实测节点与设备 | `RayWorkerGroup.from_detached()`、`PlacementGroupSchedulingStrategy` |
-| `init_from_lease(...)`、`validate_server_runtime() -> dict` | 初始化 Borrowed Server/Engine 并确认实际 HTTP/Engine 状态 | 原生 `vLLMReplica` Server 创建、`MultiTaskvLLMHttpServer` |
-| `cleanup_borrowed_runtime() -> None` | 清理 Borrowed Server/Worker，检查 Ray Actor 进入 DEAD；证据不足则报错 | `ray.kill`、Ray State API |
-| `sleep()`、`wake_up(tags)` | Native 生命周期的真实运行时休眠与恢复 | vLLM 原生 sleep/wake 原语 |
+**复用点**：复用 Ray named Actor 发现和 detached 生命周期。
 
-**实现与旧设计字段的区别：** 当前类没有逐项定义示例中的 `allocation_kind`、`lease_id`、`source_lease_ids`、`donor_task_ids`、`runtime_state`、`owns_resource_pool`、`claims`、`serving_version`、`operation_id`、`node_layout`、`expected_device_map`、`actual_device_map`、`cleanup_result`、`creation_stage` 等成员。租约细节保留在 Lease/spec/Manager 的 Owner 视图，参数版本由 CE/Trainer 管理；不可为了与旧示例形式一致而把这些字段误标为已实现。
+### 1.8.3 `Contracts` — `orchestration/contracts.py`
 
-### 1.8.4 LB、Checkpoint Engine 与后端
+**继承与职责**：标准 Enum / dataclass（非 VERL 子类）。
 
-| 组件 | 核心字段 / 状态 | 关键方法 | 复用点 |
-| --- | --- | --- | --- |
-| `rollout/load_balancer.py` | 基类路由/服务端集合及 request→server 事实；本类 `_awaiting_service_restore`、`_settled_retention`、`_settled_count`；内部 attempt 和操作关联账本 | `acquire_server(request_id,...)`、`release_server(server_id, request_id)`、`query_attempt(request_id)`、`confirm_continuation(request_id, client_id,...)`、`continuation_handoff_requests(operation_id)`、`requests_for_server(server_id)`、`begin_drain(key, operation_id)`、`commit_ready(...)`、`finish_remove(key)` | 继承 `GlobalRequestLoadBalancer`，复用原生 HTTP Server 选择与请求释放；新增安全 fencing/attempt 证明 |
-| `checkpoint/checkpoint_engine_manager.py` | `_effective_replica_map`（`effective_replicas` 属性）、`_pending_bootstrap_map`（`pending_bootstrap` 属性）、`_bootstrap_ready_map`、`parameter_validation_enabled`、`source_validation_enabled`、`backend` | `register_pending(...)`、`bootstrap_target(...)`、`commit_pending(...)`、`discard_pending(key)`、`add_effective(...)`、`remove_effective(key)`、`mark_all_loaded_version(version)`、`validate_parameter_sync(...)` | 继承原生 `CheckpointEngineManager`；复用 `RayWorkerGroup`、原生通信组/参数广播和版本同步，仅控制目标集合与证据 |
-| `checkpoint/checkpoint_engine_worker.py` | 原生 Worker 权重加载状态、带 suffix 的 ServerAdapter、参数 Manifest / digest | `update_weights(global_steps)`、`get_parameter_manifest() -> dict`，内部 tensor SHA256 | 继承 `CheckpointEngineWorker`；复用 VERL 原生 Worker 与接收端，附加传输审计 |
-| `checkpoint/hccl_checkpoint_engine.py` | 源端 manifest、训练步/权重摘要相关事实 | `send_weights(weights, global_steps)`、`get_source_manifest() -> dict`、`finalize()` | 继承原生 `HCCLCheckpointEngine`；复用 Ascend/HCCL 真实通信与 finalize，不创建虚构权重成功证据 |
+#### 字段
 
-**跨模块复用边界**：原生 VERL 仍负责训练循环、WorkerGroup、参数发送接收、Rollout 主循环和 Runtime 原语；Ray 负责 Actor/PG 放置；MultiTask 主要增加 GS/Lease、Owner 独立事实、任务级编排、目标集同步、证据校验和 fail-closed。查询操作/证据应通过现有方法，不直接从别的组件读内部 map。
+```python
+ReplicaKey: task_session: str; replica_id: str; runtime_epoch: int = 0
+OperationCommand: operation_id: str; kind: OperationKind; target: ReplicaKey; lease_id: str; force: bool | None = None
+OperationRecord: operation_id: str; status: OperationStatus; result: str | None
+OperationEvidence: operation_id: str; type: EvidenceType; timestamp: int; released_gpu_uuids: tuple[str, ...]
+Lease: lease_id: str; claims: tuple[Mapping, ...]; expires_at: float
+# 枚举：ReplicaKind, ReplicaState, AttemptState, OperationKind, OperationStatus, EvidenceType
+```
+
+#### 方法及作用
+
+- `__post_init__()`：类型/标识验证
+- `OperationEvidence.now(...)`：构造带时间戳证据
+- `Lease.claim_ids(), source_lease_ids(), bundle_keys(), gpu_uuids()`：提取 claims 身份
+
+**复用点**：复用 Python dataclass/Enum；仅描述已有合同，不新增类型。
+
+### 1.8.4 `OperationJournal` — `orchestration/operation_journal.py`
+
+**继承与职责**：独立操作账本。
+
+#### 字段
+
+```python
+# [新增]
+_records: dict       # operation_id -> OperationRecord
+_commands: dict      # operation_id -> OperationCommand
+_active_by_task: dict # 任务并发操作索引
+```
+
+#### 方法及作用
+
+- `begin(command) -> OperationRecord`：受理或同命令幂等返回
+- `query(operation_id) -> OperationRecord | None`：参见代码具体参数与返回值
+- `command(operation_id) -> OperationCommand`：参见代码具体参数与返回值
+- `mark_running(id) -> OperationRecord`：参见代码具体参数与返回值
+- `reopen_unknown(id) -> OperationRecord`：参见代码具体参数与返回值
+- `finish(...)`：写终态并校验身份
+
+**复用点**：复用 OperationCommand / Record，不持有 GPU/模型状态。
+
+### 1.8.5 `ReplicaSyncGate` — `orchestration/replica_sync_gate.py`
+
+**继承与职责**：asyncio 同步闸门。
+
+#### 字段
+
+```python
+# [新增]
+_lock: asyncio.Lock
+_epoch: int
+_owner: GateOwner | None
+_blocked_reason: str | None
+_blocked_operation_id: str | None
+# GateLease: _gate, owner
+```
+
+#### 方法及作用
+
+- `acquire(...) -> GateLease`：独占同步权
+- `GateLease.guard(call, *args, **kwargs)`：闸门内执行
+- `GateLease.release() -> bool`：释放
+- `block(owner, reason) -> None`：阻断
+- `reconcile(...)`：对账恢复
+- `health / owner / blocked_reason`：查询
+
+**复用点**：复用 asyncio.Lock 和原生 Trainer 权重更新节奏；不替换 VERL checkpoint 通信原语。
+
+### 1.8.6 `RuntimeProfile / RayActor` — `integration/verl/runtime_profile.py；integration/verl/ray_actor.py`
+
+**继承与职责**：轻量函数与校验器。
+
+#### 字段
+
+```python
+# [新增持久字段] 无
+# 配置项读取自 VERL/Hydra config
+```
+
+#### 方法及作用
+
+- `resolve_runtime_profile(config)`：选定受支持 profile
+- `validate_runtime_profile(config) -> bool`：能力准入
+- `unwrap_native_actor_class(actor_class) -> type`：解包 Ray remote 类
+
+**复用点**：复用原生配置树、Ray Actor 类语义；不维护跨任务状态。
+
+### 1.8.7 `TaskRunner` — `integration/verl/experimental_fully_async/task_runner.py`
+
+**继承与职责**：MultiTaskFullyAsyncTaskRunner(FullyAsyncTaskRunner)。
+
+#### 字段
+
+```python
+# [继承] components、VERL 原生 run() / 初始化链路
+# [新增]
+task_session: str
+group_scheduler: ActorHandle
+_control_ready: ...
+_attached_to_gs: bool
+_journal_lock: threading.Lock
+_operation_journal: OperationJournal
+_operation_threads: dict
+_operation_leases: dict   # operation_id -> Lease 快照
+```
+
+#### 方法及作用
+
+- `run(config)`：执行原生训练主流程并安装插件接线
+- `submit_operation(...)`：接收命令
+- `query_operation(operation_id) -> OperationRecord`：参见代码具体参数与返回值
+- `native_placement_candidates() -> tuple[dict, ...]`：参见代码具体参数与返回值
+- `_build_borrowed_spec(...): 派生单次 ADD spec`：参见代码具体参数与返回值
+- `_execute_operation(id)`：编排 Trainer/Rollouter
+- `_attach_task_with_reconciliation()`：共享 GS 注册对账
+
+**复用点**：复用 FullyAsyncTaskRunner 初始化、Ray RPC 与 VERL 训练主循环；新增任务级 operation 编排。
+
+### 1.8.8 `Trainer` — `integration/verl/experimental_fully_async/trainer.py`
+
+**继承与职责**：MultiTaskFullyAsyncTrainer(FullyAsyncTrainer)。
+
+#### 字段
+
+```python
+# [继承] current_param_version, rollouter, actor_wg, config
+# [新增]
+task_session: str
+_replica_sync_gate: ReplicaSyncGate
+checkpoint_manager: MultiTaskCheckpointEngineManager # [扩展重赋值]
+```
+
+#### 方法及作用
+
+- `_setup_checkpoint_manager()`：建立 Native 参数成员
+- `_fit_update_weights()`：受 G 闸门保护的原生权重推进
+- `bootstrap_and_publish(operation) -> OperationEvidence`：ADD
+- `remove_and_commit(operation) -> OperationEvidence`：REMOVE/DONATE
+- `restore_and_publish(operation) -> OperationEvidence`：RESTORE
+- `reconcile_exit(...)`：退出结果对账
+
+**复用点**：复用 FullyAsyncTrainer 的优化器、参数版本、CheckpointEngine 与 Rollouter；不重写 PPO。
+
+### 1.8.9 `Rollouter / Client` — `integration/verl/experimental_fully_async/rollouter.py`
+
+**继承与职责**：MultiTaskFullyAsyncRollouter(FullyAsyncRollouter)。
+
+#### 字段
+
+```python
+# [继承] llm_server_manager, async_rollout_manager, reward_loop_manager 等
+# [新增]
+group_scheduler: ActorHandle
+task_session: str
+_pending_operation_targets: dict
+_idle_report_signature, _idle_report_last_sent: ...
+_idle_report_task: asyncio.Task | None
+_force_handoff_timeout_s, _natural_drain_timeout_s: float
+# Client 适配：_continuation_client_id, _continuation_enabled, _release_fences
+```
+
+#### 方法及作用
+
+- `native_placement_candidates() -> tuple[dict, ...]`：参见代码具体参数与返回值
+- `collect_idle_candidates() -> tuple`：参见代码具体参数与返回值
+- `submit_idle_report()`：上报空闲资源
+- `prepare_replica(...)`：准备隐藏 Borrowed
+- `prepare_exit(...)`：drain / FORCE 准入
+- `get_pending_target(id) -> ReplicaKey`：参见代码具体参数与返回值
+- `get_pending_replicas(id)`：读取待装参目标
+- `commit_service_change(operation)`：发布或撤销路由
+- `finalize_release(operation) -> OperationEvidence`：释放对账
+
+**复用点**：复用 FullyAsyncRollouter、FullyAsyncLLMServerClient、RewardLoopManager 与原生 async rollout；增量封装 continuation 和 task-scoped RewardLoop。
+
+### 1.8.10 `LLMServerManager` — `integration/verl/experimental_fully_async/llm_server_manager.py`
+
+**继承与职责**：MultiTaskLLMServerManager(FullyAsyncLLMServerManager)。
+
+#### 字段
+
+```python
+# [继承] rollout_replicas, server_addresses, server_handles, rollout_config
+# [新增]
+task_session: str
+rollout_replica_class: ... # [重赋值] MultiTaskvLLMReplica
+_load_balancer_cls: ...     # [重赋值] MultiTask LB
+replica_state: dict[ReplicaKey, ReplicaState]
+replica_kind: dict[ReplicaKey, ReplicaKind]
+_runtime_inventory: dict[ReplicaKey, object]
+borrowed_operations: dict[str, dict]
+_native_release_evidence: dict
+next_replica_rank: int
+replica_operation_lock: asyncio.Lock
+global_load_balancer: ActorHandle # [重赋值]
+```
+
+#### 方法及作用
+
+- `register_replica(...)->None`：登记 kind/state/runtime
+- `transition_replica(key, state)->ReplicaState`：参见代码具体参数与返回值
+- `replica_meta(key)->tuple[ReplicaKind, ReplicaState]`：参见代码具体参数与返回值
+- `inspect_runtime(key)`：查询实际 runtime
+- `validate_borrowed_spec(spec)->dict`：参见代码具体参数与返回值
+- `create_borrowed_replica(spec)->dict`：参见代码具体参数与返回值
+- `sleep(...), destroy(...)`：生命周期
+- `activate_service(key), deactivate_service(key)`：服务状态
+- `query_release_evidence(...)`：查询 RELEASED
+
+**复用点**：复用 FullyAsyncLLMServerManager、Native Replica 初始化、Ray PG / Actor 与 vLLM 服务管理。
+
+### 1.8.11 `Replica` — `rollout/replica.py`
+
+**继承与职责**：MultiTaskvLLMReplica(vLLMReplica)。
+
+#### 字段
+
+```python
+# [继承] replica_rank, config, model_config, world_size, nnodes, workers, servers, resource_pool, bundle_indices, rollout_mode, name_suffix, _server_address, _server_handle
+# [新增]
+replica_kind: ReplicaKind
+placement_claims: tuple[dict, ...] | None
+runtime_epoch: int
+borrowed_worker_names: tuple[str, ...]
+borrowed_server_names: tuple[str, ...]
+borrowed_cleanup_verified: bool
+server_class: ... # [重赋值] ray.remote(MultiTaskvLLMHttpServer)
+```
+
+#### 方法及作用
+
+- `get_ray_class_with_init_args()->RayClassWithInitArgs`：参见代码具体参数与返回值
+- `validate_placement(spec)->None`：参见代码具体参数与返回值
+- `build_borrowed_worker_plan(spec)->dict`：参见代码具体参数与返回值
+- `init_from_lease(...)`：独立 CE Worker/Server
+- `worker_placements()->tuple[dict,...]`：参见代码具体参数与返回值
+- `validate_worker_placement()->tuple[dict,...]`：参见代码具体参数与返回值
+- `validate_server_runtime()->dict`：参见代码具体参数与返回值
+- `cleanup_borrowed_runtime()->None`：参见代码具体参数与返回值
+- `sleep(), wake_up(tags)`：原生设备生命周期
+
+**复用点**：复用 vLLMReplica、RayWorkerGroup.from_detached 和指定已有 PG bundle；不复用 donor CE Worker，不创建 borrower PG。
+
+### 1.8.12 `HTTP Server` — `rollout/http_server.py`
+
+**继承与职责**：MultiTaskvLLMHttpServer(vLLMHttpServer)。
+
+#### 字段
+
+```python
+# [继承/重赋值] engine, _server_port
+# [新增]
+_submission_paused: bool
+_multitask_sleep_stage_value: str
+```
+
+#### 方法及作用
+
+- `runtime_health()->dict`：Engine/端口/Node 健康
+- `shutdown_runtime()->dict`：真实引擎退出
+- `sleep()->dict, wake_up(tags)->dict`：原生 sleep/wake 包装
+- `_wait_admission_barrier()`：安全准入
+- `_validate_multitask_engine_capabilities(engine)`：原语准入
+
+**复用点**：复用 vLLMHttpServer、EngineCore 和 sleep/wake；不以 RPC 返回代替真实设备证明。
+
+### 1.8.13 `LoadBalancer` — `rollout/load_balancer.py`
+
+**继承与职责**：MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer)。
+
+#### 字段
+
+```python
+# [继承] servers、服务选择/释放逻辑
+# [新增]
+routes: dict
+active_request_server: dict
+attempt_state: dict
+draining_operations: dict
+ready_operations: dict
+continuation_handoffs: dict
+_awaiting_service_restore: bool
+_settled_retention: ...
+_settled_count: int
+```
+
+#### 方法及作用
+
+- `acquire_server(request_id, **extra)`：请求准入
+- `release_server(server_id, request_id)`：结清 attempt
+- `query_attempt(request_id)`：查询 attempt 状态
+- `confirm_continuation(request_id, client_id, ...)`：续推前缀回执
+- `continuation_handoff_requests(operation_id)->tuple[str,...]`：参见代码具体参数与返回值
+- `begin_drain(key, operation_id)`：停止新流量
+- `commit_ready(...)`：服务发布
+- `finish_remove(key)`：撤销服务
+- `query_ready_operation(id)`：发布对账
+
+**复用点**：复用 GlobalRequestLoadBalancer 的请求分配、路由缓存及 Server 句柄；增加 request/attempt Owner 事实。
+
+### 1.8.14 `MessageQueue` — `integration/verl/experimental_fully_async/message_queue.py`
+
+**继承与职责**：MultiTaskMessageQueue(MessageQueue)。
+
+#### 字段
+
+```python
+# [继承] 原生队列配置及消费机制
+# [新增]
+task_session: str
+_completion_tmpdir: ...
+_completion_db: ...
+_next_completion_seq: int
+_completion_lock: asyncio.Lock
+# CompletionEvidence：完整样本提交回执
+```
+
+#### 方法及作用
+
+- `put_sample_once(sample)->CompletionEvidence`：幂等提交
+- `put_sample(sample)->bool`：保持原接口兼容
+- `_lookup_completion(...)`：查重
+- `_decode_identity(sample)->tuple[str,str]`：参见代码具体参数与返回值
+- `shutdown()`：关闭并清理辅助资源
+
+**复用点**：复用原生 MessageQueue 与训练消费路径；增加完成样本唯一性存证和冲突拒绝。
+
+### 1.8.15 `CheckpointEngineManager` — `checkpoint/checkpoint_engine_manager.py`
+
+**继承与职责**：MultiTaskCheckpointEngineManager(CheckpointEngineManager)。
+
+#### 字段
+
+```python
+# [继承] actor_wg, replicas, 原生同步配置
+# [新增]
+_effective_replica_map: dict
+_pending_bootstrap_map: dict
+_bootstrap_ready_map: dict
+parameter_validation_enabled: bool
+source_validation_enabled: bool
+backend: str
+# 属性：effective_replicas、pending_bootstrap
+```
+
+#### 方法及作用
+
+- `register_pending(...)`：登记待装参目标
+- `bootstrap_target(...)`：同步目标 Vpub
+- `commit_pending(...)`：pending -> effective
+- `discard_pending(key)->None`：参见代码具体参数与返回值
+- `add_effective(...)->None / remove_effective(key)->None`：参见代码具体参数与返回值
+- `mark_all_loaded_version(version)->None`：参见代码具体参数与返回值
+- `validate_parameter_sync(...)`：manifest/版本校验
+- `_get_source_manifest()`：获取源端审计
+
+**复用点**：复用 CheckpointEngineManager、RayWorkerGroup、VERL 原生发送/接收与通信组；只限定目标集合及证据条件。
+
+### 1.8.16 `CheckpointEngineWorker` — `checkpoint/checkpoint_engine_worker.py`
+
+**继承与职责**：MultiTaskCheckpointEngineWorker(CheckpointEngineWorker)。
+
+#### 字段
+
+```python
+# [继承] 原生 checkpoint worker 与权重接收能力
+# [新增]
+_server_name_suffix: str
+server_handle: ... # [适配赋值]
+parameter_validation_enabled: bool
+_last_parameter_manifest: dict | None
+```
+
+#### 方法及作用
+
+- `update_weights(global_steps)`：原生装参并更新 manifest
+- `get_parameter_manifest()->dict`：接收侧审计
+- `_MultiTaskServerAdapter._ensure_server_handle()->bool`：关联命名 Server
+
+**复用点**：复用原生 CheckpointEngineWorker、ServerAdapter、vLLM 权重接收端。
+
+### 1.8.17 `HCCLCheckpointEngine` — `checkpoint/hccl_checkpoint_engine.py`
+
+**继承与职责**：MultiTaskHCCLCheckpointEngine(HCCLCheckpointEngine)。
+
+#### 字段
+
+```python
+# [继承/复用] pyhccl, rank, world_size, send_buf, recv_buf
+# [新增]
+source_validation_enabled: bool
+_source_manifest: dict | None
+```
+
+#### 方法及作用
+
+- `send_weights(weights, global_steps)`：HCCL 真实发送并更新源 manifest
+- `get_source_manifest()->dict`：供目标/源对照
+- `finalize()->None`：通信收尾
+- `_tensor_sha256(tensor)->str`：摘要
+
+**复用点**：复用原生 HCCLCheckpointEngine 通信器和 VERL 权重数据路径；不绕过完成校验。
+
+### 1.8.18 `验收辅助` — `testing/npu_restore_sender.py；testing/startup_diagnostics.py`
+
+**继承与职责**：辅助脚本/函数（非产品 Actor）。
+
+#### 字段
+
+```python
+# [运行期] 模型、通信环境与诊断参数；不持有 GS/Lease Owner 状态
+```
+
+#### 方法及作用
+
+- `NPU RESTORE sender`：测试版本变化与收发真实路径
+- `startup diagnostics`：打印/检查实际运行环境
+
+**复用点**：复用目标环境的 torch_npu、HCCL、Ray / VERL；不参与生产控制面。
 
 # 第二部分：测试与综合验收
 
