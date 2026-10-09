@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,42 @@ import subprocess
 import sys
 import time
 import uuid
+
+
+def configure_multitask_import(repo):
+    """Expose this checkout to the driver, spawned VERL jobs and Ray workers.
+
+    Adding PYTHONPATH to the subprocess env alone is too late: this driver
+    imports GroupScheduler before any child VERL process is launched.
+    """
+    source = (repo / "src").resolve()
+    package = source / "multi_task_scheduler" / "__init__.py"
+    if not package.is_file():
+        raise ValueError(f"MultiTask source checkout is missing: {package}")
+
+    # Avoid duplicate entries while giving the requested checkout precedence.
+    original = os.environ.get("PYTHONPATH", "")
+    components = [p for p in original.split(os.pathsep) if p and p != str(source)]
+    new_pythonpath = os.pathsep.join([str(source), *components])
+    os.environ["PYTHONPATH"] = new_pythonpath
+    if str(source) in sys.path:
+        sys.path.remove(str(source))
+    sys.path.insert(0, str(source))
+
+    # Guard against silently using another version from site-packages.
+    imported = sys.modules.get("multi_task_scheduler")
+    if imported is not None:
+        actual = Path(getattr(imported, "__file__", "") or "").resolve()
+        if not actual.is_relative_to(source):
+            raise RuntimeError(
+                f"multi_task_scheduler already imported from {actual}, expected {source}"
+            )
+    spec = importlib.util.find_spec("multi_task_scheduler")
+    if spec is None or not spec.origin or not Path(spec.origin).resolve().is_relative_to(source):
+        raise RuntimeError(
+            f"multi_task_scheduler cannot be imported from current checkout {source}"
+        )
+    return new_pythonpath
 
 
 def arguments():
@@ -232,7 +269,7 @@ def build_auto_lease(donor_session, candidates, donor_rank, token, ttl_s, namesp
     }
 
 
-def connect_ray(ray, *, address, namespace, start_local=False):
+def connect_ray(ray, *, address, namespace, start_local=False, pythonpath=None):
     """Connect existing Ray or opt-in to temporary, single-node Ray.
 
     Auto never silently starts a different Ray cluster in production.
@@ -240,11 +277,13 @@ def connect_ray(ray, *, address, namespace, start_local=False):
     """
     if start_local and address != "auto":
         raise ValueError("--start-local-ray requires --ray-address auto")
+    init_kwargs = dict(namespace=namespace, ignore_reinit_error=False, log_to_driver=False)
+    # The driver itself and all Ray workers must resolve the same checkout,
+    # including the detached GroupScheduler that is created on first startup.
+    if pythonpath is not None:
+        init_kwargs["runtime_env"] = {"env_vars": {"PYTHONPATH": pythonpath}}
     try:
-        context = ray.init(
-            address=address, namespace=namespace, ignore_reinit_error=False,
-            log_to_driver=False,
-        )
+        context = ray.init(address=address, **init_kwargs)
         return address, False
     except ConnectionError as exc:
         if address != "auto":
@@ -258,10 +297,7 @@ def connect_ray(ray, *, address, namespace, start_local=False):
                 "or provide --ray-address <head-ip>:<port> for an existing cluster."
             ) from exc
 
-    context = ray.init(
-        address="local", namespace=namespace, ignore_reinit_error=False,
-        log_to_driver=False,
-    )
+    context = ray.init(address="local", **init_kwargs)
     # Ray 'local' is an instruction to CREATE a cluster, not a connectable
     # address. Use the real GCS endpoint for both external VERL processes.
     runtime_context = ray.get_runtime_context()
@@ -295,6 +331,8 @@ def main():
     try:
         if not (repo / "scripts/e2e/run_all.sh").is_file():
             raise ValueError(f"not a verl-multi-task checkout: {repo}")
+        pythonpath = configure_multitask_import(repo)
+        log(f"MultiTask source: {repo / 'src'}")
         if a.auto_lease and a.lease is not None:
             raise ValueError("--auto-lease cannot be combined with --lease; generated Lease lives in run logs")
         if a.interactive_lease and (a.lease is None or a.auto_lease):
@@ -364,7 +402,7 @@ def main():
         env.update(RAY_ADDRESS=a.ray_address, PYTHONUNBUFFERED="1",
                    MT_E2E_LOG_ROOT=str(e2e_root), MT_E2E_ATTACH_ONLY="1",
                    MT_E2E_REQUIRE_COMPLETE="1")
-        env["PYTHONPATH"] = str(repo / "src") + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        env["PYTHONPATH"] = pythonpath
         # Avoid inherited FORCE proof flag: in existing attach-mode script it
         # only supports launcher logs; our optional proof checker scans task logs.
         env.pop("MT_E2E_REQUIRE_INFLIGHT_FORCE", None)
@@ -372,7 +410,7 @@ def main():
         log(f"Connect Ray {a.ray_address}, namespace={a.namespace}")
         connected_address, temporary_ray = connect_ray(
             ray, address=a.ray_address, namespace=a.namespace,
-            start_local=a.start_local_ray,
+            start_local=a.start_local_ray, pythonpath=pythonpath,
         )
         if temporary_ray:
             log(f"Started isolated local Ray: {connected_address}")
