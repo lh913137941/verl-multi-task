@@ -84,7 +84,7 @@ MessageQueue 约束完整样本恰好一次提交；重复提交的幂等性、�
 
 操作在 ACK 丢失、timeout、真实 Actor 异常时按原 `operation_id` 查询 Owner 事实；UNKNOWN 或证据缺失不直接重发非幂等设备动作。ADD 失败回滚包括 pending 清理及隐藏 runtime `finalize_release`；RESTORE 失败需防止未完成参数恢复的 Native 重新进入服务；FORCE 缺少真实 handoff 时不得把在途请求视为可安全终止。
 
-**2026-10-09 NPU E2E 已知问题**：`logs/two_real_jobs/20261009-084341/` 的 `force_cycle` 实际在第二次 ADD 失败，报 `ADD bootstrap failed; hidden runtime was verified RELEASED`，因此未进入 FORCE。日志显示 `checkpoint-finalize-complete` 与 `kv-resume-complete`，随后有 EngineCore shutdown 和 SIGTERM，但尚不足以确定底层根因。已在本分支 Trainer `bootstrap_and_publish` 异常捕获处增加包含 `operation_id`、`target`、`e_committed` 和 traceback 的日志（提交 `35ed25a`）；**仅增强诊断，尚未证明 ADD 根因已修复**。
+**2026-10-09 NPU E2E 历史失败（08:43 轮次）**：`logs/two_real_jobs/20261009-084341/` 的 `force_cycle` 实际在第二次 ADD 失败，报 `ADD bootstrap failed; hidden runtime was verified RELEASED`，因此未进入 FORCE。日志显示 `checkpoint-finalize-complete` 与 `kv-resume-complete`，随后有 EngineCore shutdown 和 SIGTERM，但尚不足以确定底层根因。已在本分支 Trainer `bootstrap_and_publish` 异常捕获处增加包含 `operation_id`、`target`、`e_committed` 和 traceback 的日志（提交 `35ed25a`）；**仅增强诊断；后续 09:42 轮次的 5/5 PASS 说明该次未复现，但不能据此判定 ADD 的历史根因已经消除**。
 
 # 第二部分：测试与综合验收
 
@@ -163,17 +163,26 @@ python scripts/e2e/verify_two_verl_jobs.py \
 
 ## 2.6 已观察到的验收结果及未关闭事项
 
-**2026-10-09 真实 NPU 双任务执行**：
+**最新观测：2026-10-09 真实 Ascend NPU 双任务 E2E（运行目录 `logs/two_real_jobs/20261009-094238/`）**。本轮启动隔离本地 Ray，检测到 8 个 NPU 资源，使用 `multitask_hccl`；Donor 和 Borrower 分别以独立 `task_session` 注册到同一个 GroupScheduler。Auto Lease 基于真实 donor CE、named PG（`c500b2433a4fb2cd06fd94c0eb1602000000`）及设备身份 `NPU:b446be0859e5365c63d5e98ec8820137a1c1c1985377966e004112b6:1` 创建，并核验 PG bundle=0、`NPU=1.0`、`CPU=2.0`。
 
-| 场景 | 观测结果 | 备注 |
+| 场景 | 08:43 历史轮次 | 09:42 最新轮次 |
 | --- | --- | --- |
-| `control_plane` | PASS | 同轮完成 |
-| `exactly_once` | PASS | 同轮完成 |
-| `recovery` | PASS | 同轮完成 |
-| `lifecycle` | PASS | 同轮完成 |
-| `force` | FAIL | `force_cycle` 的 ADD bootstrap 失败，未进入 FORCE |
+| `control_plane` | PASS | **PASS** |
+| `exactly_once` | PASS | **PASS** |
+| `recovery` | PASS | **PASS** |
+| `lifecycle` | PASS | **PASS** |
+| `force` | FAIL（第二次 ADD bootstrap 失败） | **PASS** |
+| 总结果 | FAIL（退出码 1） | **PASS（退出码 0，5/5）** |
 
-该记录可证明所列通过场景在当次环境中完成，但不代表跨 CUDA/NPU、不同硬件组合均已验收。后续应在新诊断日志下复现失败，关联 `e2e-baa0d4fefb-add` 的原始 traceback，核实 CE target commit、服务发布、EngineCore 生命周期与二次借卡时序；修复后重新跑全量五场景及严格在途 FORCE。**目前不得声明 FORCE 真实 in-flight continuation 已通过。**
+**验收结论**：最新轮次已完成五个已选择 E2E 场景，返回 `0`。这证明该轮正常生命周期与 FORCE 场景的默认验收通过；**日志未表明使用 `--require-inflight-force`，因此不能据此宣称真实在途 targeted abort + continuation 的严格验收通过**。此次也未提供其他 CUDA/NPU 组合的验收证据。
+
+**仍需关闭的事项**：
+
+- **严格 FORCE**：使用 `--require-inflight-force` 并检查同一 REMOVE operation 的中断、续推回执、attempt 终态与最终样本无重复。
+- **进程收尾**：Python 在退出阶段提示 `ResourceWarning: subprocess 406621 is still running`；需要检查进程是否随后正常结束或属于清理遗漏，不以 `exit=0` 自动认定资源收尾无问题。
+- **历史 ADD 失败**：`20261009-084341` 轮次的 `e2e-baa0d4fefb-add` 在 bootstrap 回滚后记录已验证 `RELEASED`，底层原始异常尚未确定。新轮次未复现不等于根因已修复；Trainer 已增加捕获 traceback 的诊断日志，复发时按同一 operation_id 排查。
+
+本节基于用户提供的两次 E2E 控制台日志与历史 `force_cycle/result.json`，并非在本次文档更新中重新运行测试。
 
 ## 2.7 发布门禁
 
