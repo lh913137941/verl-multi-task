@@ -631,3 +631,99 @@ def test_two_real_jobs_backend_overrides_keep_npu_hccl_and_cuda_nccl_separate():
 
     # The actual E2E fixed override list must use the tested helper.
     assert '*checkpoint_backend_overrides(devices["donor"])' in source
+
+
+
+def test_control_plane_and_exactly_once_attach_existing_ray_without_cpu_override(
+    tmp_path, monkeypatch
+):
+    """Both independent validation drivers must reuse the parent's Ray GCS.
+
+    A real Ray driver rejects num_cpus when RAY_ADDRESS already points to a
+    running cluster. Assert argument shape with a fake init that stops startup.
+    """
+    import importlib.util
+    import json
+    from types import ModuleType, SimpleNamespace
+
+    for script_name, expected_exit in (
+        ("control_plane_recovery.py", 2),
+        ("exactly_once_driver.py", 1),
+    ):
+        for address in (None, "10.170.27.158:45860"):
+            module_name = f"_test_ray_attach_{script_name.replace('.', '_')}"
+            spec = importlib.util.spec_from_file_location(module_name, E2E / script_name)
+            driver = importlib.util.module_from_spec(spec)
+            monkeypatch.setitem(sys.modules, module_name, driver)
+            spec.loader.exec_module(driver)
+
+            observed = []
+            fake_ray = ModuleType("ray")
+            fake_ray.is_initialized = lambda: False
+
+            def fake_init(**kwargs):
+                observed.append(kwargs)
+                raise RuntimeError("simulated Ray connect stopped before actors")
+
+            fake_ray.init = fake_init
+            monkeypatch.setitem(sys.modules, "ray", fake_ray)
+
+            if script_name == "control_plane_recovery.py":
+                # The test stops in ray.init: no real Ray or scheduler is needed.
+                scheduler_module = ModuleType(
+                    "multi_task_scheduler.scheduler.group_scheduler"
+                )
+                scheduler_module.GroupScheduler = object
+                monkeypatch.setitem(sys.modules, scheduler_module.__name__, scheduler_module)
+                # Contracts may have been imported by other tests, or may be a
+                # lightweight stub if the package is not installed.
+                contracts_name = "multi_task_scheduler.orchestration.contracts"
+                if contracts_name not in sys.modules:
+                    contracts = ModuleType(contracts_name)
+                    for symbol in (
+                        "EvidenceType", "Lease", "OperationCommand",
+                        "OperationEvidence", "OperationKind", "OperationRecord",
+                        "OperationStatus", "ReplicaKey", "ReplicaKind",
+                    ):
+                        setattr(contracts, symbol, object)
+                    monkeypatch.setitem(sys.modules, contracts_name, contracts)
+            else:
+                queue_module = ModuleType(
+                    "multi_task_scheduler.integration.verl.experimental_fully_async.message_queue"
+                )
+                queue_module.MultiTaskMessageQueue = object
+                monkeypatch.setitem(sys.modules, queue_module.__name__, queue_module)
+
+            if address:
+                monkeypatch.setenv("RAY_ADDRESS", address)
+                monkeypatch.setenv("PYTHONPATH", "/mounted/checkout/src")
+            else:
+                monkeypatch.delenv("RAY_ADDRESS", raising=False)
+                monkeypatch.delenv("PYTHONPATH", raising=False)
+
+            output = tmp_path / f"{script_name}-{address or 'local'}.json"
+            monkeypatch.setattr(sys, "argv", [
+                script_name, "--result-file", str(output)
+            ])
+            if script_name == "control_plane_recovery.py":
+                # Avoid real stale timeout; Ray initialization fails earlier.
+                sys.argv.extend(["--stale-wait-s", "0.1"])
+
+            assert driver.main() == expected_exit
+            assert len(observed) == 1
+            kwargs = observed[0]
+            if address:
+                assert kwargs["address"] == address
+                assert "num_cpus" not in kwargs
+                assert kwargs["runtime_env"] == {
+                    "env_vars": {"PYTHONPATH": "/mounted/checkout/src"}
+                }
+            else:
+                assert kwargs["address"] == "local"
+                assert kwargs["num_cpus"] == (
+                    2 if script_name == "control_plane_recovery.py" else 3
+                )
+                assert "runtime_env" not in kwargs
+            record = json.loads(output.read_text(encoding="utf-8"))
+            assert record["last_stage"] == "ray_init" if script_name == "exactly_once_driver.py" else record["state"] == "BLOCKED"
+            assert "simulated Ray connect" in record["detail"]
