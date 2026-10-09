@@ -1,7 +1,8 @@
 # 双任务 E2E 示例
 
 - `native_args.txt`：唯一保留的 Hydra 原生训练参数样例。使用前填写真实的模型、训练与验证数据路径。
-- `lease.example.json`：Lease 结构示例；只有具备真实可验证的资源 placement 时才能用于完整生命周期验收。
+
+E2E 默认从真实 donor 资源位置自动构造 Lease，无需提供静态 Lease JSON。可选 `--lease` 仅用于使用已验证的人工诊断输入。
 
 从仓库根目录运行：
 
