@@ -14,6 +14,10 @@ tests/
 └── conftest.py           # 共用源码路径、Ray Worker PYTHONPATH 设置
 ```
 
+**关于两个 `conftest.py`：** `tests/conftest.py` 是所有测试共用的源码与 Ray Worker 路径配置；`tests/integration/cuda/conftest.py` 只为 CUDA 验收提供 `gpu_test_config`、`gpu_inventory` fixture。Pytest 在 CUDA 子目录自动继承父级 fixture，无需合并或重复注册；避免让 CPU unit 依赖 `nvidia-smi` 或真实设备配置。
+
+依赖安装分层见 [requirements/README.md](../requirements/README.md)，示例入口见 [examples/README.md](../examples/README.md)。
+
 ## 先选需要哪一层
 
 | 修改内容 | 优先运行 | 要求 |
