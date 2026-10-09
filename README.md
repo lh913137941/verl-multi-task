@@ -215,347 +215,145 @@ patches/verl-v0.10-fully-async-multitask-entry.patch
 
 ---
 
-## 6. 启用 MultiTask
+## 6. 快速开始：运行两个真实 VERL 任务
 
-最小配置方向：
+**推荐入口：`scripts/e2e/verify_two_verl_jobs.py`。** 不需要手动创建 Ray Placement Group、
+填写 Lease 或分别启动 donor / borrower。先准备能正常运行的 VERL Fully Async 环境，以及
+真实的模型目录、训练和验证数据。
 
-```text
-multitask.enabled=true
-multitask.runtime.profile=experimental_fully_async_standalone
+在本仓库根目录执行（**替换三处 `/实际...` 路径**）：
 
-actor_rollout_ref.hybrid_engine=false
-actor_rollout_ref.rollout.name=vllm
-actor_rollout_ref.rollout.mode=async
-actor_rollout_ref.rollout.tensor_model_parallel_size=1
-actor_rollout_ref.rollout.data_parallel_size=1
-actor_rollout_ref.rollout.pipeline_model_parallel_size=1
-actor_rollout_ref.rollout.enable_sleep_mode=true
-actor_rollout_ref.rollout.free_cache_engine=true
-actor_rollout_ref.rollout.calculate_log_probs=true
+```bash
+# 已有 /tmp/native_args.txt 时保留原文件；样例默认针对 Ascend NPU。
+test -f /tmp/native_args.txt || cp examples/e2e/native_args.txt /tmp/native_args.txt
 
-actor_rollout_ref.rollout.checkpoint_engine.backend=nccl
-actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nccl.rebuild_group=true
-
-async_training.use_trainer_do_validate=false
-async_training.use_dynamic_resource_scheduling=false
-
-data.train_batch_size=0
-data.gen_batch_size=1
+python scripts/e2e/verify_two_verl_jobs.py \
+  --repo . \
+  --ray-address auto \
+  --start-local-ray \
+  --native-args /tmp/native_args.txt \
+  --model-path /实际模型目录/Qwen3-0.6B \
+  --train-files /实际数据目录/train.parquet \
+  --val-files /实际数据目录/test.parquet \
+  --scenarios "control_plane exactly_once recovery lifecycle force"
 ```
 
-`trainer.device` 不需要为 MultiTask 手工写死。VERL 的 `auto_set_device()` 会在
-profile 选择前把它归一化为当前平台的 `cuda` 或 `npu`；MultiTask profile
-接受这两种 accelerator device，并继续拒绝 CPU-only 生命周期。
+- `/tmp/native_args.txt` 每行一个 **Hydra `key=value`**（不是 shell 脚本）。
+  样例见 [examples/e2e/native_args.txt](examples/e2e/native_args.txt)；如果文件里已填写真实模型和数据路径，
+  可省略上面的 `--model-path`、`--train-files`、`--val-files`。
+- `--start-local-ray`：优先连接现有 Ray；没有集群时启动临时单机 Ray，结束后关闭。
+  使用持久或多机 Ray 时，指定 `--ray-address <head地址>`，**去掉** `--start-local-ray`。
+- 启动器自动完成 MultiTask 入口检查、两个 VERL driver 启动、共享 GS 注册、
+  从真实 donor CE / PG 自动发现物理 Lease，以及指定场景的验收。
+  它会在必要时备份并修补当前 Python **实际导入**的 VERL 源码入口；
+  禁止自动改动时加 `--no-auto-bridge`（要求入口已经接好）。
+  源码 `src/` 会自动传给本次 driver 和新建 Ray worker。
+- 初始默认每任务各申请 1 张 Trainer 和 1 张独立 Rollout 卡；需要调整时使用
+  `--trainer-gpus` / `--rollout-gpus`，确保 Ray 有足够真实 GPU/NPU 资源。
 
-`multitask.enabled=false` 或未配置时继续使用原生 Fully Async TaskRunner。
-
-显式启用后，如果 profile、拓扑、依赖或 runtime capability 不满足要求，会直接失败，
-不会静默退回另一套 MultiTask 行为。
+**自己通过原生 VERL 入口运行时**，关键开关是
+`multitask.enabled=true` 和
+`multitask.runtime.profile=experimental_fully_async_standalone`。
+其余运行条件（独立 Rollout、TP/DP/PP=1、参数同步后端等）必须满足
+[`runtime_profile.py`](src/multi_task_scheduler/integration/verl/runtime_profile.py)；
+上面的 E2E 启动器会统一补齐这些限定参数。未启用 MultiTask 时仍使用原生 VERL。
 
 ---
 
-## 7. CUDA 与 Ascend NPU
+## 7. CUDA / Ascend NPU：只需关注的差异
 
-### CUDA
+| 项目 | CUDA | Ascend NPU |
+| --- | --- | --- |
+| `trainer.device` | `cuda` | `npu`（样例 `native_args.txt` 的默认值） |
+| Ray 加速卡资源 | `GPU` | `NPU` |
+| Checkpoint backend | 原生 `nccl` | `multitask_hccl` + HCCL |
+| Native sleep | 支持条件下 level 2 | 当前 vLLM-Ascend 使用平台安全的 level 1 |
 
-CUDA 路径要求 whole-GPU DONATE 能进入 level-2 sleep。MTP rollout、未 merge 的 LoRA
-等只能安全使用更浅 sleep level 的配置会 fail-closed。
+**使用第 6 节的启动器时，后端会按设备自动配置。** NPU 不要手工照抄 CUDA 的
+`checkpoint_engine.backend=nccl`；实际需要 `multitask_hccl` 及对应
+`custom_backend_module`，启动器已处理。
 
-真实 CUDA acceptance：
-
-```bash
-export VERL_MULTITASK_GPU_MODEL_PATH=/path/to/local/model
-
-python -m pytest -q -s   -m gpu_integration   tests/integration/test_native_sleep_gpu.py
-```
-
-覆盖：
-
-- native sleep -> 同物理 GPU borrower -> REMOVE；
-- FORCE targeted abort + continuation；
-- current-Vpub RESTORE。
-
-### Ascend NPU
-
-NPU 路径使用：
-
-```text
-VERL platform: huawei
-device:        npu
-Ray resource:  NPU
-communication: HCCL
-rollout:       vLLM-Ascend
-```
-
-VERL / vLLM-Ascend 当前把 NPU 的可用 sleep primitive 解析为 level 1；
-MultiTask NPU 路径因此要求 platform-safe level-1 sleep，而不会伪装成 CUDA level 2。
-
-为了保持首版 Lease/OperationEvidence 结构不膨胀，历史字段名
-`gpu_uuid` 暂时同时承载物理 accelerator identity：
-
-```text
-CUDA: real GPU UUID
-NPU:  NPU:<node_id>:<ray_accelerator_id>
-```
-
-### 关于 `transfer_to_npu`
-
-Ascend 环境常启用：
-
-```text
-torch_npu.contrib.transfer_to_npu
-```
-
-它会全局 monkey-patch `torch.cuda.*`，因此：
-
-**不要用 `torch.cuda.is_available()` / `torch.cuda.device_count()` 判断当前真实设备。**
-
-NPU acceptance 只信：
-
-```text
-VERL_PLATFORM=huawei
-verl.utils.device.get_device_name() == "npu"
-verl.utils.device.get_resource_name() == "NPU"
-torch.npu
-Ray cluster resource "NPU"
-```
-
-NPU 测试会为 driver 和 Ray runtime 显式固定 `VERL_PLATFORM=huawei`；
-CUDA acceptance 若检测到 `transfer_to_npu` 已加载则直接 skip，避免假 CUDA 绿灯。
-
-真实 NPU acceptance 建议使用 plain BF16/FP16 模型；C8/ModelSlim/其它量化模型应先单独验证
-vLLM-Ascend loader 兼容性，不要把量化 backend 失败混入生命周期验收。
-
-先做静态 preflight，再验证 vanilla VERL + vLLM-Ascend 基线，最后跑 MultiTask lifecycle：
+NPU 环境首次运行失败时，先做不启动训练的预检查：
 
 ```bash
-export VERL_MULTITASK_NPU_MODEL_PATH=/path/to/local/model
-
-# /tmp 空间不足或使用率 >=95% 时，把 Ray session/object-spill 临时目录放到大盘。
-export VERL_MULTITASK_RAY_TMPDIR=/path/to/large/local/filesystem/ray_tmp
-
-# 0) 不启动 Ray/vLLM；检查版本配对、Git HEAD、NPU、模型量化判定和临时盘。
-python scripts/e2e/diagnose_npu_runtime.py
-
-# 1) 不经过 MultiTask subclass，分层验证 backend：
-#    A. direct vLLM-Ascend default executor（单卡默认 uni）
-#    B. direct vLLM-Ascend distributed_executor_backend=mp
-#    C. 原生 VERL vLLMReplica（worker extension 是 VERL server contract 的一部分）
-python -m pytest -q -s \
-  -m npu_backend_smoke \
-  tests/integration/test_native_sleep_npu.py
-
-# 2) backend smoke 通过后再跑完整生命周期。
-python -m pytest -q -s \
-  -m npu_integration \
-  tests/integration/test_native_sleep_npu.py
+VERL_MULTITASK_NPU_MODEL_PATH=/实际模型目录/Qwen3-0.6B \
+  python scripts/e2e/diagnose_npu_runtime.py
 ```
 
-当前 VERL NPU 安装脚本使用同版本 lane 的 vLLM / vLLM-Ascend；例如当前脚本对应
-`vLLM v0.23.0` + `vLLM-Ascend releases/v0.23.0`。不要把任意 vLLM source HEAD
-与另一条 vLLM-Ascend release/main 混用。诊断脚本会从本地 VERL checkout 的
-`scripts/install_vllm_mcore_npu.sh` 读取期望 pair 并与实际环境对照。
-
-NPU acceptance 在启动 Ray 前会检查临时文件系统的剩余空间；空间不足时会
-直接报告环境阻断，避免等到 vLLM EngineCore 初始化后才出现模糊的 WorkerProc 错误。
-
-三条设备级验收：
-
-```text
-NPU DONATE:
-native sleep -> same-slot borrowed runtime -> real generation -> REMOVE
-
-NPU FORCE:
-targeted abort -> continuation proof -> alternate replica completes request
-
-NPU RESTORE:
-sleep -> lend slot -> remove borrower -> mutate trainer Vpub
--> HCCL checkpoint transfer -> version check -> final wake -> generation
-```
-
-注意：VERL 的 Ascend Checkpoint Engine 实现仍通过现有
-`checkpoint_engine.backend="nccl"` 配置入口选择，runtime 在 NPU 平台落到 HCCL；
-不要仅根据配置字符串判断底层通信设备。
+确认 vLLM / vLLM-Ascend 版本配套、模型可加载以及 Ray 能看到真实 `NPU`。
+若使用了 `torch_npu.contrib.transfer_to_npu`，不要仅用
+`torch.cuda.is_available()` 判断设备类型。模型优先使用已验证的 BF16/FP16；
+量化模型先单独验证 vLLM-Ascend 加载。设备级专项测试见第 8 节。
 
 ---
 
-## 8. 分层测试
+## 8. 测试：按需要选择
 
-### Unit
+普通代码修改通常先跑 **Unit**；涉及 Ray Actor 时再跑 CPU Ray；
+改动原生 VERL 适配时跑 Native：
 
 ```bash
 python -m pytest -q tests/unit
+python -m pytest -q -m ray_integration tests/integration
+python -m pytest -q -m native tests/native_unit
 ```
 
-### CPU Ray integration
+有真实硬件、模型且需要验证设备级 sleep / 恢复时再跑（**二选一**）：
 
 ```bash
-python -m pytest -q   -m ray_integration   tests/integration
-```
-
-这层验证真实 Ray Actor / GroupScheduler 控制面，不需要 GPU/NPU。
-
-### Native VERL adapter
-
-```bash
-python -m pytest -q   -m native   tests/native_unit
-```
-
-这层检查 MultiTask subclass 与真实 VERL 类的继承/方法合同。
-
-### CUDA acceptance
-
-```bash
-export VERL_MULTITASK_GPU_MODEL_PATH=/path/to/model
-
-python -m pytest -q -s   -m gpu_integration   tests/integration/test_native_sleep_gpu.py
-```
-
-### Ascend NPU acceptance
-
-```bash
-export VERL_MULTITASK_NPU_MODEL_PATH=/path/to/model
-export VERL_MULTITASK_RAY_TMPDIR=/path/to/large/local/filesystem/ray_tmp
-
+# Ascend NPU：先验证 backend，再验证完整 NPU 集成
+export VERL_MULTITASK_NPU_MODEL_PATH=/实际模型目录/Qwen3-0.6B
+python -m pytest -q -s -m npu_backend_smoke tests/integration/test_native_sleep_npu.py
 python -m pytest -q -s -m npu_integration tests/integration/test_native_sleep_npu.py
+
+# CUDA：在 CUDA 机器上运行
+VERL_MULTITASK_GPU_MODEL_PATH=/实际模型目录 \
+  python -m pytest -q -s -m gpu_integration tests/integration/test_native_sleep_gpu.py
 ```
 
-pytest marker 定义见 `pyproject.toml`。
+这些专项测试与第 6 节的双任务 E2E 互为补充；不需要每次全部运行。
 
 ---
 
-## 9. E2E 与异常恢复
+## 9. E2E 验收结果与排错
 
-完整脚本位于：
+第 6 节的 `--scenarios` 可直接指定范围，无需换一套启动脚本：
 
-```text
-scripts/e2e/
-```
+| 场景 | 验证内容 |
+| --- | --- |
+| `control_plane` | GS / Lease / 注册与 ACK 丢失 |
+| `exactly_once` | MessageQueue 样本去重与冲突拒绝 |
+| `recovery` | 确定性异常与 UNKNOWN 对账 |
+| `lifecycle` | DONATE → ADD → REMOVE → RESTORE |
+| `force` | DONATE → ADD → FORCE REMOVE → RESTORE |
 
-快速验证控制面、恢复和 Exactly-once：
+例如只复测两个失败场景，将第 6 节命令最后一行换成
+`--scenarios "control_plane exactly_once"`；只跑生命周期则换成
+`--scenarios "lifecycle force"`。
 
-```bash
-bash scripts/e2e/verify_cluster.sh   --quick   --lease /tmp/lease.json   --attach
-```
-
-完整集群生命周期：
-
-```bash
-bash scripts/e2e/verify_cluster.sh   --launcher /path/to/test_launcher.sh   --lease /tmp/lease.json
-```
-
-已有运行任务时：
+结果写入 `logs/two_real_jobs/<运行时间>/`。查看**最近一次**运行：
 
 ```bash
-python scripts/e2e/list_tasks.py
-
-bash scripts/e2e/verify_cluster.sh   --attach   --lease /tmp/lease.json   --donor-session <donor-task-session>   --borrower-session <borrower-task-session>
+RUN=$(ls -dt logs/two_real_jobs/*/ | head -n 1)
+cat "${RUN}orchestration_summary.json"
+grep -E 'MULTITASK_E2E_RESULT|FAIL|BLOCKED' "${RUN}e2e.log" | tail -n 50
+find "${RUN}scenarios" -name result.json -print
 ```
 
-Lease fixture：
+`STATE=PASS` 且所选场景全为 `PASS` 才算该轮通过。
+退出码：`0=PASS`、`1=FAIL`、`2=BLOCKED`（环境或证据不足）。
+场景失败时优先查看对应 `scenarios/<场景>/<运行ID>/result.json`，
+再查 `donor.log` / `borrower.log`，不要只根据总表定位根因。
 
-```text
-examples/e2e/lease.example.json
-```
+**严格在途 FORCE**：在含有 `force` 的 E2E 命令中额外添加
+`--require-inflight-force`，要求与本次 FORCE 操作匹配、且实际中断/续推的正向证明；
+默认 `force: PASS` **不等于**已经验证真实在途请求续推。
 
-结果严格区分：
+需要保留训练任务以便进一步排查时，可以加 `--keep-running`，但必须连接
+**持久 Ray 集群**且不能同时使用 `--start-local-ray`。
 
-```text
-0 = PASS
-1 = FAIL
-2 = BLOCKED
-```
-
-缺少硬件、拓扑或真实证据时返回 BLOCKED，而不是伪报 PASS。
-
-完整说明：
-[docs/e2e-acceptance.md](docs/e2e-acceptance.md)。
-
-
-### 两个真实 Fully Async 任务的共享 GS 一键验收
-
-准备可运行的原生 Fully Async 模型、数据和训练参数，将 Hydra overrides
-逐行写入 `/tmp/native_args.txt`。E2E 会自动把本仓 `src/` 加入主进程、
-两个 VERL driver 的 `PYTHONPATH`，并通过 Ray `runtime_env` 传给新建的
-Ray Worker，因此无需手动导出 `PYTHONPATH` 或为了这个启动器执行 `pip install -e .`。
-多机 Ray 上每个节点仍必须能访问**同一路径**的源码；现存的 detached Actor
-无法被这次启动器自动更新。
-
-**无需手动设置 `VERL_ROOT`、`git apply` 或安装额外补丁。** 默认启动时，
-`verify_two_verl_jobs.py` 会自动定位当前 Python **实际导入**的 VERL：
-若缺少 MultiTask bridge，先尝试仓库自带的标准补丁；因 VERL 本地改动而
-无法匹配时，使用 AST 定位只修改入口 `TaskRunner` 选择和 Hydra 的
-`multitask` 默认配置。修改前会备份文件，校验不通过会回滚；
-已安装则不重复修改。若入口已有其他自定义 TaskRunner 选择逻辑，
-将直接 BLOCKED 而不会覆盖。也不会删除现有 VERL 改动。
-
-如只想检查而**不允许自动修改 VERL**，运行 E2E 时增加
-`--no-auto-bridge`；可独立执行
-`python scripts/e2e/ensure_verl_multitask_bridge.py --check-only` 进行只读检查。
-直接执行 `python scripts/e2e/ensure_verl_multitask_bridge.py` 也能单独安装入口。
-对于通过 `site-packages` 导入的非源码版本，脚本会拒绝原地修改，要求先使用
-可编辑安装的 VERL 源码 checkout。
-
-```bash
-export RAY_ADDRESS=auto  # 或实际 Ray head 地址
-python scripts/e2e/verify_two_verl_jobs.py \
-  --repo . \
-  --ray-address "$RAY_ADDRESS" \
-  --namespace multitask-jobs \
-  --native-args /tmp/native_args.txt \
-  --start-local-ray \
-  --model-path /实际模型路径/Qwen3-0.6B
-```
-
-上面的 `--model-path` 是真实的模型路径，请替换为机器上的实际目录。
-样例 `examples/e2e/native_args.txt` 中的
-`/REPLACE_WITH_VERL_REPO_DIR/Qwen3-0.6B` **只是占位符**，不能直接训练。
-脚本现在会在启动 Ray 和 donor 之前检测该占位符、缺失的本地模型
-`config.json` 以及不存在的本地数据集路径，并直接打印具体参数错误。
-如果示例中的 GSM8K 路径也与机器不符，可额外传入
-`--train-files /真实数据/train.parquet --val-files /真实数据/test.parquet`，
-不需要修改 `/tmp/native_args.txt`。
-
-在**单机真实 GPU/NPU E2E** 中，若没有启动 Ray，可附带 `--start-local-ray`：
-脚本先连接现有 Ray；连接不到时才创建**临时单节点** Ray，将实际 GCS 地址传给
-两个 VERL driver，并在结束时关闭。E2E 根据 `trainer.device` 自动选择
-权重同步 backend：**NPU** 使用已有的 `multitask_hccl`（通过
-`custom_backend_module` 在发送端/接收端加载，并启用 `rebuild_group`），
-避免原生 HCCL `finalize()` 调用不存在的 `PyHcclCommunicator.destroyComm`；
-**CUDA** 保持原生 `nccl`。无需额外手工修改 VERL 或 Hydra 配置。
-需要 `--keep-running` 或跨节点执行时，
-应自行启动持久 Ray head（如 `ray start --head`）/连接现有集群，
-**不要**添加 `--start-local-ray`。Ray 必须真实注册 `GPU` 或 `NPU`
-资源；若 NPU 检测不到，脚本会明确报错，不能伪造物理卡数量。
-不添加 `--start-local-ray` 时继续采用安全的只连接模式；
-当无运行中的 Ray 时会提示具体的处理方式。
-
-脚本启动两个独立的原生 VERL Fully Async driver，强制启用 MultiTask 并使用相同的
-Ray 地址和 job namespace；等待两个新的 task_session 附着到同一个 named detached GS，
-然后通过 donor TaskRunner → Rollouter → CE Worker 只读采集真实 GPU/NPU 身份，
-结合原生 Replica 所持有的 named Placement Group 验证 bundle、node、设备及 namespace。
-验证通过后自动生成 `logs/two_real_jobs/<运行时间>/auto_lease.json` 并交给已有 E2E
-驱动使用。默认选择 donor native rank 0；可用 `--donor-replica-rank` 明确指定。
-若事实不完整、PG 无法验证或任务未就绪，直接 BLOCKED，不猜测 PG/卡号。
-已有的 `--lease /tmp/lease.json --interactive-lease` 仍支持手工诊断。
-
-这个自动 Lease 是 **E2E 编排产生的真实资源快照**，不是业务侧需要维护的配置项；
-生产调度中仍由 GS 根据 idle report、容量、安全边界及资源归属选择 donor/borrower，
-使用内部 `open_lease` 记账，不能仅凭自动发现便视为资源已获借出许可。
-为避免两个真实任务在同一 Ray namespace 内发生资源名称冲突，
-MultiTask 使用 TaskRunner 的 `task_session` 同时隔离原生 Rollout PG/CE/server、
-Trainer ResourcePool/Placement Group 和 RewardLoop Worker 的名称；Trainer 的角色映射、
-资源数量以及 RewardLoop 原生奖励计算与节点亲和调度保持不变。
-不应通过删除其他任务的同名 Actor/PG 来处理冲突。
-若生命周期操作临时移走了最后一个可分配的 Rollout Server，
-MultiTask Client 只在 LB 确认属于 DONATE/REMOVE 等生命周期交接时短时等待
-ADD/RESTORE 重新发布服务；等待有上限，超时仍失败。初始化时本就没有
-Server 或无交接证明时继续立即报错，不以无限重试掩盖资源/配置问题。
-
-随后复用现有 `run_all.sh` 验证 control_plane、exactly_once、recovery、lifecycle 和 force。
-可用 `--scenarios "lifecycle force"` 缩小范围；`--keep-running` 可保留两个 driver。
-结果和训练日志保存在 `logs/two_real_jobs/<运行时间>/`；退出码为
-`0=PASS / 1=FAIL / 2=BLOCKED`。真实 GPU/NPU 运行结果需在实际集群上判定。
+详细的验收断言、异常恢复合同、手动 Lease 和 attach 模式见
+[docs/e2e-acceptance.md](docs/e2e-acceptance.md)，避免把 README 变成内部设计手册。
 
 ---
 
