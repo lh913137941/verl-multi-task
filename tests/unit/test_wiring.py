@@ -47,6 +47,7 @@ from _wiring_support import (
     native_manager_class,
     _isolated_group_scheduler_class,
     _scheduler_test_lease,
+    _borrowed_test_claim,
     rollouter_class,
 )
 
@@ -2304,23 +2305,7 @@ def test_borrowed_worker_plan_is_deterministic_and_side_effect_free():
         "placement_epoch": 3,
         "world_size": 1,
         "max_colocate_count": FIRST_RELEASE_MAX_COLOCATE_COUNT,
-        "claims": [
-            {
-                "claim_id": "claim-0",
-                "source_lease_id": "source-lease-0",
-                "donor_task_id": "donor-task",
-                "donor_replica_rank": 0,
-                "rank": 0,
-                "pg_id": "pg",
-                "bundle_index": 4,
-                "node_id": "node-a",
-                "gpu_uuid": "GPU-0",
-                "node_rank": 0,
-                "local_rank": 0,
-                "gpu_fraction": FIRST_RELEASE_RAY_GPU_FRACTION,
-                "cpu_request": 1.0,
-            }
-        ],
+        "claims": [_borrowed_test_claim(bundle_index=4, node_id="node-a", gpu_uuid="GPU-0")],
     }
 
     first = replica.build_borrowed_worker_plan(spec)
@@ -2370,23 +2355,7 @@ def test_borrowed_worker_plan_rejects_donor_topology_or_wrong_identity():
         "placement_epoch": 1,
         "world_size": 1,
         "max_colocate_count": FIRST_RELEASE_MAX_COLOCATE_COUNT,
-        "claims": [
-            {
-                "claim_id": "claim-0",
-                "source_lease_id": "source-lease-0",
-                "donor_task_id": "donor-task",
-                "donor_replica_rank": 0,
-                "rank": 0,
-                "pg_id": "pg",
-                "bundle_index": 0,
-                "node_id": "node-a",
-                "gpu_uuid": "GPU-0",
-                "node_rank": 0,
-                "local_rank": 0,
-                "gpu_fraction": FIRST_RELEASE_RAY_GPU_FRACTION,
-                "cpu_request": 1.0,
-            }
-        ],
+        "claims": [_borrowed_test_claim(node_id="node-a", gpu_uuid="GPU-0")],
     }
 
     wrong_rank = dict(base, replica_rank=3)
@@ -2599,23 +2568,7 @@ def test_create_workers_from_claims_clones_actor_options_per_rank():
         "placement_epoch": 0,
         "world_size": 1,
         "max_colocate_count": FIRST_RELEASE_MAX_COLOCATE_COUNT,
-        "claims": [
-            {
-                "claim_id": "claim-0",
-                "source_lease_id": "source-lease-0",
-                "donor_task_id": "donor-task",
-                "donor_replica_rank": 0,
-                "rank": 0,
-                "pg_id": "pg",
-                "bundle_index": 2,
-                "node_id": "node",
-                "gpu_uuid": "GPU-x",
-                "node_rank": 0,
-                "local_rank": 0,
-                "gpu_fraction": FIRST_RELEASE_RAY_GPU_FRACTION,
-                "cpu_request": 1.0,
-            }
-        ],
+        "claims": [_borrowed_test_claim(bundle_index=2)],
     }
 
     assert asyncio.run(replica._create_workers_from_claims(spec, {"pg": "PG"})) is None
@@ -2769,23 +2722,7 @@ def test_init_from_lease_reaches_runtime_ready_only_after_server_health():
         "placement_epoch": 2,
         "world_size": 1,
         "max_colocate_count": FIRST_RELEASE_MAX_COLOCATE_COUNT,
-        "claims": [
-            {
-                "claim_id": "claim-0",
-                "source_lease_id": "source-lease-0",
-                "donor_task_id": "donor-task",
-                "donor_replica_rank": 0,
-                "rank": 0,
-                "pg_id": "pg",
-                "bundle_index": 0,
-                "node_id": "node",
-                "gpu_uuid": "GPU-x",
-                "node_rank": 0,
-                "local_rank": 0,
-                "gpu_fraction": FIRST_RELEASE_RAY_GPU_FRACTION,
-                "cpu_request": 1.0,
-            }
-        ],
+        "claims": [_borrowed_test_claim()],
     }
 
     receipt = asyncio.run(replica.init_from_lease(spec, {"pg": "PG"}))
@@ -4235,51 +4172,10 @@ def test_group_scheduler_rejects_stale_or_mismatched_idle_donate_when_report_exi
         )
 
 def test_group_scheduler_binds_donate_to_lease_donor_rank():
-    path = SOURCE / "scheduler/group_scheduler.py"
-    tree = ast.parse(path.read_text())
-    scheduler = next(
-        node for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "GroupScheduler"
-    )
-    scheduler.decorator_list = []
-    module = ast.Module(
-        body=[scheduler],
-        type_ignores=[],
-    )
-    env = {
-        "ReplicaKey": ReplicaKey,
-        "ReplicaKind": ReplicaKind,
-        "ActorHandle": object,
-        "Lease": Lease,
-        "OperationCommand": OperationCommand,
-        "OperationEvidence": OperationEvidence,
-        "OperationKind": OperationKind,
-        "OperationRecord": OperationRecord,
-        "RUNTIME_KIND": "test",
-        "EvidenceType": EvidenceType,
-        "_RELEASE_KINDS": {OperationKind.DONATE, OperationKind.REMOVE},
-        "_IDLE_REPORT_MAX_AGE_S": 10.0,
-        "CONTROL_RPC_TIMEOUT_S": CONTROL_RPC_TIMEOUT_S,
-        "native_replica_key": native_replica_key,
-        "time": time,
-        "ray": type("Ray", (), {"remote": staticmethod(lambda **kwargs: (lambda cls: cls))}),
-    }
-    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), env)
-    cls = env["GroupScheduler"]
-    lease = Lease(
-        "l1",
-        ({
-            "claim_id": "claim-1",
-            "source_lease_id": "source-1",
-            "donor_task_id": "task-a",
-            "donor_replica_rank": 1,
-            "pg_id": "pg",
-            "bundle_index": 1,
-            "node_id": "n0",
-            "gpu_uuid": "u1",
-            "gpu_fraction": 0.5,
-            "cpu_request": 1.0,
-        },),
+    cls = _isolated_group_scheduler_class()
+    lease = _scheduler_test_lease(
+        "l1", claim_id="claim-1", source_lease_id="source-1",
+        donor_replica_rank=1, bundle_index=1, gpu_uuid="u1",
     )
 
     assert cls._target_matches_donor(ReplicaKey("task-a", "native-1"), lease)
@@ -4288,49 +4184,10 @@ def test_group_scheduler_binds_donate_to_lease_donor_rank():
     assert not cls._target_matches_donor(ReplicaKey("task-a", "native-1", 1), lease)
 
 def test_group_scheduler_restore_requires_original_donor_and_returned_claims():
-    path = SOURCE / "scheduler/group_scheduler.py"
-    tree = ast.parse(path.read_text())
-    scheduler = next(
-        node for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "GroupScheduler"
-    )
-    scheduler.decorator_list = []
-    module = ast.Module(body=[scheduler], type_ignores=[])
-    env = {
-        "ReplicaKey": ReplicaKey,
-        "ReplicaKind": ReplicaKind,
-        "ActorHandle": object,
-        "Lease": Lease,
-        "OperationCommand": OperationCommand,
-        "OperationEvidence": OperationEvidence,
-        "OperationKind": OperationKind,
-        "OperationRecord": OperationRecord,
-        "RUNTIME_KIND": "test",
-        "EvidenceType": EvidenceType,
-        "_RELEASE_KINDS": {OperationKind.DONATE, OperationKind.REMOVE},
-        "_IDLE_REPORT_MAX_AGE_S": 10.0,
-        "CONTROL_RPC_TIMEOUT_S": CONTROL_RPC_TIMEOUT_S,
-        "native_replica_key": native_replica_key,
-        "time": time,
-        "ray": FakeRay,
-    }
-    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), env)
-    cls = env["GroupScheduler"]
+    cls = _isolated_group_scheduler_class()
     gs = cls()
-    lease = Lease(
-        "l1",
-        ({
-            "claim_id": "claim-1",
-            "source_lease_id": "source-1",
-            "donor_task_id": "task-a",
-            "donor_replica_rank": 0,
-            "pg_id": "pg",
-            "bundle_index": 0,
-            "node_id": "n0",
-            "gpu_uuid": "u0",
-            "gpu_fraction": 0.5,
-            "cpu_request": 1.0,
-        },),
+    lease = _scheduler_test_lease(
+        "l1", claim_id="claim-1", source_lease_id="source-1",
     )
     gs.open_lease(lease)
 
