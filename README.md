@@ -518,7 +518,12 @@ python scripts/e2e/verify_two_verl_jobs.py \
 
 在**单机真实 GPU/NPU E2E** 中，若没有启动 Ray，可附带 `--start-local-ray`：
 脚本先连接现有 Ray；连接不到时才创建**临时单节点** Ray，将实际 GCS 地址传给
-两个 VERL driver，并在结束时关闭。需要 `--keep-running` 或跨节点执行时，
+两个 VERL driver，并在结束时关闭。E2E 根据 `trainer.device` 自动选择
+权重同步 backend：**NPU** 使用已有的 `multitask_hccl`（通过
+`custom_backend_module` 在发送端/接收端加载，并启用 `rebuild_group`），
+避免原生 HCCL `finalize()` 调用不存在的 `PyHcclCommunicator.destroyComm`；
+**CUDA** 保持原生 `nccl`。无需额外手工修改 VERL 或 Hydra 配置。
+需要 `--keep-running` 或跨节点执行时，
 应自行启动持久 Ray head（如 `ray start --head`）/连接现有集群，
 **不要**添加 `--start-local-ray`。Ray 必须真实注册 `GPU` 或 `NPU`
 资源；若 NPU 检测不到，脚本会明确报错，不能伪造物理卡数量。
