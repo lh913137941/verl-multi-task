@@ -280,8 +280,9 @@ VERL_MULTITASK_NPU_MODEL_PATH=/实际模型目录/Qwen3-0.6B \
   python scripts/e2e/diagnose_npu_runtime.py
 ```
 
-确认 vLLM / vLLM-Ascend 版本配套、模型可加载以及 Ray 能看到真实 `NPU`。
-若使用了 `torch_npu.contrib.transfer_to_npu`，不要仅用
+这里检查 vLLM / vLLM-Ascend 版本配套、模型文件结构、`torch.npu` 可用性及
+VERL 的 NPU 资源映射；**真正的模型加载和 Ray NPU 调度**仍需第 8 节 smoke
+或第 6 节双任务 E2E 验证。若使用了 `torch_npu.contrib.transfer_to_npu`，不要仅用
 `torch.cuda.is_available()` 判断设备类型。模型优先使用已验证的 BF16/FP16；
 量化模型先单独验证 vLLM-Ascend 加载。设备级专项测试见第 8 节。
 
