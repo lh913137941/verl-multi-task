@@ -647,14 +647,32 @@ class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunn
             for role, worker_cls in self.components["role_worker_mapping"].items()
             if role != Role.Rollout
         }
+        # Native VERL names every trainer PG "trainer_poolverl_group_...", so
+        # two independent jobs collide in one Ray namespace. Scope pool names
+        # using the same TaskRunner identity already used for rollout replicas.
+        # Preserve role-to-pool ownership and resource counts unchanged.
+        if not self.task_session:
+            raise RuntimeError("Trainer resource pools require task_session")
+        resource_pool_manager = create_resource_pool_manager(
+            config, roles=list(trainer_role_mapping.keys())
+        )
+        pool_names = {
+            name: f"{name}_mt_{self.task_session}_"
+            for name in resource_pool_manager.resource_pool_spec
+        }
+        resource_pool_manager.resource_pool_spec = {
+            pool_names[name]: spec
+            for name, spec in resource_pool_manager.resource_pool_spec.items()
+        }
+        resource_pool_manager.mapping = {
+            role: pool_names[name]
+            for role, name in resource_pool_manager.mapping.items()
+        }
         trainer = MultiTaskFullyAsyncTrainer.remote(
             config=config,
             tokenizer=self.components["tokenizer"],
             role_worker_mapping=trainer_role_mapping,
-            resource_pool_manager=create_resource_pool_manager(
-                config,
-                roles=list(trainer_role_mapping.keys()),
-            ),
+            resource_pool_manager=resource_pool_manager,
             ray_worker_group_cls=self.components["ray_worker_group_cls"],
             device_name=config.trainer.device,
             task_session=self.task_session,
