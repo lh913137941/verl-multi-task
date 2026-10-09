@@ -58,5 +58,7 @@ DP=1、PP=1、non-PD vLLM；当前真实 GPU 验收仅覆盖 TP=1，因此 TP>1 
 Actor 类型、GPU UUID、sleep 前后显存和日志。若没有实际触发中断/续推或 current-Vpub
 重装，只记录已实际覆盖的能力。
 
-当前分支没有可用的 GitHub Actions 运行结果；README 不声明未执行的 native/GPU
-测试通过。安装说明、状态 owner 与能力边界见 [README](../../README.md)。
+GitHub Actions 只自动执行 [CPU Unit](../../tests/unit/README.md)；真实 Ray、VERL、
+CUDA/NPU 验收需要在对应环境单独运行，不能将单测通过视作硬件验收通过。
+完整测试目录与环境要求见 [tests/README.md](../../tests/README.md)，
+安装说明、状态 Owner 与能力边界见 [项目 README](../../README.md)。
