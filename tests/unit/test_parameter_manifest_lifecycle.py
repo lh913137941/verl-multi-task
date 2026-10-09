@@ -19,6 +19,11 @@ def worker(monkeypatch):
             yield value
 
     modules = {
+        # This test intentionally imports the real CE module with CPU-only
+        # substitutes. The MultiTask-scoped ServerAdapter is not instantiated
+        # in the manifest case, so lightweight import stubs are sufficient.
+        "ray": {"get_actor": lambda name: None},
+        "verl.workers.rollout.vllm_rollout.vllm_rollout": {"ServerAdapter": object},
         "torch": {"Tensor": object},
         "verl.checkpoint_engine.base": {"CheckpointEngineWorker": object},
         "verl.single_controller.base.decorator": {
