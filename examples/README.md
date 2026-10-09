@@ -22,6 +22,6 @@ python scripts/e2e/verify_two_verl_jobs.py \
 
 ## 原生 Fully Async
 
-在已有可运行的 VERL 环境里，通过 `experimental_fully_async/native_entry_overrides.txt` 追加 MultiTask 专有参数；训练模型/数据/资源参数继续使用自己的原生命令。详见 [原生入口说明](experimental_fully_async/README.md)。
+在已有可运行的 VERL 环境里，按 [原生入口说明](experimental_fully_async/README.md) 在原有命令中追加必要 Hydra overrides；训练模型/数据/资源参数继续使用自己的原生命令。
 
 请勿将原生接入的 overrides 与双任务 E2E 的完整 native_args 混为一个配置文件。
