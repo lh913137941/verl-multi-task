@@ -410,7 +410,7 @@ def main() -> int:
     print(
         "Run the vanilla backend smoke first: "
         "python -m pytest -q -s -m npu_backend_smoke "
-        "tests/integration/test_native_sleep_npu.py"
+        "tests/integration/npu/test_native_sleep_npu.py"
     )
     return 0
 
