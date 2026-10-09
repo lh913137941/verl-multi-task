@@ -66,7 +66,19 @@ def main() -> int:
 
         result["last_stage"] = "ray_init"
         if not ray.is_initialized():
-            ray.init(num_cpus=3, ignore_reinit_error=True, log_to_driver=True)
+            address = os.environ.get("RAY_ADDRESS")
+            kwargs = {"ignore_reinit_error": True, "log_to_driver": True}
+            if address:
+                # Join the parent E2E's existing Ray cluster without trying to
+                # replace its CPU resources or creating another local cluster.
+                kwargs["address"] = address
+                if os.environ.get("PYTHONPATH"):
+                    kwargs["runtime_env"] = {
+                        "env_vars": {"PYTHONPATH": os.environ["PYTHONPATH"]}
+                    }
+            else:
+                kwargs.update(address="local", num_cpus=3)
+            ray.init(**kwargs)
             started_ray = True
 
         session = f"queue-e2e-{uuid.uuid4().hex[:8]}"
