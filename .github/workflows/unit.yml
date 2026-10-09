@@ -18,10 +18,16 @@ jobs:
           python-version: "3.11"
       - name: Install unit-test dependencies
         run: python -m pip install -e '.[test]'
-      - name: Compile opt-in integration entrypoints
+      - name: Compile opt-in integration entrypoints (without device imports)
         run: |
-          python -m py_compile tests/integration/npu/test_native_sleep_npu.py
-          python -m py_compile scripts/e2e/diagnose_npu_runtime.py
+          python -m py_compile \
+            tests/integration/ray/test_group_scheduler.py \
+            tests/integration/verl/test_native_adapters.py \
+            tests/integration/cuda/conftest.py \
+            tests/integration/cuda/test_baseline_environment.py \
+            tests/integration/cuda/test_native_sleep_gpu.py \
+            tests/integration/npu/test_native_sleep_npu.py \
+            scripts/e2e/diagnose_npu_runtime.py
 
       - name: Run unit suite
         run: python -m pytest -q tests/unit
