@@ -52,6 +52,9 @@ class MultiTaskvLLMReplica(vLLMReplica):
             rollout_config=self.config,
             model_config=self.model_config,
             replica_rank=self.replica_rank,
+            # Native/borrowed vLLM servers include this scoped suffix in
+            # their named Ray actor IDs. Their CE adapter must use the same ID.
+            server_name_suffix=self.name_suffix,
         )
 
     @staticmethod
