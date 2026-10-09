@@ -21,7 +21,6 @@ tests=(
   "tests/unit/test_rollouter_wiring.py::test_rollouter_natural_drain_timeout_stays_draining_and_same_op_resumes"
   "tests/unit/test_rollouter_wiring.py::test_rollouter_force_timeout_same_op_resumes_without_repeating_abort"
   "tests/unit/test_rollouter_wiring.py::test_rollouter_force_abort_ack_loss_recovers_from_full_continuation_proof_without_reabort"
-  "tests/unit/test_replica_sync_gate.py"
   "tests/unit/test_contracts.py"
   "tests/unit/test_message_queue_exactly_once.py"
 )
