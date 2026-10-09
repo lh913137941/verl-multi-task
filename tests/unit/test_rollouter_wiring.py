@@ -1554,6 +1554,11 @@ def test_rollouter_retracts_idle_candidates_on_resume(lost_retraction_ack):
 
 # --- test_reward_loop_isolation.py (consolidated boundary scenarios) ---
 
+_REWARD_LOOP_SOURCE = (
+    Path(__file__).resolve().parents[2]
+    / "src/multi_task_scheduler/integration/verl/experimental_fully_async/rollouter.py"
+)
+
 def _isolated_reward_manager():
     registry = []
 
