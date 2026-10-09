@@ -3,12 +3,10 @@ import asyncio
 import hashlib
 import threading
 import time
-from pathlib import Path
 
 import pytest
 
 from multi_task_scheduler.orchestration.contracts import (
-    CONTROL_RPC_TIMEOUT_S,
     EvidenceType,
     AttemptState,
     FIRST_RELEASE_MAX_COLOCATE_COUNT,
@@ -23,9 +21,7 @@ from multi_task_scheduler.orchestration.contracts import (
     ReplicaKind,
     ReplicaState,
     native_replica_key,
-    require_operation_evidence,
 )
-from multi_task_scheduler.orchestration.operation_journal import OperationJournal
 from multi_task_scheduler.orchestration.replica_sync_gate import GateKind, ReplicaSyncGate
 
 from _wiring_support import (
@@ -35,7 +31,6 @@ from _wiring_support import (
     RemoteMethod,
     AsyncRemoteMethod,
     FakeRay,
-    _test_require_evidence,
     taskrunner_class,
     trainer_class,
     load_balancer_class,
@@ -50,6 +45,7 @@ from _wiring_support import (
     _borrowed_test_claim,
     rollouter_class,
 )
+
 
 def test_admitted_request_blocks_removal_until_verified_continuation():
     key = ReplicaKey("task-a", "r0")
