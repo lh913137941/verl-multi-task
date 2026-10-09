@@ -542,8 +542,10 @@ Ray 地址和 job namespace；等待两个新的 task_session 附着到同一个
 这个自动 Lease 是 **E2E 编排产生的真实资源快照**，不是业务侧需要维护的配置项；
 生产调度中仍由 GS 根据 idle report、容量、安全边界及资源归属选择 donor/borrower，
 使用内部 `open_lease` 记账，不能仅凭自动发现便视为资源已获借出许可。
-为避免两个真实任务在同一 Ray namespace 内产生相同 native rollout PG/CE/server 名，
-MultiTask 对原生 Replica 的资源名称增加 task_session 作用域。
+为避免两个真实任务在同一 Ray namespace 内发生资源名称冲突，
+MultiTask 使用 TaskRunner 的 `task_session` 同时隔离原生 Rollout PG/CE/server
+及 Trainer ResourcePool/Placement Group 的名称；Trainer 的角色映射与资源数量不变。
+不应通过清理其他任务的同名 PG 处理冲突。
 
 随后复用现有 `run_all.sh` 验证 control_plane、exactly_once、recovery、lifecycle 和 force。
 可用 `--scenarios "lifecycle force"` 缩小范围；`--keep-running` 可保留两个 driver。
