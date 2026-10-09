@@ -11,6 +11,7 @@ from verl.experimental.fully_async_policy.fully_async_rollouter import (
     FullyAsyncAgentLoopManager,
     FullyAsyncRollouter,
 )
+from verl.experimental.reward_loop import RewardLoopManager
 from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
 
 from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
@@ -161,6 +162,38 @@ class _MultiTaskFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         )
 
 
+class _TaskScopedRewardLoopManager(RewardLoopManager):
+    """Retain native reward calculation, but scope its named Ray workers to a task."""
+
+    def __init__(self, *args, task_session: str, **kwargs):
+        if not isinstance(task_session, str) or not task_session:
+            raise ValueError("RewardLoop workers require task_session")
+        self._task_session = task_session
+        super().__init__(*args, **kwargs)
+
+    def _init_reward_loop_workers(self):
+        # Native VERL hardcodes reward_loop_worker_{i}. This task-local override
+        # changes ONLY the name while preserving native node affinity and
+        # RewardLoopWorker constructor/compute_score_batch behavior.
+        self.reward_loop_workers = []
+        node_ids = [
+            node["NodeID"]
+            for node in ray.nodes()
+            if node["Alive"] and node["Resources"].get("CPU", 0) > 0
+        ]
+        for i in range(self.config.reward.num_workers):
+            node_id = node_ids[i % len(node_ids)]
+            self.reward_loop_workers.append(
+                self.reward_loop_workers_class.options(
+                    name=f"reward_loop_worker_{i}_mt_{self._task_session}",
+                    scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                        node_id=node_id,
+                        soft=True,
+                    ),
+                ).remote(self.config, self.reward_router_address)
+            )
+
+
 @ray.remote(num_cpus=10, max_concurrency=100)
 class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter)):
     def __init__(
@@ -215,6 +248,20 @@ class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter
                     raise
                 await asyncio.sleep(delay)
                 delay *= 2
+
+    async def _create_reward_loop_manager(self):
+        """Use native reward functionality with a task-scoped worker namespace."""
+        if not self.task_session:
+            raise RuntimeError("RewardLoop manager requires task_session")
+        loop = asyncio.get_running_loop()
+        self.reward_loop_manager = await loop.run_in_executor(
+            None,
+            lambda: _TaskScopedRewardLoopManager(
+                config=self.config,
+                rm_resource_pool=None,
+                task_session=self.task_session,
+            ),
+        )
 
     async def _init_async_rollout_manager(self):
         enable_agent_reward_loop = (
