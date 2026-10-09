@@ -14,7 +14,7 @@ verl_expansion 的旧 D2/D3/D4 controller、rank/dict receipt、Ascend/HCCL fixt
 | 脚本 | 证据层级 | 主要验证 |
 | --- | --- | --- |
 | `validate_lifecycle_cycle.sh` | 真实 VERL/Ray/GPU runtime | `DONATE -> ADD -> REMOVE -> RESTORE`；每步必须取得设计规定的终态 evidence，并验证 exact-command replay 幂等 |
-| `validate_force_remove.sh` | 真实 VERL/Ray/vLLM runtime | `DONATE -> ADD -> FORCE REMOVE -> RESTORE`；要求 partial rollout 与另一个 active server。可选要求真实在途 continuation proof |
+| `validate_force_remove.sh` | 真实 VERL/Ray/vLLM runtime | `DONATE -> ADD -> FORCE REMOVE -> RESTORE`；严格在途 continuation proof 由主启动器的 `--require-inflight-force` 校验 |
 | `validate_control_plane.sh` | 真实 Ray Actor/RPC，CPU 即可 | GS fail-closed、过期 Lease、claim 冲突、stale idle report、RELEASED evidence 幂等、GS->TR ACK 丢失后 staging 保留与 same-op replay |
 | `validate_exactly_once.sh` | 真实 Ray MessageQueue Actor | 同 logical sample + 同 payload 只提交一次；同 ID 不同 digest 拒绝；队列 overflow 保留 dropped_oldest evidence |
 | `validate_recovery_faults.sh` | 确定性 fault-injection | advance_lease ACK loss、UNKNOWN replay、G BLOCKED reconcile、RESTORE rollback/quarantine、natural drain timeout same-op resume、FORCE partial handoff/abort ACK loss |
@@ -32,138 +32,66 @@ abort reply 丢失等故障需要命中非常精确的 owner-commit 边界；在
 
 日志默认写到 `logs/multitask_e2e/`。
 
-## 集群一行验收
+## 推荐入口：两个真实 VERL 任务
 
-实际集群上不需要逐个调用上面的脚本。推荐直接使用总入口。
-
-启动一个测试训练并做完整验收：
-
-```bash
-bash scripts/e2e/verify_cluster.sh --launcher /path/to/multitask_test_launcher.sh --lease /tmp/lease.json
-```
-
-如果 donor / borrower 两个测试 job 已经在同一 Ray 集群里运行，先列出已注册 TaskRunner：
+仓库统一入口为 `scripts/e2e/verify_two_verl_jobs.py`。它通过原生 VERL Fully Async 入口
+启动 donor/borrower，连接同一个 Ray / GroupScheduler，从真实 donor CE 与 Placement Group
+发现物理资源，自动生成 Lease，然后由 `run_all.sh` 调用下方五个 `validate_*` 执行验收。
 
 ```bash
-python scripts/e2e/list_tasks.py
+python scripts/e2e/verify_two_verl_jobs.py \
+  --repo . \
+  --ray-address auto \
+  --start-local-ray \
+  --native-args examples/e2e/native_args.txt \
+  --scenarios "lifecycle force"
 ```
 
-然后指定两个不同的 task_session：
+`native_args.txt` 必须提前配置**真实的模型和数据路径**；仓库样例中的模型路径默认是占位符。
+已有持久 Ray 集群时，指定实际 `--ray-address` 并移除 `--start-local-ray`。
+启动器在必要时安全备份/修补当前实际导入的 VERL 入口，不使用另一套训练主循环。
+
+`--scenarios` 可设为 `"control_plane exactly_once recovery lifecycle force"`，也可以只选择失败场景。
+每次结果位于 `logs/two_real_jobs/<时间>/orchestration_summary.json`；
+场景明细位于 `scenarios/<场景>/<运行ID>/result.json`。
+退出码：0=PASS、1=FAIL、2=BLOCKED；没有真实完成证据绝不能算 PASS。
+
+## 验收脚本为何保留
+
+`run_all.sh` 的五条场景分别由以下脚本完成，**并非废弃入口**：
+
+- `validate_control_plane.sh`：真实 Ray 控制面检查，调用 `control_plane_recovery.py`
+- `validate_exactly_once.sh`：真实 Ray MessageQueue，调用 `exactly_once_driver.py`
+- `validate_recovery_faults.sh`：通过明确列出的 pytest 故障注入用例验证恢复合同
+- `validate_lifecycle_cycle.sh`：实际 DONATE → ADD → REMOVE → RESTORE，调用 `lifecycle_driver.py`
+- `validate_force_remove.sh`：实际 DONATE → ADD → FORCE REMOVE → RESTORE，同样复用 `lifecycle_driver.py`
+
+前 3 项可以独立运行，无需启动双任务，但控制面与队列检查仍需相应 Ray/VERL 环境：
 
 ```bash
-bash scripts/e2e/verify_cluster.sh --attach --lease /tmp/lease.json \
-  --donor-session <donor-task-session> \
-  --borrower-session <borrower-task-session>
-```
-
-只想先验证不依赖真实生命周期拓扑的控制面/异常恢复/Exactly-once：
-
-```bash
-bash scripts/e2e/verify_cluster.sh --quick --lease /tmp/lease.json --attach
-```
-
-完整模式默认运行：
-
-```text
-control_plane -> exactly_once -> recovery -> lifecycle -> force
-```
-
-最终只需要看命令退出码和脚本打印的 `summary.json` 路径：
-
-- `0` = 全部要求通过；
-- `1` = 至少一个能力验证失败；
-- `2` = 环境/拓扑不足，存在 BLOCKED，不能宣称完整验收通过。
-
-若希望阶段性执行时允许 BLOCKED，但仍保留结果记录，可加 `--allow-blocked`。
-
-## 先跑不需要 GPU 的恢复合同
-
-```bash
-bash scripts/e2e/validate_recovery_faults.sh
 bash scripts/e2e/validate_control_plane.sh
-```
-
-`validate_control_plane.sh` 需要 Ray，但不需要完整 VERL/vLLM/GPU。它创建临时 GS 与真实 Ray
-TaskRunner substitute，专门验证 GS 账本和 RPC 不确定性；临时 Actor 在场景结束后销毁。
-
-Exactly-once 需要能导入当前 VERL 和 Ray：
-
-```bash
 bash scripts/e2e/validate_exactly_once.sh
+bash scripts/e2e/validate_recovery_faults.sh
 ```
 
-## 真实生命周期 E2E
+生命周期验证只走**附着到当前真实双任务**的路径，由双任务启动器设置
+`MT_E2E_ATTACH_ONLY=1`、`MT_E2E_LEASE_FILE`、
+`MT_E2E_DONOR_SESSION`、`MT_E2E_BORROWER_SESSION`、`RAY_ADDRESS`。
+不要拿示例 Lease 的虚拟 `pg_id` / `gpu_uuid` 当真实卡归属。
 
-真实生命周期需要一份物理 Lease fixture。复制：
+## 严格 FORCE 与回执
 
-```bash
-cp examples/e2e/lease.example.json /tmp/lease.json
-```
+普通 `force: PASS` 只证明对应 FORCE 生命周期操作闭环；要进一步要求
+**至少一次真实在途请求中断和 continuation handoff**，在主命令中增加
+`--require-inflight-force`。严格校验由 `verify_two_verl_jobs.py` 完成，
+从同一次运行的 `force_cycle/result.json` 取得精确 `operation_id`，
+再匹配 `borrower.log` 中的 `MULTITASK_FORCE_HANDOFF` 回执。
+不再有另一份 launcher-mode 的重复校验实现。
 
-然后把 `pg_id`、`node_id`、`gpu_uuid`、`bundle_index` 和 donor rank 改成真实环境值。这里的 `pg_id` 是 Ray placement group 的十六进制 ID（`pg.id.hex()`），不是 placement group name。
-`donor_task_id` 可以保留 `__TASK_SESSION__`，driver 会替换为本次附着的 TaskRunner session。
-当前融合分支的 borrowed runtime 明确限制 `TP=DP=PP=1` 且 `len(claims)=1`，因此真实生命周期 fixture 只能选择**单 GPU donor replica**；不能拿多 GPU donor 的其中一张卡冒充完整 donor。后续若放开多 TP，需要先扩展生产实现和设计合同，再扩展本 fixture。
-
-### 方式 A：脚本启动一个有限时长的测试训练
-
-```bash
-export MULTITASK_LAUNCH_SCRIPT=/path/to/your/multitask_test_launcher.sh
-export MT_E2E_LEASE_FILE=/tmp/lease.json
-
-bash scripts/e2e/validate_lifecycle_cycle.sh \
-  <传给 launcher 的 Hydra overrides>
-```
-
-launcher 应启动足够长、但最终会正常退出的测试训练。driver 会等待 TaskRunner 注册到命名 GS 后，
-通过正式的 `open_lease -> submit_operation -> query_operation` 链路执行生命周期。
-
-### 方式 B：附着到已经运行的测试 job
-
-```bash
-export MT_E2E_ATTACH_ONLY=1
-export RAY_ADDRESS=auto
-export MT_E2E_LEASE_FILE=/tmp/lease.json
-
-bash scripts/e2e/validate_lifecycle_cycle.sh
-```
-
-如果同一 GS 下同时挂了多个 TaskRunner，需要额外设置：
-
-```bash
-export MT_E2E_TASK_SESSION=<目标 task_session>
-```
-
-## FORCE REMOVE
-
-```bash
-export MT_E2E_LEASE_FILE=/tmp/lease.json
-bash scripts/e2e/validate_force_remove.sh <launcher overrides>
-```
-
-该场景要求配置 `async_training.partial_rollout=true`，并且 FORCE 目标之外至少还有一个 active
-rollout server。否则返回 BLOCKED，而不是把 preflight rejection 算成功。
-
-默认 FORCE 场景证明真实 `abort_all_requests()` 路径能够完成并闭环。
-如果要进一步要求本次测试**真的命中至少一个 ADMITTED request 并完成 continuation handoff**：
-
-```bash
-export MT_E2E_REQUIRE_INFLIGHT_FORCE=1
-bash scripts/e2e/validate_force_remove.sh <持续产生 rollout request 的测试配置>
-```
-
-Rollouter 会输出一个结构化 receipt：
-
-```text
-MULTITASK_FORCE_HANDOFF {"operation_id": "...", "admitted_count": 1,
- "abort_ack_known": true, "aborted_count": 1, "confirmed_count": 1}
-```
-
-当 `MT_E2E_REQUIRE_INFLIGHT_FORCE=1` 时，校验器从本次 `result.json` 取得 FORCE REMOVE
-的 `operation_id`，只检查同一操作的 receipt。每条 receipt 独立核验计数，不能拼接不同操作的日志。
-已收到 abort ACK 时，必须有 `aborted_count > 0`，且
-`aborted_count <= confirmed_count <= admitted_count`；如果 abort ACK 丢失，则必须
-`aborted_count=null`，且本次全部 ADMITTED requests 都有 continuation proof。
-没有命中本次操作，或没有真实在途续推时返回 BLOCKED；计数矛盾或证明不完整返回 FAIL。
+正常 abort ACK 要求 `aborted_count > 0`，且
+`aborted_count <= confirmed_count <= admitted_count`；若 abort ACK 丢失，
+要求全部边界 ADMITTED 请求均有 continuation proof。
+无正向在途证明返回 BLOCKED；计数矛盾返回 FAIL。
 
 ## 可选参数清单审计
 
@@ -182,28 +110,8 @@ CUDA 仍使用原生 NCCL，未增加 NCCL 源端审计。
 
 ## 综合验收
 
-```bash
-export MT_E2E_LEASE_FILE=/tmp/lease.json
-export MULTITASK_LAUNCH_SCRIPT=/path/to/test_launcher.sh
-export MT_E2E_REQUIRE_COMPLETE=1
-bash scripts/e2e/run_all.sh <launcher overrides>
-```
-
-默认场景为：
-
-```text
-control_plane exactly_once recovery lifecycle force
-```
-
-可缩小范围：
-
-```bash
-MT_E2E_SCENARIOS="control_plane recovery" \
-MT_E2E_REQUIRE_COMPLETE=0 \
-bash scripts/e2e/run_all.sh
-```
-
-`run_all.sh` 会继续执行后续场景，并在最终 `summary.json` 中区分 PASS、FAIL 和 BLOCKED。
+统一从 `verify_two_verl_jobs.py` 选择场景，主脚本自动调用 `run_all.sh` 汇总。
+`run_all.sh` 不负责启动训练、不创建物理 Lease；请勿将它当独立的集群启动入口。
 
 ## 与设计文档关键合同的对应
 
