@@ -547,6 +547,10 @@ MultiTask 使用 TaskRunner 的 `task_session` 同时隔离原生 Rollout PG/CE/
 Trainer ResourcePool/Placement Group 和 RewardLoop Worker 的名称；Trainer 的角色映射、
 资源数量以及 RewardLoop 原生奖励计算与节点亲和调度保持不变。
 不应通过删除其他任务的同名 Actor/PG 来处理冲突。
+若生命周期操作临时移走了最后一个可分配的 Rollout Server，
+MultiTask Client 只在 LB 确认属于 DONATE/REMOVE 等生命周期交接时短时等待
+ADD/RESTORE 重新发布服务；等待有上限，超时仍失败。初始化时本就没有
+Server 或无交接证明时继续立即报错，不以无限重试掩盖资源/配置问题。
 
 随后复用现有 `run_all.sh` 验证 control_plane、exactly_once、recovery、lifecycle 和 force。
 可用 `--scenarios "lifecycle force"` 缩小范围；`--keep-running` 可保留两个 driver。
