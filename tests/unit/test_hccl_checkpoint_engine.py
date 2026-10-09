@@ -235,7 +235,7 @@ def test_real_restore_acceptance_loads_opt_in_backend_on_both_sides():
     """Guard against the integration test silently selecting native nccl."""
     source = (
         Path(__file__).resolve().parents[2]
-        / "tests/integration/test_native_sleep_npu.py"
+        / "tests/integration/npu/test_native_sleep_npu.py"
     )
     tree = ast.parse(source.read_text(encoding="utf-8"))
     restore = next(
