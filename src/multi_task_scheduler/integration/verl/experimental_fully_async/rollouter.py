@@ -151,7 +151,42 @@ class _MultiTaskFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
             if self._release_fences.get(request_id) is release_ref:
                 self._release_fences.pop(request_id, None)
 
-        server_id, server = await super()._acquire_server(request_id, **extra)
+        # Native FullyAsyncLLMServerClient retries empty routing only when
+        # initialized in only-hybrid mode. MultiTask may instead temporarily
+        # remove the LAST standalone server during DONATE/REMOVE, then restore
+        # it via ADD/RESTORE. Do not let a valid no-service handoff kill the
+        # streaming generation worker; retry only with LB-confirmed evidence.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(
+            300.0,
+            float(getattr(getattr(self.config, "multitask", None),
+                          "drain_timeout_s", 300.0)),
+        )
+        waiting = False
+        while True:
+            try:
+                server_id, server = await super()._acquire_server(request_id, **extra)
+                break
+            except RuntimeError as exc:
+                if "No available servers in load balancer" not in str(exc):
+                    raise
+                if not await self._load_balancer.is_service_restore_pending.remote():
+                    # Empty at initial boot or due to unrelated failure: fail
+                    # fast, do not mask incorrect routing setup.
+                    raise
+                if not waiting:
+                    print(
+                        "[MultiTaskRollouter] no active rollout server during "
+                        "lifecycle handoff; waiting for ADD/RESTORE",
+                        flush=True,
+                    )
+                    waiting = True
+                if loop.time() >= deadline:
+                    raise TimeoutError(
+                        "No rollout server restored before lifecycle wait deadline; "
+                        "check DONATE/REMOVE/ADD/RESTORE operation evidence"
+                    ) from exc
+                await asyncio.sleep(0.5)
         if not self._continuation_enabled:
             return server_id, server
         return server_id, _ContinuationAwareServer(
