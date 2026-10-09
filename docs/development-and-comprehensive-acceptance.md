@@ -119,6 +119,68 @@ MessageQueue 约束完整样本恰好一次提交；重复提交的幂等性、�
 | `rollout/replica.py` | `replica_kind`、`runtime_epoch`、`placement_claims`、`borrowed_worker_names`、`borrowed_server_names`、`workers`、`servers`、`borrowed_cleanup_verified` | `validate_placement(spec)`、`build_borrowed_worker_plan(spec)`、`worker_placements()`、`validate_worker_placement()`、`validate_server_runtime()`、`init_from_lease(...)`、`cleanup_borrowed_runtime()`、`sleep()`、`wake_up(tags)` | 继承原生 `vLLMReplica`；复用 Ray WorkerGroup/PG、vLLM Worker 与原生 Runtime 创建机制 |
 | `rollout/http_server.py` | `engine`、`_submission_paused`、`_multitask_sleep_stage_value`、`_server_port` | `runtime_health() -> dict`、`shutdown_runtime() -> dict`、`sleep() -> dict`、`wake_up(tags) -> dict`；`_wait_admission_barrier()`、`_validate_multitask_engine_capabilities()` | 继承 `vLLMHttpServer`；复用 vLLM EngineCore、真实模型生成和 sleep/wake 原语，不以模拟回执替代设备状态 |
 
+#### 核心示例：`MultiTaskvLLMReplica(vLLMReplica)` 字段与复用明细
+
+Native 和 Borrowed **复用同一个扩展类**：Native 延续原生初始化路径；Borrowed 走 `init_from_lease()`，在 Lease 指定的已有 PG/bundle 上创建**独立** CE Worker 和 vLLM Server/Engine。Borrowed 不复用 donor 的 CE Worker，也不创建归 borrower 所有的新 PG。当前代码明确限定 **TP=1、单 claim、单 server**；以下不把多卡拓扑或旧版扩展提案当成已实现。
+
+**字段（区分继承与新增）：**
+
+```python
+# 继承 vLLMReplica（Native 沿用，Borrowed 创建路径赋值/复用）
+replica_rank                # [继承] 本任务内 Replica rank
+config, model_config        # [继承] Rollout 与模型配置
+world_size, nnodes          # [继承] 当前 Borrowed 校验 world_size=1、nnodes=1
+gpus_per_replica_node       # [继承] 每节点 Replica 设备数
+workers, servers            # [继承] 新建 Borrowed CE Workers / vLLM Servers 的句柄
+resource_pool, bundle_indices # [继承] Native 资源配置；Borrowed 不拥有 donor PG
+rollout_mode                # [继承] Borrowed 按 STANDALONE 路径运行
+_server_address, _server_handle # [继承] 主 HTTP endpoint 与句柄
+name_suffix                 # [继承] 为任务/租约命名隔离提供后缀
+
+# 当前 MultiTaskvLLMReplica 明确增加或重赋值
+replica_kind: ReplicaKind   # [新增] NATIVE/BORROWED，而非 allocation_kind 字符串
+placement_claims           # [新增] Borrowed 的归一化逐卡 claims
+runtime_epoch              # [新增] Runtime 身份代次
+server_class               # [重赋值] ray.remote(MultiTaskvLLMHttpServer)
+borrowed_worker_names      # [运行期新增] 创建的 Borrowed CE Actor 名称
+borrowed_server_names      # [运行期新增] 创建的 Borrowed Server Actor 名称
+borrowed_cleanup_verified  # [运行期新增] 清理核验事实，不能代替 RELEASED evidence
+```
+
+**资源规格与 Worker 实测结构：** `validate_placement(spec)` 使用 `spec["lease_id"]`、`spec["placement_epoch"]`、`spec["replica_rank"]`、`spec["claims"]`、`spec["expires_at"]` 等数据；目前单个 claim 的 `rank/node_rank/local_rank` 均要求为 0。`build_borrowed_worker_plan()` 返回的核心项为：
+
+```python
+{
+    "rank": 0,
+    "claim_id": "...",
+    "actor_name": "...",
+    "pg_id": "...",
+    "bundle_index": 0,
+    "node_id": "...",
+    "gpu_uuid": "...",     # 字段沿用原名，NPU 实际为 NPU:node_id:accelerator_id
+    "num_gpus": 0.5,       # Ray 分配份额，不代表物理半张卡
+    "num_cpus": 1.0,
+    "env_vars": {"WORLD_SIZE": "1", "RANK": "0",
+                 "RAY_LOCAL_WORLD_SIZE": "1",
+                 "WG_PREFIX": "...", "WG_BACKEND": "ray"}
+}
+```
+
+`worker_placements()` 从**实际 CE Actor** 中获取 `node_id`、`pg_id`、`gpu_uuid`、`resource_name`、`accelerator_id`；`validate_worker_placement()` 对照 claims 检查 node 和设备身份。CUDA 的数字设备 ID 进一步通过 `nvidia-smi` 对照 UUID；NPU 使用 `NPU:node_id:accelerator_id` 身份。
+
+**主要方法与原生复用：**
+
+| 方法 | 作用与结果 | 复用点 |
+| --- | --- | --- |
+| `get_ray_class_with_init_args() -> RayClassWithInitArgs` | 替换为带服务命名隔离的 `MultiTaskCheckpointEngineWorker` | 原生 `RayClassWithInitArgs` 与 CE Worker 参数 |
+| `validate_placement(spec) -> None`、`build_borrowed_worker_plan(spec) -> dict` | 验证 Lease/Replica/TP=1 约束并生成 CE Actor 的确定性放置方案 | Ray PG/bundle、Lease claims |
+| `_create_workers_from_claims(...)`、`validate_worker_placement() -> tuple[dict, ...]` | 在指定原 PG/bundle 上创建独立 CE Workers，并实测节点与设备 | `RayWorkerGroup.from_detached()`、`PlacementGroupSchedulingStrategy` |
+| `init_from_lease(...)`、`validate_server_runtime() -> dict` | 初始化 Borrowed Server/Engine 并确认实际 HTTP/Engine 状态 | 原生 `vLLMReplica` Server 创建、`MultiTaskvLLMHttpServer` |
+| `cleanup_borrowed_runtime() -> None` | 清理 Borrowed Server/Worker，检查 Ray Actor 进入 DEAD；证据不足则报错 | `ray.kill`、Ray State API |
+| `sleep()`、`wake_up(tags)` | Native 生命周期的真实运行时休眠与恢复 | vLLM 原生 sleep/wake 原语 |
+
+**实现与旧设计字段的区别：** 当前类没有逐项定义示例中的 `allocation_kind`、`lease_id`、`source_lease_ids`、`donor_task_ids`、`runtime_state`、`owns_resource_pool`、`claims`、`serving_version`、`operation_id`、`node_layout`、`expected_device_map`、`actual_device_map`、`cleanup_result`、`creation_stage` 等成员。租约细节保留在 Lease/spec/Manager 的 Owner 视图，参数版本由 CE/Trainer 管理；不可为了与旧示例形式一致而把这些字段误标为已实现。
+
 ### 1.8.4 LB、Checkpoint Engine 与后端
 
 | 组件 | 核心字段 / 状态 | 关键方法 | 复用点 |
