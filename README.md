@@ -39,12 +39,8 @@ python scripts/e2e/verify_two_verl_jobs.py \
 | `lifecycle` | DONATE → ADD → REMOVE → RESTORE |
 | `force` | DONATE → ADD → FORCE REMOVE → RESTORE |
 
-例如，只复测控制面和样本提交：
-
-```bash
-# 加在第 1 节命令末尾
---scenarios "control_plane exactly_once"
-```
+例如，只复测控制面和样本提交，在第 1 节命令最后加上
+`--scenarios "control_plane exactly_once"`。
 
 如果要严格验证 **真实在途请求被中断并成功续推**，还需在包含 `force` 的命令中增加 `--require-inflight-force`。普通的 `force: PASS` 不代表一定命中了在途请求。
 
