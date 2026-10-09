@@ -327,6 +327,67 @@ def connect_ray(ray, *, address, namespace, start_local=False, pythonpath=None):
     return resolved, True
 
 
+def validate_inflight_force_proof(force_result: dict, borrower_log: str) -> tuple[int, dict | None]:
+    """Validate one actual FORCE operation from this run.
+
+    Return (exit_status, positive_receipt): PASS=0, FAIL=1, BLOCKED=2.
+    All receipts for the matching operation must be internally consistent.
+    Missing actual in-flight interruption is BLOCKED, never a synthetic PASS.
+    """
+    if force_result.get("state") != "PASSED" or force_result.get("scenario") != "force_cycle":
+        return 1, None
+    commands = [
+        step.get("command", {})
+        for step in force_result.get("events", [])
+        if step.get("command", {}).get("kind") == "REMOVE"
+        and step["command"].get("force") is True
+    ]
+    if len(commands) != 1:
+        return 1, None
+    operation_id = commands[0].get("operation_id")
+    if not isinstance(operation_id, str) or not operation_id:
+        return 1, None
+
+    records = []
+    for line in borrower_log.splitlines():
+        match = re.search(r"MULTITASK_FORCE_HANDOFF\s+(\{.*\})", line)
+        if not match:
+            continue
+        try:
+            receipt = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            return 1, None
+        if not isinstance(receipt, dict):
+            return 1, None
+        if receipt.get("operation_id") == operation_id:
+            records.append(receipt)
+    if not records:
+        return 2, None
+
+    proven = []
+    for item in records:
+        admitted, confirmed = item.get("admitted_count"), item.get("confirmed_count")
+        aborted, known = item.get("aborted_count"), item.get("abort_ack_known")
+        if (
+            type(admitted) is not int or type(confirmed) is not int
+            or type(known) is not bool or not 0 <= confirmed <= admitted
+        ):
+            return 1, None
+        if known:
+            if type(aborted) is not int or not 0 <= aborted <= confirmed:
+                return 1, None
+            if aborted > 0:
+                proven.append(item)
+        else:
+            if aborted is not None or confirmed != admitted:
+                return 1, None
+            if admitted > 0:
+                proven.append(item)
+    if not proven:
+        return 2, None
+    return 0, proven[-1]
+
+
 def main():
     a = arguments()
     repo = a.repo.resolve()
@@ -614,49 +675,17 @@ def main():
             if not force_results:
                 raise RuntimeError("force cycle result.json is absent")
             force_result = json.loads(force_results[-1].read_text(encoding="utf-8"))
-            commands = [step["command"] for step in force_result.get("events", [])
-                        if step.get("command", {}).get("kind") == "REMOVE"
-                        and step["command"].get("force") is True]
-            if len(commands) != 1:
-                raise RuntimeError("could not uniquely identify FORCE REMOVE operation")
-            op_id = commands[0]["operation_id"]
-            pattern = re.compile(r"MULTITASK_FORCE_HANDOFF\s+(\{.*\})")
-            receipts = []
-            # Actor logs may not be forwarded into the driver log; absence is BLOCKED.
-            for ln in (logs / "borrower.log").read_text(encoding="utf-8", errors="replace").splitlines():
-                m = pattern.search(ln)
-                if m:
-                    try:
-                        item = json.loads(m.group(1))
-                    except json.JSONDecodeError:
-                        continue
-                    if item.get("operation_id") == op_id:
-                        receipts.append(item)
-            valid = []
-            for item in receipts:
-                ad, conf, ab, known = (item.get("admitted_count"), item.get("confirmed_count"),
-                                       item.get("aborted_count"), item.get("abort_ack_known"))
-                if type(ad) is not int or type(conf) is not int or type(known) is not bool or not 0 <= conf <= ad:
-                    result_code = 1
-                    break
-                if known:
-                    if type(ab) is not int or not 0 <= ab <= conf:
-                        result_code = 1
-                        break
-                    if ab > 0:
-                        valid.append(item)
-                else:
-                    if ab is not None or conf != ad:
-                        result_code = 1
-                        break
-                    if ad > 0:
-                        valid.append(item)
-            if result_code == 0 and not valid:
-                result_code = 2
-                state["detail"] = "no matching positive in-flight FORCE proof in borrower forwarded logs"
+            result_code, receipt = validate_inflight_force_proof(
+                force_result,
+                (logs / "borrower.log").read_text(encoding="utf-8", errors="replace"),
+            )
             if result_code == 0:
-                state["inflight_force_proof"] = valid[-1]
-                log(f"PASS: in-flight FORCE handoff evidence: {valid[-1]}")
+                state["inflight_force_proof"] = receipt
+                log(f"PASS: in-flight FORCE handoff evidence: {receipt}")
+            elif result_code == 2:
+                state["detail"] = "no positive in-flight FORCE proof for this operation in borrower forwarded logs"
+            else:
+                state["detail"] = "invalid or conflicting in-flight FORCE proof for this operation"
 
         if result_code == 0:
             for proc in procs:
