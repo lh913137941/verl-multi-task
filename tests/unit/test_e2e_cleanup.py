@@ -4,6 +4,7 @@ No Ray/VERL/NPU required: enforce the script call graph and fail-closed
 behavior rather than relying on tests that import the full training runtime.
 """
 
+import ast
 import os
 import re
 import subprocess
@@ -52,6 +53,23 @@ def test_all_five_validate_scripts_still_reachable_from_real_two_job_runner():
         )
     assert 'MT_E2E_SCENARIOS' in dispatch
     assert 'MT_E2E_REQUIRE_COMPLETE' in dispatch
+
+    # This scenario invokes named unit tests rather than the entire suite:
+    # moving a test must update its selector, not silently lose recovery proof.
+    recovery = (SCRIPTS / "validate_recovery_faults.sh").read_text(encoding="utf-8")
+    selectors = re.findall(
+        r'"(tests/unit/test_[^"]+\.py)::(test_\w+)"', recovery
+    )
+    assert len(selectors) == 9
+    for relative_path, test_name in selectors:
+        test_file = ROOT / relative_path
+        assert test_file.is_file(), relative_path
+        module = ast.parse(test_file.read_text(encoding="utf-8"))
+        assert any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == test_name
+            for node in module.body
+        ), f"stale recovery selector: {relative_path}::{test_name}"
 
 
 @pytest.mark.parametrize(
