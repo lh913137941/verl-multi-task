@@ -14,10 +14,8 @@ from multi_task_scheduler.orchestration.replica_sync_gate import (
     ReplicaSyncGate,
 )
 
-import pytest
 from multi_task_scheduler.orchestration.contracts import OperationCommand, OperationKind, OperationStatus, ReplicaKey
 from multi_task_scheduler.orchestration.operation_journal import OperationIdentityError, OperationJournal
-import pytest
 
 from multi_task_scheduler.orchestration.contracts import (
     AttemptState,
