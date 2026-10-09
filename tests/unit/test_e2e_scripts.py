@@ -783,6 +783,14 @@ def test_all_five_validate_scripts_still_reachable_from_real_two_job_runner():
         r'"(tests/unit/test_[^"]+\.py)::(test_\w+)"', recovery
     )
     assert len(selectors) == 9
+    # Consolidation must not make the recovery driver run the same suite twice.
+    assert recovery.count('"tests/unit/test_orchestration.py"') == 1
+    for obsolete in (
+        "test_operation_journal.py",
+        "test_replica_sync_gate.py",
+        "test_wiring.py",
+    ):
+        assert obsolete not in recovery
     for relative_path, test_name in selectors:
         test_file = _CLEANUP_ROOT / relative_path
         assert test_file.is_file(), relative_path
