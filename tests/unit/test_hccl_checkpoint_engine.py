@@ -105,6 +105,28 @@ def test_current_ascend_api_destroys_once_and_releases_buffers(backend):
     assert engine.send_buf is None and engine.recv_buf is None
 
 
+def test_current_vllm_ascend_close_is_preferred_over_raw_library_destroy(backend):
+    engine, communicator, npu, _, _ = backend
+    communicator.close = Mock()
+    engine.finalize()
+    engine.finalize()
+    communicator.close.assert_called_once_with()
+    communicator.hccl.hcclCommDestroy.assert_not_called()
+    npu.synchronize.assert_called_once()
+    assert engine.pyhccl is None
+
+
+def test_missing_destroy_method_fails_closed_without_releasing_buffers(backend):
+    engine, communicator, npu, _, _ = backend
+    communicator.hccl = object()  # no close/destroyComm or hcclCommDestroy
+    original_buffers = (engine.send_buf, engine.recv_buf)
+    with pytest.raises(RuntimeError, match="no supported HCCL destruction API"):
+        engine.finalize()
+    assert engine.pyhccl is communicator
+    assert (engine.send_buf, engine.recv_buf) == original_buffers
+    npu.empty_cache.assert_not_called()
+
+
 def test_legacy_communicator_api_remains_supported(backend):
     engine, communicator, _, _, _ = backend
     communicator.destroyComm = Mock()
