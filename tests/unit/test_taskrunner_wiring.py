@@ -1,3 +1,5 @@
+from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
+
 """TASKRUNNER wiring regression scenarios; shared test fakes live in _wiring_support."""
 import ast
 from pathlib import Path
@@ -1181,3 +1183,17 @@ def test_missing_session_fails_before_resource_pool_or_trainer_creation():
     with pytest.raises(RuntimeError, match="require task_session"):
         runner._create_trainer(SimpleNamespace(trainer=SimpleNamespace(device="npu")))
     assert not created
+
+
+# --- VERL integration compatibility guard ---
+
+def test_unwrap_native_actor_class_requires_ray_actor_metadata():
+    class Native:
+        pass
+
+    class ActorClass:
+        __ray_actor_class__ = Native
+
+    assert unwrap_native_actor_class(ActorClass) is Native
+    with pytest.raises(TypeError, match="Ray ActorClass"):
+        unwrap_native_actor_class(object())
