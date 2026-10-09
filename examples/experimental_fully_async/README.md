@@ -41,7 +41,7 @@ DP=1、PP=1、non-PD vLLM；当前真实 GPU 验收仅覆盖 TP=1，因此 TP>1 
    ```bash
    VERL_MULTITASK_GPU_MODEL_PATH=/path/to/local/model \
    python -m pytest -q -s -m gpu_integration \
-     tests/integration/test_native_sleep_gpu.py
+     tests/integration/cuda/test_native_sleep_gpu.py
    ```
    同一文件包含两层验收：1 GPU 用例要求 native 真实生成成功、CE worker 报告物理
    GPU UUID、Manager 生成精确 `RELEASED`、level-2 sleep 后 `nvidia-smi` 显存显著
