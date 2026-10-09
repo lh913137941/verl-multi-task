@@ -97,11 +97,26 @@ class MultiTaskHCCLCheckpointEngine(HCCLCheckpointEngine):
                 # before destroying its communicator or freeing weight buckets.
                 with torch.npu.device(self.device):
                     torch.npu.synchronize()
+                    # Modern vLLM-Ascend exposes close(), which handles
+                    # device synchronization and marks the communicator closed.
+                    # Older releases have only the underlying HCCL library.
+                    close = getattr(communicator, "close", None)
                     destroy = getattr(communicator, "destroyComm", None)
-                    if callable(destroy):
+                    if callable(close):
+                        close()
+                    elif callable(destroy):
                         destroy(communicator.comm)
                     else:
-                        communicator.hccl.hcclCommDestroy(communicator.comm)
+                        library_destroy = getattr(
+                            getattr(communicator, "hccl", None),
+                            "hcclCommDestroy",
+                            None,
+                        )
+                        if not callable(library_destroy):
+                            raise RuntimeError(
+                                "PyHcclCommunicator exposes no supported HCCL destruction API"
+                            )
+                        library_destroy(communicator.comm)
                 self.pyhccl = None
             # Non-sending training ranks have no communicator.  Checking the
             # handle also makes repeated finalize safe after rank becomes None.
