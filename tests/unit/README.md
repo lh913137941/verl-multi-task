@@ -89,4 +89,4 @@ python scripts/e2e/verify_two_verl_jobs.py \
 1. **一个组件优先维护一个测试文件**；专项设备后端、Exactly Once 等不同依赖/契约可以独立保留。
 2. 用 `_wiring_support.py` 复用 AST 装载、Mock、Claim/Lease 工厂；每次构造返回新的可变对象，避免跨测试污染。
 3. 保留关键流程的**成功、明确失败、未知结果/ACK 丢失、幂等重放及恢复**边界；不要因为断言对象相近就合并不同故障时序。
-4. Mock/AST 单测主要证明本地合同，不应宣称已覆盖真实通信组、模型加载、Ray Actor 竞争或硬件行为。修改相应接线后还需运行 [native_unit](../native_unit/)、[integration](../integration/) 或真实 E2E。
+4. Mock/AST 单测主要证明本地合同，不应宣称已覆盖真实通信组、模型加载、Ray Actor 竞争或硬件行为。修改相关接线后，还需按 [集成测试目录](../integration/) 的运行环境选择 Ray、VERL、CUDA/NPU 检查或真实 E2E；测试入口总览见 [tests/README.md](../README.md)。
