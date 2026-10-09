@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import uuid
@@ -40,9 +41,28 @@ def main() -> int:
         return 2
 
     started_ray = False
-    if not ray.is_initialized():
-        ray.init(num_cpus=2, ignore_reinit_error=True, log_to_driver=True)
-        started_ray = True
+    try:
+        if not ray.is_initialized():
+            address = os.environ.get("RAY_ADDRESS")
+            kwargs = {"ignore_reinit_error": True, "log_to_driver": True}
+            if address:
+                # In attach mode CPU resources belong to the existing cluster.
+                # Ray rejects num_cpus when the driver connects to one.
+                kwargs["address"] = address
+                if os.environ.get("PYTHONPATH"):
+                    kwargs["runtime_env"] = {
+                        "env_vars": {"PYTHONPATH": os.environ["PYTHONPATH"]}
+                    }
+            else:
+                kwargs.update(address="local", num_cpus=2)
+            ray.init(**kwargs)
+            started_ray = True
+    except Exception as exc:
+        result.update(state="BLOCKED", detail=f"cannot connect control-plane Ray: {type(exc).__name__}: {exc}")
+        args.result_file.parent.mkdir(parents=True, exist_ok=True)
+        args.result_file.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        print("MULTITASK_E2E_RESULT " + json.dumps(result, sort_keys=True))
+        return 2
 
     @ray.remote
     class DummyTaskRunner:
