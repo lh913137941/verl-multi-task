@@ -4,8 +4,6 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
-import asyncio
-import pytest
 from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
     AttemptState,
