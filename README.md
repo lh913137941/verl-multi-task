@@ -195,6 +195,8 @@ VERL_MULTITASK_GPU_MODEL_PATH=/实际模型路径 \
 
 它们验证的是底层运行时/设备能力，与双任务 E2E 互补，不要求每次修改都全部运行。
 
+单元测试的文件职责、关键覆盖边界及维护约定见 [tests/unit/README.md](tests/unit/README.md)。
+
 ---
 
 ## 9. E2E 验收结果与排错
