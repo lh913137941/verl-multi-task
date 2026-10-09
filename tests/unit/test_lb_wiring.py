@@ -13,6 +13,7 @@ from multi_task_scheduler.orchestration.contracts import (
 )
 from _wiring_support import (
     load_balancer_class,
+    isolated,
 )
 
 
@@ -314,26 +315,6 @@ def test_lb_settled_gc_count_survives_reacquire_and_forced_finish():
 
 # --- test_zero_server_handoff.py (consolidated boundary scenarios) ---
 
-ROOT = Path(__file__).resolve().parents[2] / "src/multi_task_scheduler"
-
-
-def _extract_class(path, name, parent, **globals_):
-    tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
-    klass = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name)
-    klass.bases = [ast.Name(id="Parent", ctx=ast.Load())]
-    klass.decorator_list = []
-    ns = {"Parent": parent, **globals_}
-    module = ast.Module(
-        body=[
-            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
-            klass,
-        ],
-        type_ignores=[],
-    )
-    exec(compile(ast.fix_missing_locations(module), str(ROOT / path), "exec"), ns)
-    return ns[name]
-
-
 def _load_router():
     class Parent:
         def __init__(self, servers, **kwargs):
@@ -365,7 +346,7 @@ def _load_router():
         def now(operation_id, kind):
             return (operation_id, kind)
 
-    cls = _extract_class(
+    cls = isolated(
         "rollout/load_balancer.py", "MultiTaskGlobalRequestLoadBalancer",
         Parent, DEFAULT_ROUTING_CACHE_SIZE=1000, ReplicaKey=Key,
         OperationEvidence=Evidence, EvidenceType=SimpleNamespace(SERVICE_COMMITTED="service"),
@@ -432,7 +413,7 @@ def _load_client(*, plan, pending, asyncio_module=asyncio):
                 raise result
             return result
 
-    cls = _extract_class(
+    cls = isolated(
         "integration/verl/experimental_fully_async/rollouter.py",
         "_MultiTaskFullyAsyncLLMServerClient", Parent,
         asyncio=asyncio_module, _ContinuationAwareServer=object,
