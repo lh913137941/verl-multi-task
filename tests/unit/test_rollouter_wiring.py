@@ -1554,21 +1554,7 @@ def test_rollouter_retracts_idle_candidates_on_resume(lost_retraction_ack):
 
 # --- test_reward_loop_isolation.py (consolidated boundary scenarios) ---
 
-_REWARD_LOOP_SOURCE = (
-    Path(__file__).resolve().parents[2]
-    / "src/multi_task_scheduler/integration/verl/experimental_fully_async/rollouter.py"
-)
-
-
 def _isolated_reward_manager():
-    tree = ast.parse(_REWARD_LOOP_SOURCE.read_text(encoding="utf-8"))
-    cls = next(
-        node for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "_TaskScopedRewardLoopManager"
-    )
-    cls.bases = [ast.Name(id="NativeRewardLoopManager", ctx=ast.Load())]
-    cls.decorator_list = []
-
     registry = []
 
     class RewardWorkerClass:
@@ -1605,10 +1591,13 @@ def _isolated_reward_manager():
             ),
         ),
     )
-    env = {"ray": fake_ray, "NativeRewardLoopManager": NativeRewardLoopManager}
-    module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
-    exec(compile(module, str(_REWARD_LOOP_SOURCE), "exec"), env)
-    return env["_TaskScopedRewardLoopManager"], registry
+    cls = isolated(
+        f"{INTEGRATION}/rollouter.py",
+        "_TaskScopedRewardLoopManager",
+        NativeRewardLoopManager,
+        ray=fake_ray,
+    )
+    return cls, registry
 
 
 def test_two_verl_jobs_create_distinct_reward_loop_actor_names():
