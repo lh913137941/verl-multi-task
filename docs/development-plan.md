@@ -45,7 +45,7 @@ Runtime Profile 指选择一整套兼容扩展类型的配置值，不是另一�
 | 待办 | 负责人/环境 | 伴生仓工作 | 是否修改 verl | 完成条件与证据 |
 |---|---|---|---|---|
 | T1 配套源码部署 | 用户执行，开发者提供说明/真实环境 | 用户将同版伴生源码嵌入 verl，并记录提交与文件清单 | 用户部署已有接线提交；无计划新增 | driver、所有 Ray 节点和子进程使用同版源码；部署记录没有 Git、虚拟环境或缓存副本 |
-| T2 真实父类检查 | 用户执行，开发者分析失败/具备原生依赖的环境 | 执行现有 `tests/native_unit/test_native_adapters.py` 的 11 个用例 | 无计划新增 | pytest 原始输出通过；真实父类、方法委托、Ray 资源选项和两个本地构造用例均有结果 |
+| T2 真实父类检查 | 用户执行，开发者分析失败/具备原生依赖的环境 | 执行现有 `tests/integration/verl/test_native_adapters.py` 的 11 个用例 | 无计划新增 | pytest 原始输出通过；真实父类、方法委托、Ray 资源选项和两个本地构造用例均有结果 |
 | T3 原生配置加载 | 用户执行，开发者核对/原生 Hydra 入口环境 | 核对 profile 未启用、启用、非法值三条入口路径 | 无计划新增 | 原生 primary 加载成功；关闭时不导入伴生包/不发现 GS；启用错误不回退原生 |
 | T4 跨 Actor 源码来源 | 用户采集，开发者核对/实际 Ray 集群 | 核对 TaskRunner、Trainer、Rollouter、LB、CE Worker、Server 进程的模块文件与版本 | 无计划新增 | 各进程引用部署清单中的源码；没有旧包覆盖或只在 driver 可见的源码 |
 | T5 全部实体初始化 | 用户执行，开发者审阅/实际 GPU 集群 | 检查 [实体清单](architecture.md#1-实体所有者和创建点) 的九类扩展与 GS；同时检查原生 AgentLoop、队列、WorkerDict、ServerAdapter | 无计划新增 | Actor 状态、对象类型和初始化日志能互相印证；GS 保存当前 TaskRunner 句柄；Trainer/CE 与 Rollouter/Manager 所有权正确 |
@@ -77,7 +77,7 @@ T7 不要求实现心跳或故障恢复。TaskRunner 被直接杀死、进程崩
    PYTHONPATH="$PWD/verl-multi-task/src:$PWD" \
    PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
    python -m pytest -q -p no:cacheprovider \
-     verl-multi-task/tests/native_unit/test_native_adapters.py
+     verl-multi-task/tests/integration/verl/test_native_adapters.py
    ```
 
 4. 用户使用 [原生入口示例](../examples/experimental_fully_async/README.md) 验证原生 Hydra 配置和训练。
