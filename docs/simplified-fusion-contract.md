@@ -68,5 +68,5 @@ gate alone does not serialize optimizer updates. ADD and RESTORE both use the
 same G-serialized target-bootstrap/version-confirmation boundary; runtime
 acceptance still requires the real current-Vpub GPU path to succeed.
 
-See 092303 repair and validation notes（历史审计记录已清理） for the
-source baseline, tests and remaining runtime work.
+For implementation and remaining validation gaps, consult the current source,
+[design document](多RL任务共享调度对接VERL_动态流程编排融合设计精简优化版092401.md), and [E2E acceptance guide](e2e-acceptance.md).
