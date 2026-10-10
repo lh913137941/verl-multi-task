@@ -241,9 +241,21 @@ def main() -> int:
             "idle report is stale",
         )
 
-        # Clear the stale advisory report without changing the lease ledger.
+        # Clear the stale advisory report without changing the lease ledger,
+        # then publish a fresh candidate before testing the successful DONATE path.
         ray.get(gs.detach_task.remote(task_session), timeout=10)
         ray.get(gs.attach_task.remote(task_session, runner), timeout=10)
+        ray.get(
+            gs.submit_idle_report.remote(
+                {
+                    "task_session": task_session,
+                    "candidates": [
+                        {"replica_key": donor, "kind": ReplicaKind.NATIVE.value}
+                    ],
+                }
+            ),
+            timeout=10,
+        )
 
         donate = OperationCommand(
             f"op-{token}-donate",
