@@ -138,6 +138,15 @@ class GroupScheduler:
 
             donor_task_id = lease.claims[0]["donor_task_id"]
             if command.kind is OperationKind.DONATE:
+                if history:
+                    last_command = self.operation_commands.get(history[-1])
+                    if (
+                        last_command is not None
+                        and last_command.kind is OperationKind.REMOVE
+                    ):
+                        raise ValueError(
+                            "lease awaits RESTORE after borrowed REMOVE"
+                        )
                 idle_report = self.idle_reports.get(command.target.task_session)
                 if idle_report is None:
                     raise ValueError(
@@ -154,15 +163,6 @@ class GroupScheduler:
                     raise ValueError(
                         "DONATE target is not a currently reported idle NATIVE replica"
                     )
-                if history:
-                    last_command = self.operation_commands.get(history[-1])
-                    if (
-                        last_command is not None
-                        and last_command.kind is OperationKind.REMOVE
-                    ):
-                        raise ValueError(
-                            "lease awaits RESTORE after borrowed REMOVE"
-                        )
                 if command.target.task_session != donor_task_id:
                     raise ValueError("DONATE target does not own the lease claims")
                 if not self._target_matches_donor(command.target, lease):
