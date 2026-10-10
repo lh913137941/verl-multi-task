@@ -109,6 +109,14 @@ def arguments():
     return args
 
 
+def _rollout_gpus_for_role(args, role):
+    """Resolve rollout GPU count without coupling donor surplus to borrower size."""
+    if role not in {"donor", "borrower"}:
+        raise ValueError(f"unknown E2E role {role!r}")
+    specific = getattr(args, f"{role}_rollout_gpus", None)
+    return args.rollout_gpus if specific is None else specific
+
+
 def read_args(path):
     if path is None:
         return []
@@ -555,13 +563,7 @@ def main():
         # The native args file can override various model, trainer, dataset and
         # algorithm settings, but cannot silently disable MultiTask/Ray wiring.
         def start(role, token):
-            role_rollout_gpus = (
-                a.donor_rollout_gpus
-                if role == "donor" and a.donor_rollout_gpus is not None
-                else a.borrower_rollout_gpus
-                if role == "borrower" and a.borrower_rollout_gpus is not None
-                else a.rollout_gpus
-            )
+            role_rollout_gpus = _rollout_gpus_for_role(a, role)
             role_fixed = [f"rollout.n_gpus_per_node={role_rollout_gpus}"]
             log(f"Launching {role} with rollout.n_gpus_per_node={role_rollout_gpus}")
             overrides = (
