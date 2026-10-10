@@ -210,6 +210,37 @@ def test_group_scheduler_add_release_compensation_unfreezes_claims():
     assert ("pg", 0) not in gs.active_bundle_owner
 
 
+def test_group_scheduler_exact_donate_replay_survives_report_expiry():
+    cls = _isolated_group_scheduler_class()
+    gs = cls()
+    lease = _scheduler_test_lease()
+    gs.open_lease(lease)
+    target = ReplicaKey("task-a", "native-0")
+    calls = []
+
+    class Runner:
+        submit_operation = RemoteMethod(
+            lambda command, lease=None: (
+                calls.append(command.operation_id) or OperationRecord(command.operation_id)
+            )
+        )
+
+    gs.task_runners["task-a"] = Runner()
+    gs.submit_idle_report({
+        "task_session": "task-a",
+        "candidates": ({"replica_key": target, "kind": ReplicaKind.NATIVE.value},),
+    })
+    command = OperationCommand("op-donate-replay", OperationKind.DONATE, target, lease.lease_id)
+    assert gs.submit_operation(command).operation_id == command.operation_id
+
+    # Once accepted, exact replay reconciles the same operation even if its
+    # advisory report has since aged out; it must not create a new operation.
+    gs.idle_reports["task-a"]["observed_at"] = time.monotonic() - 11.0
+    assert gs.submit_operation(command).operation_id == command.operation_id
+    assert calls == ["op-donate-replay", "op-donate-replay"]
+    assert tuple(gs.operation_commands) == ("op-donate-replay",)
+
+
 def test_group_scheduler_rejects_stale_or_mismatched_idle_donate_when_report_exists():
     cls = _isolated_group_scheduler_class()
     gs = cls()
