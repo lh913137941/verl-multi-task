@@ -53,8 +53,23 @@
 1. VERL 原生入口 `verl.experimental.fully_async_policy.fully_async_main` 根据 `multitask.enabled` 选择 TaskRunner。验证当前导入入口：`python scripts/e2e/ensure_verl_multitask_bridge.py --check-only`；不要假设安装包会自动修改任意 VERL checkout。
 2. `runtime_profile.py` 限制受支持的 independent/non-PD vLLM 配置，不符合真实能力条件则 fail-closed；设备、后端与 TP/DP/PP 组合须按环境验收。
 3. TaskRunner 初始化组件后向共享 GS `attach_task(task_id, task_runner)` 注册，退出时 `detach_task(task_id)`；丢失 ACK 需要查真实注册状态，不直接创建重复任务。
-4. GS 的 `open_lease(lease)` 和 `advance_lease(lease_id, evidence)` 是内部 Lease 账本动作。`submit_operation(command)` 分发操作；`submit_idle_report(report)` 接受资源空闲观察。GS 不负责直接调用设备 sleep/wake。
+4. GS 的 `open_lease(lease)` 和 `advance_lease(lease_id, evidence)` 是内部 Lease 账本动作。`submit_operation(command)` 分发操作；`submit_idle_report(report)` 接受资源空闲观察。**新的 DONATE 必须有 10 秒内的空泡报告，且报告明确包含同一 `ReplicaKey` 的 `NATIVE` 候选**；缺报、过期、空候选或目标/类型不符均在下发前拒绝。已登记的同一 `operation_id` 精确重放仍进入原操作对账路径，不因报告后续过期而创建第二个操作。GS 不负责直接调用设备 sleep/wake。
 5. TaskRunner 通过 `submit_operation` 和 `query_operation` 提供任务侧操作接入；OperationJournal 处理接受、执行中、完成和重复命令。重试使用同一 `operation_id`，而非另发不相关的新操作。
+
+### 1.3.1 容量富余、空泡感知与 DONATE 准入
+
+“容量富余”不是显存空闲率或 GPU 利用率，而是 Rollouter 根据当前生产窗口、已提交并发容量与 ACTIVE Replica 数量计算出的**可暂时退出的容量**。当前实现 `collect_idle_candidates()` 要求 Rollouter 处于 `paused` 且容量参数有效：
+
+```python
+required_active = ceil(max_concurrent_samples / concurrent_samples_per_replica)
+surplus_count = max(0, active_replica_count - required_active)
+```
+
+代码使用等价的整数向上取整计算，并只从 ACTIVE 列表中选择 `surplus_count` 个候选。例如 (C=35)、单 Replica 并发 (P=16)、ACTIVE 数 (N=4)，所需数量为 3，富余数量为 1；若 (C=16,P=16,N=1)，则没有容量富余。真实数值来自当前 VERL Rollouter 与 Manager，而不是硬编码。
+
+`_idle_report_loop()` 约每秒检查当前状态；候选非空时根据候选签名变化和上报间隔提交给 GS。候选消失会撤回旧报告；GS 对报告使用单调时钟检查，当前新鲜度上限为 10 秒。报告只是候选观察，不证明旧请求已经结清，也不直接授予借卡权。
+
+**DONATE 的硬门禁**：GS 对新操作必须要求 `idle_reports[donor_task_session]` 存在且未过期，且 `candidates` 中精确包含目标 `ReplicaKey` 并标为 `NATIVE`。缺失、过期、空列表、其他 Native Replica 或 Borrowed 类型均拒绝；拒绝发生在记录新操作意图和调用 TaskRunner 之前。若 Lease 已经打开，其资源预留保持冻结，不可在没有 RELEASED 证据时重新授权。修正或刷新报告后可以复用尚未登记的原命令身份；已经登记的命令只允许同一 `operation_id` 精确重放。
 
 ## 1.4 生命周期主要流程及证据
 
@@ -672,6 +687,14 @@ VERL_MULTITASK_NPU_MODEL_PATH=/path/to/model \
 python scripts/e2e/verify_two_verl_jobs.py \
   --repo . --ray-address auto --start-local-ray \
   --native-args examples/e2e/native_args.txt \
+  --scenarios "control_plane exactly_once recovery lifecycle force"
+
+# NPU 8 卡示例：若当前 C=35、单 Replica 并发 P=16，4 个 donor rollout replicas 才能形成 1 个容量富余候选；
+# borrower 仍用 1 张 rollout 卡。具体应以真实 idle report 和集群资源为准。
+python scripts/e2e/verify_two_verl_jobs.py \
+  --repo . --ray-address auto --start-local-ray \
+  --native-args examples/e2e/native_args.txt \
+  --trainer-gpus 1 --donor-rollout-gpus 4 --borrower-rollout-gpus 1 \
   --scenarios "control_plane exactly_once recovery lifecycle force"
 ```
 
