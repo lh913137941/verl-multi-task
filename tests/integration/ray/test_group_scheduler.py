@@ -139,6 +139,7 @@ def test_group_scheduler_fences_active_claims_until_verified_release():
         with pytest.raises(ValueError, match="already active"):
             ray.get(gs.open_lease.remote(overlapping))
 
+        report_idle_native(gs)
         command = OperationCommand(
             "op-release",
             OperationKind.DONATE,
