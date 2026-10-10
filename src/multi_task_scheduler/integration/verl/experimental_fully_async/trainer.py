@@ -4,7 +4,6 @@
 """Native Fully Async Trainer plus the single task-local synchronization gate G."""
 
 import json
-import logging
 
 import ray
 from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
@@ -306,6 +305,10 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
                 "ADD service commit",
             )
         except BaseException as exc:
+            # Keep this import in the method body as well: the isolated wiring
+            # test compiles the class without module-level imports.
+            import logging
+
             logging.getLogger(__name__).exception(
                 "ADD bootstrap/publish failed before rollback: operation_id=%s target=%s e_committed=%s",
                 operation.operation_id,
