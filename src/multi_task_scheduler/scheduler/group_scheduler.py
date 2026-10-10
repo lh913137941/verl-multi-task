@@ -139,18 +139,21 @@ class GroupScheduler:
             donor_task_id = lease.claims[0]["donor_task_id"]
             if command.kind is OperationKind.DONATE:
                 idle_report = self.idle_reports.get(command.target.task_session)
-                if idle_report is not None:
-                    age = time.monotonic() - idle_report["observed_at"]
-                    if age > _IDLE_REPORT_MAX_AGE_S:
-                        raise ValueError("DONATE idle report is stale; wait for a fresh paused-window report")
-                    reported = {
-                        candidate["replica_key"]: ReplicaKind(candidate["kind"])
-                        for candidate in idle_report["candidates"]
-                    }
-                    if reported.get(command.target) is not ReplicaKind.NATIVE:
-                        raise ValueError(
-                            "DONATE target is not a currently reported idle NATIVE replica"
-                        )
+                if idle_report is None:
+                    raise ValueError(
+                        "DONATE requires a fresh idle report containing the target NATIVE replica"
+                    )
+                age = time.monotonic() - idle_report["observed_at"]
+                if age > _IDLE_REPORT_MAX_AGE_S:
+                    raise ValueError("DONATE idle report is stale; wait for a fresh paused-window report")
+                reported = {
+                    candidate["replica_key"]: ReplicaKind(candidate["kind"])
+                    for candidate in idle_report["candidates"]
+                }
+                if reported.get(command.target) is not ReplicaKind.NATIVE:
+                    raise ValueError(
+                        "DONATE target is not a currently reported idle NATIVE replica"
+                    )
                 if history:
                     last_command = self.operation_commands.get(history[-1])
                     if (
