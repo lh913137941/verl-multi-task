@@ -610,6 +610,34 @@ def test_two_real_jobs_runs_source_bootstrap_before_verl_or_ray_imports():
     )
 
 
+def test_two_real_jobs_resolves_role_specific_rollout_gpu_counts():
+    source = (E2E / "verify_two_verl_jobs.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    fn = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_rollout_gpus_for_role"
+    )
+    namespace = {}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "rollout_gpu_resolver", "exec"), namespace)
+
+    from types import SimpleNamespace
+    resolve = namespace["_rollout_gpus_for_role"]
+    args = SimpleNamespace(
+        rollout_gpus=1,
+        donor_rollout_gpus=4,
+        borrower_rollout_gpus=1,
+    )
+    assert resolve(args, "donor") == 4
+    assert resolve(args, "borrower") == 1
+    args.donor_rollout_gpus = None
+    assert resolve(args, "donor") == 1
+    with pytest.raises(ValueError, match="unknown E2E role"):
+        resolve(args, "other")
+
+    assert "--donor-rollout-gpus" in source
+    assert "--borrower-rollout-gpus" in source
+
+
 def test_two_real_jobs_backend_overrides_keep_npu_hccl_and_cuda_nccl_separate():
     """Regression: the NPU path must not invoke native HCCL.destroyComm."""
     import pytest
