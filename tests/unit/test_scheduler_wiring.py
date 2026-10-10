@@ -42,6 +42,10 @@ def test_group_scheduler_stages_operation_intent_before_taskrunner_dispatch():
         )
 
     gs.task_runners["task-a"] = Runner()
+    gs.submit_idle_report({
+        "task_session": "task-a",
+        "candidates": ({"replica_key": command.target, "kind": ReplicaKind.NATIVE.value},),
+    })
     record = gs.submit_operation(command)
     assert record.operation_id == command.operation_id
     assert gs.operation_commands[command.operation_id] == command
@@ -143,6 +147,10 @@ def test_group_scheduler_preserves_staging_when_submission_outcome_is_ambiguous(
         )
 
     gs.task_runners["task-a"] = Runner()
+    gs.submit_idle_report({
+        "task_session": "task-a",
+        "candidates": ({"replica_key": command.target, "kind": ReplicaKind.NATIVE.value},),
+    })
     with pytest.raises(TimeoutError, match="reply lost"):
         gs.submit_operation(command)
     assert gs.operation_commands[command.operation_id] == command
@@ -235,6 +243,46 @@ def test_group_scheduler_rejects_stale_or_mismatched_idle_donate_when_report_exi
         gs.submit_operation(
             OperationCommand("op-mismatch", OperationKind.DONATE, target, lease.lease_id)
         )
+
+
+def test_group_scheduler_requires_fresh_idle_report_for_donate():
+    cls = _isolated_group_scheduler_class()
+    gs = cls()
+    lease = _scheduler_test_lease()
+    gs.open_lease(lease)
+    target = ReplicaKey("task-a", "native-0")
+
+    class Runner:
+        submit_operation = RemoteMethod(
+            lambda command, lease=None: OperationRecord(command.operation_id)
+        )
+
+    gs.task_runners["task-a"] = Runner()
+
+    with pytest.raises(ValueError, match="requires a fresh idle report"):
+        gs.submit_operation(
+            OperationCommand("op-no-report", OperationKind.DONATE, target, lease.lease_id)
+        )
+
+    # An empty report is an explicit retraction, not donation authorization.
+    gs.submit_idle_report({"task_session": "task-a", "candidates": ()})
+    with pytest.raises(ValueError, match="not a currently reported idle NATIVE"):
+        gs.submit_operation(
+            OperationCommand("op-empty-report", OperationKind.DONATE, target, lease.lease_id)
+        )
+
+    gs.submit_idle_report({
+        "task_session": "task-a",
+        "candidates": ({"replica_key": target, "kind": ReplicaKind.BORROWED.value},),
+    })
+    with pytest.raises(ValueError, match="not a currently reported idle NATIVE"):
+        gs.submit_operation(
+            OperationCommand("op-borrowed-report", OperationKind.DONATE, target, lease.lease_id)
+        )
+
+    assert "op-no-report" not in gs.operation_commands
+    assert "op-empty-report" not in gs.operation_commands
+    assert "op-borrowed-report" not in gs.operation_commands
 
 
 def test_group_scheduler_binds_donate_to_lease_donor_rank():
