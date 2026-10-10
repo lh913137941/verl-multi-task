@@ -80,7 +80,11 @@ def arguments():
     p.add_argument("--donor-args", type=Path, help="optional donor-only Hydra overrides")
     p.add_argument("--borrower-args", type=Path, help="optional borrower-only Hydra overrides")
     p.add_argument("--trainer-gpus", type=int, default=1, help="trainer GPUs per node per job")
-    p.add_argument("--rollout-gpus", type=int, default=1, help="native standalone rollout GPUs per node per job")
+    p.add_argument("--rollout-gpus", type=int, default=1, help="default rollout GPUs per node per job")
+    p.add_argument("--donor-rollout-gpus", type=int, default=None,
+                   help="optional donor-only rollout GPU count; provision enough native replicas to produce a real surplus idle report")
+    p.add_argument("--borrower-rollout-gpus", type=int, default=None,
+                   help="optional borrower-only rollout GPU count (defaults to --rollout-gpus)")
     p.add_argument("--startup-timeout", type=int, default=900)
     p.add_argument("--e2e-timeout", type=int, default=5400)
     p.add_argument("--scenarios", default="control_plane exactly_once recovery lifecycle force",
@@ -95,6 +99,13 @@ def arguments():
     args = p.parse_args()
     if args.native_overrides and args.native_overrides[0] == "--":
         args.native_overrides.pop(0)
+    for name in ("trainer_gpus", "rollout_gpus"):
+        if getattr(args, name) < 1:
+            p.error(f"--{name.replace('_', '-')} must be >= 1")
+    for name in ("donor_rollout_gpus", "borrower_rollout_gpus"):
+        value = getattr(args, name)
+        if value is not None and value < 1:
+            p.error(f"--{name.replace('_', '-')} must be >= 1")
     return args
 
 
@@ -517,7 +528,6 @@ def main():
             "trainer.nnodes=1",
             f"trainer.n_gpus_per_node={a.trainer_gpus}",
             "rollout.nnodes=1",
-            f"rollout.n_gpus_per_node={a.rollout_gpus}",
             "actor_rollout_ref.hybrid_engine=false",
             "actor_rollout_ref.rollout.name=vllm",
             "actor_rollout_ref.rollout.mode=async",
@@ -545,7 +555,19 @@ def main():
         # The native args file can override various model, trainer, dataset and
         # algorithm settings, but cannot silently disable MultiTask/Ray wiring.
         def start(role, token):
-            overrides = shared_args + local_args[role] + input_overrides + fixed + [f"trainer.experiment_name=two_real_{role}_{token}"]
+            role_rollout_gpus = (
+                a.donor_rollout_gpus
+                if role == "donor" and a.donor_rollout_gpus is not None
+                else a.borrower_rollout_gpus
+                if role == "borrower" and a.borrower_rollout_gpus is not None
+                else a.rollout_gpus
+            )
+            role_fixed = [f"rollout.n_gpus_per_node={role_rollout_gpus}"]
+            log(f"Launching {role} with rollout.n_gpus_per_node={role_rollout_gpus}")
+            overrides = (
+                shared_args + local_args[role] + input_overrides + fixed + role_fixed
+                + [f"trainer.experiment_name=two_real_{role}_{token}"]
+            )
             cmd = [sys.executable, "-m", "verl.experimental.fully_async_policy.fully_async_main", *overrides]
             (logs / f"{role}_command.json").write_text(
                 json.dumps(cmd, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
