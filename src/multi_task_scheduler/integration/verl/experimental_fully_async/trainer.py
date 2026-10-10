@@ -218,6 +218,7 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
         lease = await gate.acquire(operation.operation_id, GateKind.ADD)
         pending_registered = False
         e_committed = False
+        target = None
         try:
             target = await self.rollouter.get_pending_target.remote(operation.operation_id)
             replicas = tuple(
@@ -312,7 +313,7 @@ class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
             logging.getLogger(__name__).exception(
                 "ADD bootstrap/publish failed before rollback: operation_id=%s target=%s e_committed=%s",
                 operation.operation_id,
-                operation.target,
+                target,
                 e_committed,
             )
             if not e_committed:
