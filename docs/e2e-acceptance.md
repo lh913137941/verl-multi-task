@@ -44,11 +44,14 @@ python scripts/e2e/verify_two_verl_jobs.py \
   --ray-address auto \
   --start-local-ray \
   --native-args examples/e2e/native_args.txt \
+  --trainer-gpus 1 --donor-rollout-gpus 4 --borrower-rollout-gpus 1 \
   --scenarios "lifecycle force"
 ```
 
-`native_args.txt` 必须提前配置**真实的模型和数据路径**；仓库样例中的模型路径默认是占位符。
-已有持久 Ray 集群时，指定实际 `--ray-address` 并移除 `--start-local-ray`。
+`native_args.txt` 必须提前配置**真实的模型和数据路径**；仓库样例中的模型路径默认是占位符。 完整生命周期的 DONATE 还要求 donor Rollouter 真正上报容量富余的 Native Replica：当前准入会拒绝缺失、过期或不包含目标的空泡报告。
+已有持久 Ray 集群时，指定实际 `--ray-address` 并移除 `--start-local-ray`。 
+
+上面的 8-NPU 示例假定 `max_required_samples=35`、单 Replica 并发 `P=16`：4 个 donor rollout replicas 对应 `required_active=ceil(35/16)=3`，因此最多报告 1 个富余候选；borrower 仍用 1 个 rollout GPU。若配置/机器不同，应按 `required_active=ceil(C/P)` 调整 donor rollout 容量，并以新鲜 idle report 为准，不能手工伪造候选。`--rollout-gpus` 仍是 donor/borrower 的默认值，`--donor-rollout-gpus` / `--borrower-rollout-gpus` 可分别覆盖。
 启动器在必要时安全备份/修补当前实际导入的 VERL 入口，不使用另一套训练主循环。
 
 `--scenarios` 可设为 `"control_plane exactly_once recovery lifecycle force"`，也可以只选择失败场景。
