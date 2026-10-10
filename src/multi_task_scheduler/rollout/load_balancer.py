@@ -23,6 +23,10 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         self.active_request_server: dict[str, str] = {}
         self.attempt_state: dict[str, AttemptState] = {}
         self.draining_operations: dict[str, str] = {}
+        # Closing admission on the last server is a lifecycle transition, not
+        # proof that future service can never return. Keep this fact after
+        # finish_remove until an ADD/RESTORE publishes a replacement.
+        self._awaiting_service_restore = False
         self.ready_operations: dict[str, tuple[ReplicaKey, str, OperationEvidence]] = {}
         # request_id -> (client_id, prefix_digest, operation_id, evidence).
         # This remains LB-internal request truth: exact retries are idempotent,
@@ -38,6 +42,9 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         # Keep enough SETTLED history for ACK-loss queries without allowing
         # request facts to grow for the entire task lifetime.
         self._settled_retention = 10_000
+        # Keep the GC threshold independent of outstanding ADMITTED requests.
+        # Otherwise every release at high concurrency scans the full ledger.
+        self._settled_count = 0
         for key, server_id in dict(initial_routes or {}).items():
             if not isinstance(key, ReplicaKey):
                 raise TypeError("initial route key must be ReplicaKey")
@@ -49,26 +56,33 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
         return ["request_id"]
 
     def _gc_settled_requests(self) -> None:
-        overflow = len(self.attempt_state) - self._settled_retention
+        overflow = self._settled_count - self._settled_retention
         if overflow <= 0:
             return
-        for request_id, state in tuple(self.attempt_state.items()):
-            if overflow <= 0:
-                break
+
+        # Batch eviction amortizes scans of the existing insertion-ordered
+        # ledger during long-running Fully Async training. Collect keys before
+        # deleting to avoid copying every ADMITTED/TERMINATED request into a
+        # temporary tuple on each release.
+        target = max(overflow, self._settled_retention // 8)
+        expired = []
+        for request_id, state in self.attempt_state.items():
             if (
                 state is AttemptState.SETTLED
                 and request_id not in self.active_request_server
             ):
-                self.attempt_state.pop(request_id, None)
-                self.continuation_proofs.pop(request_id, None)
-                overflow -= 1
+                expired.append(request_id)
+                if len(expired) >= target:
+                    break
+        for request_id in expired:
+            self.attempt_state.pop(request_id, None)
+            self.continuation_proofs.pop(request_id, None)
+        self._settled_count -= len(expired)
 
     def acquire_server(self, request_id: str, **extra):
         state = self.attempt_state.get(request_id)
         if state in {AttemptState.ADMITTED, AttemptState.TERMINATED}:
-            raise RuntimeError(
-                "request attempt has not reached SETTLED and cannot be re-admitted"
-            )
+            raise RuntimeError("request already has an unsettled generation")
 
         server_id, handle = super().acquire_server(request_id, **extra)
         if state is AttemptState.SETTLED:
@@ -76,6 +90,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             # previous ACK-loss continuation proof. A failed acquire must leave
             # the settled attempt queryable exactly as it was.
             self.continuation_proofs.pop(request_id, None)
+            self._settled_count -= 1
         self.active_request_server[request_id] = server_id
         self.attempt_state[request_id] = AttemptState.ADMITTED
         return server_id, handle
@@ -86,16 +101,24 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             owner = self.active_request_server.get(request_id)
             if owner is not None and owner != server_id:
                 raise ValueError("request release belongs to another server")
-            if state is AttemptState.SETTLED:
+            if state is AttemptState.SETTLED or state is None:
+                # Duplicated releases can outlive bounded SETTLED retention.
+                # Do not decrement native counters for a request we no longer
+                # own, including after an old completion was garbage-collected.
                 return
         super().release_server(server_id, request_id=request_id)
         if request_id and state in {AttemptState.ADMITTED, AttemptState.TERMINATED}:
             self.attempt_state[request_id] = AttemptState.SETTLED
             self.active_request_server.pop(request_id, None)
+            self._settled_count += 1
             self._gc_settled_requests()
 
     def query_attempt(self, request_id: str):
         return self.attempt_state.get(request_id)
+
+    def is_service_restore_pending(self) -> bool:
+        """Read-only reason for an empty pool; never infer it from emptiness."""
+        return self._awaiting_service_restore and not self._servers
 
     def confirm_continuation(self, request_id: str, client_id: str,
                              prefix_digest: str) -> OperationEvidence:
@@ -178,6 +201,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
                 raise ValueError("server_id is already owned by another ReplicaKey")
 
         self.add_servers({server_id: server_handle})
+        self._awaiting_service_restore = False
         self.routes[key] = server_id
         evidence = OperationEvidence.now(
             operation_id,
@@ -218,6 +242,8 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             raise ValueError("server is already draining under another operation")
         self.draining_operations[server_id] = operation_id
         self.remove_servers([server_id])
+        if not self._servers:
+            self._awaiting_service_restore = True
         return server_id
 
     def finish_remove(self, key: ReplicaKey):
@@ -233,6 +259,7 @@ class MultiTaskGlobalRequestLoadBalancer(GlobalRequestLoadBalancer):
             if self.attempt_state.get(request_id) is AttemptState.TERMINATED:
                 self.attempt_state[request_id] = AttemptState.SETTLED
                 self.active_request_server.pop(request_id, None)
+                self._settled_count += 1
 
         self.remove_servers([server_id])
         operation_id = self.draining_operations.pop(server_id, None)

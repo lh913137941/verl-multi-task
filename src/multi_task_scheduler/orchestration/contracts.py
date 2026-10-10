@@ -19,6 +19,10 @@ from typing import Any, Mapping
 FIRST_RELEASE_MAX_COLOCATE_COUNT = 2
 FIRST_RELEASE_RAY_GPU_FRACTION = 1.0 / FIRST_RELEASE_MAX_COLOCATE_COUNT
 
+# Delivery budget for synchronous control-plane RPC replies. This bounds
+# caller wait only; it is never lifecycle failure/release evidence.
+CONTROL_RPC_TIMEOUT_S = 30.0
+
 
 class ReplicaKind(str, Enum):
     NATIVE = "NATIVE"
@@ -77,6 +81,17 @@ class ReplicaKey:
             raise ValueError("replica_id must be a nonempty string")
         if type(self.runtime_epoch) is not int or self.runtime_epoch < 0:
             raise ValueError("runtime_epoch must be a nonnegative integer")
+
+
+def native_replica_key(
+    task_session: str,
+    replica_rank: int,
+    runtime_epoch: int = 0,
+) -> ReplicaKey:
+    """Single source for the retained-native replica identity convention."""
+    if type(replica_rank) is not int or replica_rank < 0:
+        raise ValueError("native replica_rank must be a nonnegative integer")
+    return ReplicaKey(task_session, f"native-{replica_rank}", runtime_epoch)
 
 
 @dataclass(frozen=True)
@@ -161,6 +176,22 @@ class OperationEvidence:
         )
 
 
+def require_operation_evidence(
+    value,
+    operation_id: str,
+    expected: EvidenceType,
+    label: str = "operation",
+) -> OperationEvidence:
+    """Validate one cross-owner receipt without duplicating adapter checks."""
+    if not isinstance(value, OperationEvidence):
+        raise TypeError(f"{label} did not return OperationEvidence")
+    if value.operation_id != operation_id:
+        raise ValueError(f"{label} evidence belongs to another operation")
+    if value.type is not expected:
+        raise ValueError(f"expected {expected.value}, got {value.type.value}")
+    return value
+
+
 @dataclass(frozen=True)
 class Lease:
     """GS ledger entry: authorized claims and expiry, without a public state machine."""
@@ -185,6 +216,14 @@ class Lease:
                 raise ValueError("each claim requires a nonempty claim_id")
 
             source_lease_id = claim.get("source_lease_id")
+            legacy_source_lease_id = claim.get("lease_id")
+            if source_lease_id is None:
+                source_lease_id = legacy_source_lease_id
+            elif (
+                legacy_source_lease_id is not None
+                and legacy_source_lease_id != source_lease_id
+            ):
+                raise ValueError("claim lease_id conflicts with source_lease_id")
             if not isinstance(source_lease_id, str) or not source_lease_id:
                 raise ValueError("each claim requires a nonempty source_lease_id")
 
@@ -224,6 +263,7 @@ class Lease:
             normalized["gpu_fraction"] = float(gpu_fraction)
             normalized["cpu_request"] = float(cpu_request)
             normalized["source_lease_id"] = source_lease_id
+            normalized.pop("lease_id", None)
             normalized_claims.append(normalized)
 
         claims = tuple(normalized_claims)

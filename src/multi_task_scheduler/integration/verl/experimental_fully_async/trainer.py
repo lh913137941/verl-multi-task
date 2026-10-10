@@ -3,34 +3,29 @@
 
 """Native Fully Async Trainer plus the single task-local synchronization gate G."""
 
+import json
+
 import ray
 from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
 from verl.utils.config import omega_conf_to_dataclass
 
 from multi_task_scheduler.checkpoint.checkpoint_engine_manager import MultiTaskCheckpointEngineManager
-from verl.single_controller.ray.base import _unwrap_ray_remote
+from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
 from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
     OperationEvidence,
     OperationRecord,
     ReplicaKey,
+    require_operation_evidence as _require_evidence,
     ReplicaKind,
+    native_replica_key,
 )
 from multi_task_scheduler.orchestration.replica_sync_gate import GateKind, ReplicaSyncGate
 
 
-def _require_evidence(value, operation_id: str, expected: EvidenceType, label: str):
-    if not isinstance(value, OperationEvidence):
-        raise TypeError(f"{label} did not return OperationEvidence")
-    if value.operation_id != operation_id:
-        raise ValueError(f"{label} evidence belongs to another operation")
-    if value.type is not expected:
-        raise ValueError(f"expected {expected.value}, got {value.type.value}")
-    return value
-
 
 @ray.remote(num_cpus=10)
-class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
+class MultiTaskFullyAsyncTrainer(unwrap_native_actor_class(FullyAsyncTrainer)):
     def __init__(self, *args, task_session=None, **kwargs):
         self.task_session = task_session
         self._replica_sync_gate = ReplicaSyncGate()
@@ -51,7 +46,7 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
 
         for index, replica in enumerate(replicas):
             rank = getattr(replica, "replica_rank", index)
-            key = ReplicaKey(self.task_session, f"native-{rank}", 0)
+            key = native_replica_key(self.task_session, rank)
             self.checkpoint_manager.add_effective(
                 key,
                 [replica],
@@ -77,6 +72,41 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
         try:
             result = await lease.guard(super()._fit_update_weights)
             if result is not None and self.checkpoint_manager is not None:
+                # E records a published version only after all enabled
+                # receiver/source checks have succeeded. On validation failure
+                # the gate stays BLOCKED and E must not claim this version.
+                if getattr(
+                    self.checkpoint_manager,
+                    "parameter_validation_enabled",
+                    False,
+                ):
+                    effective = [
+                        replica
+                        for replicas, _loaded_version
+                        in self.checkpoint_manager.effective_replicas.values()
+                        for replica in replicas
+                    ]
+                    source_manifest = (
+                        await lease.guard(
+                            self.checkpoint_manager._get_source_manifest
+                        )
+                        if getattr(
+                            self.checkpoint_manager,
+                            "source_validation_enabled",
+                            False,
+                        )
+                        else None
+                    )
+                    validation = await lease.guard(
+                        self.checkpoint_manager.validate_parameter_sync,
+                        effective,
+                        self.current_param_version,
+                        source_manifest,
+                    )
+                    print(
+                        "CE_PARAMETER_VALIDATION "
+                        + json.dumps(validation, sort_keys=True)
+                    )
                 await lease.guard(
                     self.checkpoint_manager.mark_all_loaded_version,
                     self.current_param_version,
@@ -91,6 +121,13 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
         finally:
             await lease.release()
 
+    @staticmethod
+    def _gate_fences(gate: ReplicaSyncGate, operation_id: str) -> bool:
+        return (
+            gate.health == "BLOCKED"
+            and gate.blocked_operation_id == operation_id
+        )
+
     async def _reconcile_blocked_publish(
         self,
         operation: OperationRecord,
@@ -99,10 +136,7 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
     ) -> OperationEvidence | None:
         """Resolve a BLOCKED ADD/RESTORE publication from owner facts under G."""
         gate = self.replica_sync_gate
-        if (
-            gate.health != "BLOCKED"
-            or gate.blocked_operation_id != operation.operation_id
-        ):
+        if not self._gate_fences(gate, operation.operation_id):
             return None
 
         target = await self.rollouter.get_pending_target.remote(operation.operation_id)
@@ -184,6 +218,7 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
         lease = await gate.acquire(operation.operation_id, GateKind.ADD)
         pending_registered = False
         e_committed = False
+        target = None
         try:
             target = await self.rollouter.get_pending_target.remote(operation.operation_id)
             replicas = tuple(
@@ -271,6 +306,16 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
                 "ADD service commit",
             )
         except BaseException as exc:
+            # Keep this import in the method body as well: the isolated wiring
+            # test compiles the class without module-level imports.
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "ADD bootstrap/publish failed before rollback: operation_id=%s target=%s e_committed=%s",
+                operation.operation_id,
+                target,
+                e_committed,
+            )
             if not e_committed:
                 cleanup_error = None
                 if pending_registered:
@@ -321,10 +366,7 @@ class MultiTaskFullyAsyncTrainer(_unwrap_ray_remote(FullyAsyncTrainer)):
     ) -> OperationEvidence | None:
         """Resolve a BLOCKED DONATE/REMOVE service commit from owner facts under G."""
         gate = self.replica_sync_gate
-        if (
-            gate.health != "BLOCKED"
-            or gate.blocked_operation_id != operation.operation_id
-        ):
+        if not self._gate_fences(gate, operation.operation_id):
             return None
 
         target = await self.rollouter.get_pending_target.remote(operation.operation_id)

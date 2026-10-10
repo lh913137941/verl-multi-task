@@ -1,6 +1,8 @@
+import hashlib
 """Native Fully Async server manager plus the Manager-owned M view."""
 
 import asyncio
+from functools import partial
 import time
 
 import ray
@@ -16,16 +18,14 @@ from multi_task_scheduler.orchestration.contracts import (
     ReplicaKey,
     ReplicaKind,
     ReplicaState,
+    native_replica_key,
 )
 from multi_task_scheduler.rollout.load_balancer import MultiTaskGlobalRequestLoadBalancer
 from multi_task_scheduler.rollout.replica import MultiTaskvLLMReplica
 
 _ALLOWED = {
     ReplicaState.CREATING: {ReplicaState.ACTIVE, ReplicaState.RELEASED, ReplicaState.QUARANTINED},
-    ReplicaState.ACTIVE: {
-        ReplicaState.DRAINING,
-        ReplicaState.QUARANTINED,
-    },
+    ReplicaState.ACTIVE: {ReplicaState.DRAINING},
     ReplicaState.DRAINING: {
         ReplicaState.ACTIVE,
         ReplicaState.DORMANT,
@@ -50,7 +50,15 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
         task_session=None,
     ):
         self.task_session = task_session
-        self.rollout_replica_class = MultiTaskvLLMReplica
+        # Native VERL otherwise gives independent jobs identical named PGs
+        # (rollout_pool_0verl_group_1:0) in the shared Ray namespace.
+        # Scope native PG/CE/server names to the actual TaskRunner session.
+        # Borrowed creates override name_suffix with their lease/epoch identity.
+        self.rollout_replica_class = (
+            partial(MultiTaskvLLMReplica, name_suffix=f"mt_{task_session}")
+            if task_session
+            else MultiTaskvLLMReplica
+        )
         super().__init__(config, worker_group, rollout_resource_pool)
         self._load_balancer_cls = MultiTaskGlobalRequestLoadBalancer
         self.replica_state: dict[ReplicaKey, ReplicaState] = {}
@@ -72,15 +80,13 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             # must prove the same runtime API surface before entering M=ACTIVE.
             await replica.validate_server_runtime()
             rank = getattr(replica, "replica_rank", index)
-            key = ReplicaKey(self.task_session, f"native-{rank}", 0)
+            key = native_replica_key(self.task_session, rank)
             self.register_replica(
                 key,
                 ReplicaKind.NATIVE,
                 state=ReplicaState.ACTIVE,
                 runtime=replica,
             )
-            if type(rank) is not int or rank < 0:
-                raise ValueError("native replica_rank must be a nonnegative integer")
             self.next_replica_rank = max(self.next_replica_rank, rank + 1)
 
     async def _init_global_load_balancer(self) -> None:
@@ -153,22 +159,6 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
     def inspect_runtime(self, key: ReplicaKey):
         return self._runtime_inventory.get(key)
 
-    async def runtime_loss_verified(self, key: ReplicaKey) -> bool:
-        """Return True only for runtime-owned permanent server-loss proof."""
-        if not isinstance(key, ReplicaKey):
-            raise TypeError("runtime_loss_verified requires ReplicaKey")
-        if self.replica_state.get(key) not in {
-            ReplicaState.ACTIVE,
-            ReplicaState.DRAINING,
-        }:
-            return False
-        runtime = self._runtime_inventory.get(key)
-        if runtime is None:
-            # Missing owner-local inventory is inconsistent, but it does not
-            # prove that the physical/runtime actors are dead.
-            return False
-        return bool(await runtime.runtime_loss_verified())
-
     def query_release_evidence(
         self,
         key: ReplicaKey,
@@ -202,19 +192,29 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
             return evidence
         return None
 
-    def deactivate_service(self, key: ReplicaKey):
-        """Remove one runtime from native active-service lists without destroying it."""
+    def _service_slot(self, key: ReplicaKey, *, require_route: bool):
         runtime = self._runtime_inventory.get(key)
         if runtime is None:
             raise KeyError(key)
         address = getattr(runtime, "_server_address", None)
         handle = getattr(runtime, "_server_handle", None)
-        index = None
-        if address in self.server_addresses:
-            index = self.server_addresses.index(address)
-            if index >= len(self.server_handles) or self.server_handles[index] != handle:
-                raise RuntimeError("native service address/handle inventory is inconsistent")
+        if require_route and (
+            not isinstance(address, str) or not address or handle is None
+        ):
+            raise RuntimeError("native runtime lacks a routable server identity")
+        index = self.server_addresses.index(address) if address in self.server_addresses else None
+        if (
+            index is not None
+            and (index >= len(self.server_handles) or self.server_handles[index] != handle)
+        ):
+            raise RuntimeError("native service address/handle inventory is inconsistent")
+        return runtime, address, handle, index
 
+    def deactivate_service(self, key: ReplicaKey):
+        """Remove one runtime from native active-service lists without destroying it."""
+        runtime, _address, _handle, index = self._service_slot(
+            key, require_route=False
+        )
         if runtime in self.rollout_replicas:
             self.rollout_replicas.remove(runtime)
         if index is not None:
@@ -224,25 +224,12 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
 
     def activate_service(self, key: ReplicaKey):
         """Restore one retained runtime to native active-service lists."""
-        runtime = self._runtime_inventory.get(key)
-        if runtime is None:
-            raise KeyError(key)
-        address = getattr(runtime, "_server_address", None)
-        handle = getattr(runtime, "_server_handle", None)
-        if not isinstance(address, str) or not address or handle is None:
-            raise RuntimeError("native runtime lacks a routable server identity")
-        existing_index = None
-        if address in self.server_addresses:
-            existing_index = self.server_addresses.index(address)
-            if (
-                existing_index >= len(self.server_handles)
-                or self.server_handles[existing_index] != handle
-            ):
-                raise RuntimeError("native service address/handle inventory is inconsistent")
-
+        runtime, address, handle, index = self._service_slot(
+            key, require_route=True
+        )
         if runtime not in self.rollout_replicas:
             self.rollout_replicas.append(runtime)
-        if existing_index is None:
+        if index is None:
             self.server_addresses.append(address)
             self.server_handles.append(handle)
         return runtime
@@ -444,6 +431,9 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
 
             # Keep ownership of the runtime before any awaited initialization so
             # a failing init can still report/perform verified cleanup.
+            lease_name = hashlib.sha256(
+                lease_id.encode("utf-8")
+            ).hexdigest()[:12]
             runtime = self.rollout_replica_class(
                 replica_rank=resolved_spec["replica_rank"],
                 config=self.rollout_config,
@@ -453,6 +443,10 @@ class MultiTaskLLMServerManager(FullyAsyncLLMServerManager):
                 placement_claims=resolved_spec["claims"],
                 runtime_epoch=resolved_spec["placement_epoch"],
                 max_colocate_count=FIRST_RELEASE_MAX_COLOCATE_COUNT,
+                name_suffix=(
+                    f"borrowed_{lease_name}_"
+                    f"{resolved_spec['placement_epoch']}"
+                ),
             )
             runtime_receipt = await runtime.init_from_lease(
                 resolved_spec,

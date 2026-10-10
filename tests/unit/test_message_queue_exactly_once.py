@@ -174,3 +174,31 @@ def test_completion_ledger_is_disk_backed_and_exact_after_many_samples():
         )
 
     assert queue.total_produced == 128
+
+
+def test_native_enqueue_ambiguous_ack_remains_fail_closed(monkeypatch):
+    """After a possible enqueue, a lost ACK must not admit the same sample twice."""
+    Queue, _ = queue_class()
+    queue = Queue({}, max_queue_size=8, task_session="task-a")
+    payload = pickle.dumps(Sample("sample-ack-lost", (1, 2, 3)))
+    native_put = Parent.put_sample
+
+    async def put_then_lose_ack(self, sample):
+        await native_put(self, sample)
+        raise RuntimeError("native enqueue acknowledgement lost")
+
+    monkeypatch.setattr(Parent, "put_sample", put_then_lose_ack)
+    with pytest.raises(RuntimeError, match="acknowledgement lost"):
+        asyncio.run(queue.put_sample_once(payload))
+
+    row = queue._completion_db.execute(
+        "SELECT dropped_oldest FROM completion_evidence "
+        "WHERE task_session = ? AND logical_sample_id = ?",
+        ("task-a", "sample-ack-lost"),
+    ).fetchone()
+    assert row == (None,)
+
+    with pytest.raises(RuntimeError, match="unresolved enqueue"):
+        asyncio.run(queue.put_sample_once(payload))
+    assert queue.total_produced == 1
+    assert len(queue.queue) == 1

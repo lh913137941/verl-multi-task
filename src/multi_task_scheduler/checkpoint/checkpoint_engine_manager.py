@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 
 import ray
 from verl.checkpoint_engine.base import CheckpointEngineManager
 from verl.single_controller.ray import RayWorkerGroup
+from verl.utils.device import get_device_name
 
 from multi_task_scheduler.orchestration.contracts import (
     EvidenceType,
@@ -26,8 +28,8 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         self._effective_replica_map = {}
         self._pending_bootstrap_map = {}
         self._bootstrap_ready_map = {}
-        # Runtime parameter auditing is opt-in. Normal synchronization remains native VERL.
-        import os
+        # Imported from verl_expansion main as an opt-in acceptance check.
+        # The default path remains byte-for-byte native CE transfer semantics.
         self.parameter_validation_enabled = (
             os.environ.get("MULTITASK_PARAMETER_VALIDATION", "0") == "1"
             or os.environ.get("MULTITASK_SOURCE_VALIDATION", "0") == "1"
@@ -151,12 +153,17 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
         self._effective_replica_map[key] = entry
 
     def remove_effective(self, key: ReplicaKey) -> None:
-        self.discard_pending(key)
-        entry = self._effective_replica_map.pop(key, None)
+        entry = self._effective_replica_map.get(key)
         if entry is None:
+            self.discard_pending(key)
             return
         replicas, _loaded_version = entry
+        # Native effective membership must be removed before we discard CE
+        # ownership evidence. If native removal raises, preserve the E record
+        # and bootstrap receipt for exact-operation reconciliation under G.
         super().remove_replicas(list(replicas))
+        self._effective_replica_map.pop(key, None)
+        self.discard_pending(key)
 
     def mark_all_loaded_version(self, loaded_version: int) -> None:
         if type(loaded_version) is not int or loaded_version < 0:
@@ -397,6 +404,7 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             ray_cls_with_init=replicas[0].get_ray_class_with_init_args(),
             name_prefix=f"bootstrap_{operation_id}_",
             use_gpu=True,
+            device_name=get_device_name(),
         )
         actor_wg = self.actor_wg
         topology_started = False
@@ -429,10 +437,22 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                 )
                 if not released_gpu_uuids:
                     raise RuntimeError(
-                        "native RESTORE target has no verified physical GPU UUID"
+                        "native RESTORE target has no verified physical accelerator id"
                     )
                 await asyncio.gather(
                     *[replica.wake_up(tags=["weights"]) for replica in replicas]
+                )
+                print(
+                    "RESTORE_BOOTSTRAP_STAGE "
+                    + json.dumps(
+                        {
+                            "stage": "weights-wake-complete",
+                            "operation_id": operation_id,
+                            "replica": repr(key),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
                 )
 
             # Borrowed ADD targets are resident and use VERL's native
@@ -445,6 +465,18 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
 
             topology_started = True
             self.build_process_group(rollout)
+            print(
+                "RESTORE_BOOTSTRAP_STAGE "
+                + json.dumps(
+                    {
+                        "stage": "checkpoint-topology-ready",
+                        "operation_id": operation_id,
+                        "replica": repr(key),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
             # Keep native VERL synchronization semantics here. Its
             # CheckpointEngineManager.update_weights() is async but deliberately
@@ -452,12 +484,36 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
             # only this target path to a background thread/future would let the
             # Trainer event loop progress while G still protects an in-flight
             # collective, diverging from the native ordering contract.
+            print(
+                "RESTORE_BOOTSTRAP_STAGE "
+                + json.dumps(
+                    {
+                        "stage": "weight-transfer-start",
+                        "operation_id": operation_id,
+                        "replica": repr(key),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
             ray.get(
                 actor_wg.update_weights(
                     global_steps=loaded_version,
                     mode=self.backend,
                 )
                 + rollout.update_weights(global_steps=loaded_version)
+            )
+            print(
+                "RESTORE_BOOTSTRAP_STAGE "
+                + json.dumps(
+                    {
+                        "stage": "weight-transfer-complete",
+                        "operation_id": operation_id,
+                        "replica": repr(key),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
             )
 
             ray.get(
@@ -469,9 +525,33 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                 )
             )
             finalized = True
+            print(
+                "RESTORE_BOOTSTRAP_STAGE "
+                + json.dumps(
+                    {
+                        "stage": "checkpoint-finalize-complete",
+                        "operation_id": operation_id,
+                        "replica": repr(key),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
             await asyncio.gather(
                 *[replica.resume_kv_cache() for replica in replicas]
+            )
+            print(
+                "RESTORE_BOOTSTRAP_STAGE "
+                + json.dumps(
+                    {
+                        "stage": "kv-resume-complete",
+                        "operation_id": operation_id,
+                        "replica": repr(key),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
             )
             health = await asyncio.gather(
                 *[replica.validate_server_runtime() for replica in replicas]
@@ -481,18 +561,21 @@ class MultiTaskCheckpointEngineManager(CheckpointEngineManager):
                     "target server did not confirm the published parameter version"
                 )
 
-            # No WEIGHT_READY until each requested receiver validates, when enabled.
             if self.parameter_validation_enabled:
                 source_manifest = (
                     await self._get_source_manifest()
-                    if self.source_validation_enabled else None
+                    if self.source_validation_enabled
+                    else None
                 )
                 validation = await self.validate_parameter_sync(
                     replicas,
                     expected_version=loaded_version,
                     source_manifest=source_manifest,
                 )
-                print("CE_PARAMETER_VALIDATION " + json.dumps(validation, sort_keys=True))
+                print(
+                    "CE_PARAMETER_VALIDATION "
+                    + json.dumps(validation, sort_keys=True)
+                )
 
             evidence = OperationEvidence.now(
                 operation_id,

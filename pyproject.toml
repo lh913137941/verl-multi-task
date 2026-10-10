@@ -19,9 +19,12 @@ include = ["multi_task_scheduler*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/unit"]
+pythonpath = ["src"]
 addopts = "-ra --strict-markers"
 markers = [
   "native: imports the actual verl and backend dependencies",
   "ray_integration: starts real CPU Ray actors (no verl or GPU training)",
   "gpu_integration: requires explicit real CUDA/vLLM/model acceptance environment",
+  "npu_integration: requires real Ascend NPU/vLLM-Ascend/model acceptance environment",
+  "npu_backend_smoke: requires real Ascend NPU and validates vanilla VERL/vLLM-Ascend load+generate",
 ]

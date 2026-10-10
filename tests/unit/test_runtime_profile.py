@@ -50,6 +50,49 @@ def test_valid_profile_is_not_mutated():
     assert current == before
 
 
+def npu_config():
+    current = config()
+    current["trainer"]["device"] = "npu"
+    ce = current["actor_rollout_ref"]["rollout"]["checkpoint_engine"]
+    ce["backend"] = "multitask_hccl"
+    ce["custom_backend_module"] = "multi_task_scheduler.checkpoint.hccl_checkpoint_engine"
+    ce["engine_kwargs"] = {"multitask_hccl": {"rebuild_group": True}}
+    return current
+
+
+def test_npu_profile_is_valid_after_verl_device_autodetection():
+    current = npu_config()
+    before = copy.deepcopy(current)
+    assert validate_runtime_profile(current)
+    assert current == before
+
+
+def test_npu_runtime_rejects_broken_native_hccl_teardown_and_unloaded_extension():
+    current = npu_config()
+    current["actor_rollout_ref"]["rollout"]["checkpoint_engine"]["backend"] = "nccl"
+    with pytest.raises(ProfileConfigurationError, match="multitask_hccl"):
+        validate_runtime_profile(current)
+
+    current = npu_config()
+    current["actor_rollout_ref"]["rollout"]["checkpoint_engine"]["custom_backend_module"] = None
+    with pytest.raises(ProfileConfigurationError, match="custom_backend_module"):
+        validate_runtime_profile(current)
+
+
+def test_npu_dynamic_group_requires_rebuild_on_compatible_backend():
+    current = npu_config()
+    current["actor_rollout_ref"]["rollout"]["checkpoint_engine"]["engine_kwargs"]["multitask_hccl"]["rebuild_group"] = False
+    with pytest.raises(ProfileConfigurationError, match="multitask_hccl.rebuild_group"):
+        validate_runtime_profile(current)
+
+
+def test_cuda_profile_rejects_npu_only_hccl_backend():
+    current = config()
+    current["actor_rollout_ref"]["rollout"]["checkpoint_engine"]["backend"] = "multitask_hccl"
+    with pytest.raises(ProfileConfigurationError, match="backend='nccl'"):
+        validate_runtime_profile(current)
+
+
 @pytest.mark.parametrize(
     "disabled",
     [
@@ -90,7 +133,7 @@ def test_enabled_switch_requires_boolean(value):
         ("actor_rollout_ref.rollout.calculate_log_probs", False),
         ("actor_rollout_ref.rollout.enable_sleep_mode", False),
         ("actor_rollout_ref.rollout.free_cache_engine", False),
-        ("trainer.device", "npu"),
+        ("trainer.device", "cpu"),
         ("data.train_batch_size", 1),
         ("data.gen_batch_size", 2),
     ],

@@ -1,165 +1,273 @@
 # verl-multi-task
 
-可选的 VERL experimental Fully Async 扩展包。继续使用原生训练入口，通过
-`multitask.enabled=true` 选择 MultiTask 创建链；默认关闭。
+面向 VERL experimental Fully Async 的多任务共享调度扩展。
 
-当前实现合同：`docs/simplified-fusion-contract.md`（092203）。本轮实现目标是把
-控制面和 owner 状态收敛到该合同，同时保留未验证 GPU 原语的显式失败边界。
+本仓不替换 VERL 训练入口，也不复制一套训练框架；它在原生 Fully Async +
+STANDALONE + vLLM 链路上增加：
 
-## 安装与接入
+- 多任务共享资源生命周期：`ADD / DONATE / REMOVE / RESTORE`；
+- borrowed replica 的动态创建、装参、发布和回收；
+- FORCE REMOVE 的 targeted abort + continuation；
+- Lease / operation evidence / request owner 的 fail-closed 控制面；
+- 参数同步门、Exactly-once、异常恢复和 E2E 验收；
+- CUDA 与 Ascend NPU 的设备级 acceptance 入口。
 
-在已经能运行 VERL 的训练环境中安装本仓：
+> 当前实现合同以 [simplified-fusion-contract.md](docs/simplified-fusion-contract.md) 为准；
+> [详细设计（092401）](docs/多RL任务共享调度对接VERL_动态流程编排融合设计精简优化版092401.md) 用于流程与接口评审，
+> 最新实现与设计存在差异时以代码和验收证据为准；
+> 完整验收规则见 [e2e-acceptance.md](docs/e2e-acceptance.md)。
+> 交付文件职责与分层验证见 [开发与综合验收](docs/development-and-comprehensive-acceptance.md)。
 
-```bash
-uv pip install --python /path/to/training/python /path/to/verl-multi-task
-# 开发时：
-uv pip install --python /path/to/training/python -e /path/to/verl-multi-task
-```
+---
 
-Driver、所有 Ray 节点及其运行环境都需要安装同一份扩展包，并使用兼容的
-VERL/Ray/vLLM 环境。安装本包不会替换这些运行时依赖。
+## 1. 当前支持范围
 
-仍使用 VERL 原生入口：
+本仓目前对接 VERL 的 **experimental Fully Async + 独立 vLLM Rollout**，启用 MultiTask 后自动选择唯一支持的运行配置，普通使用者无需填写 Runtime Profile 名称。
 
-```bash
-python -m verl.experimental.fully_async_policy.fully_async_main
-```
+| 项目 | 当前边界 |
+| --- | --- |
+| 设备 | CUDA GPU / Ascend NPU（不支持 CPU-only 资源借还） |
+| 部署 | 独立 Rollout；单节点，TP / DP / PP = 1 / 1 / 1 |
+| 资源共享 | 整张物理 GPU/NPU 的借还；不支持把 0.5 Ray 资源份额视为半张卡 |
+| 生命周期 | ADD、DONATE、natural REMOVE、RESTORE |
+| FORCE REMOVE | 仅 BORROWED，要求部分生成、其他可用 Server、真实续推证明 |
+| 参数同步 | CUDA 使用原生 NCCL；Ascend NPU 使用 `multitask_hccl` |
+| 暂不支持 | Hybrid、PD/disaggregation、未合并 LoRA 的借卡等未验证组合 |
 
-需要 VERL 入口具备 MultiTask 选择接线：配置规范化后、`run_ppo` 初始化 Ray 前，
-按 `multitask.enabled` 延迟解析 `MultiTaskFullyAsyncTaskRunner`。本包不使用
-`verl.plugins` 自动加载、不 monkey patch 原生类，也不提供另一份训练入口。当前
-v0.10.0.dev 基线固定到 VERL commit `f92febf50fe3db102273eaf59b1854f392ae761d`；
-对应入口接线已提交到 `lh913137941/verl:chatgpt/092203-multitask-entry`
-(commit `9f5b131195f848c9d78347179ed02f6fe48c42fc`)，并随本仓
-`patches/verl-v0.10-fully-async-multitask-entry.patch` 一并交付。
+**验收现状**：真实 NPU 双任务已完成共享 GS 注册、自动 Lease 物理身份校验和 lifecycle / force 验收；不代表所有场景及真实在途 FORCE 均已通过。以最新运行的 `orchestration_summary.json` 和 [GitHub Actions](https://github.com/lh913137941/verl-multi-task/actions) 为准。
 
-## 首版 profile
+所有关键操作采用 **fail-closed**：无法证明资源释放、参数版本或请求安全交接时，不会直接返回成功。
 
-唯一支持的 profile 是 `experimental_fully_async_standalone`。当前首版边界：
+---
 
-- experimental Fully Async；
-- pure STANDALONE；
-- vLLM、non-PD；
-- 单节点；
-- 整卡借还（物理独占由 GS 的 `pg_id/bundle_index + gpu_uuid` owner 保证；Ray actor 资源记账不是物理份额）；
-- DP=1、PP=1；
-- 当前已记录的真实 GPU 验收只覆盖 TP=1；TP>1 在补齐同卡借还/RESTORE 实测前由 runtime profile fail-closed；
-- `async_training.use_trainer_do_validate=false`；
-- `async_training.use_dynamic_resource_scheduling=false`。
+## 2. 主要流程：如何借卡、还卡
 
-最小接入参数示例：
+正常训练仍由 VERL Fully Async 驱动；MultiTask 只在共享调度操作发生时接管对应资源生命周期：
 
-```text
-multitask.enabled=true
-actor_rollout_ref.hybrid_engine=false
-actor_rollout_ref.rollout.name=vllm
-actor_rollout_ref.rollout.mode=async
-actor_rollout_ref.rollout.checkpoint_engine.backend=nccl
-actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nccl.rebuild_group=true
-actor_rollout_ref.rollout.calculate_log_probs=true
-async_training.use_trainer_do_validate=false
-async_training.use_dynamic_resource_scheduling=false
-data.train_batch_size=0
-data.gen_batch_size=1
-```
+| 操作 | 执行流程 | 完成证据 |
+| --- | --- | --- |
+| **DONATE（出借）** | Native 停止接收新请求 → 等已有请求结清 → 退出服务/参数同步集合 → 休眠原 Runtime | `RELEASED` |
+| **ADD（借入）** | 根据 Lease 在借出资源上创建隐藏 Borrowed Runtime → 同步当前模型权重 → 注册路由并对外服务 | `SERVICE_COMMITTED` |
+| **REMOVE（归还）** | Borrowed 停止接新请求 → 等待请求结清 → 退出服务 → 销毁 Borrowed Runtime，归还卡 | `RELEASED` |
+| **RESTORE（恢复）** | 原 Native Runtime 唤醒 → 同步最新权重、恢复 KV/服务 → 重新参与生成 | `SERVICE_COMMITTED` |
 
-`multitask.enabled=false` 或省略 `multitask.enabled` 时继续走原生 TaskRunner；单独设置 `multitask.runtime.profile` 不会隐式启用 MultiTask。显式启用后，缺包、缺依赖、profile 不匹配或首版拓扑不满足都会报错，不静默回退到原生 MultiTask 路径。
+典型借还链路：**DONATE → ADD → REMOVE → RESTORE**。需要强制回收时，只有 Borrowed Replica 可走 **FORCE REMOVE**：旧请求必须完成 abort 和可验证 continuation，在另一可用 Server 续推，不能直接丢弃在途请求。
 
-## 创建链与状态所有者
+注意：DONATE 返回的 `RELEASED` 表示**物理卡使用权已释放**，但原 Native Replica 的状态仍为 `DORMANT`，等待 RESTORE；Borrowed 被销毁后才进入 `RELEASED` 状态。
 
-```text
-VERL main → resolve_runtime_profile → run_ppo
-  → MultiTaskFullyAsyncTaskRunner
-    ├─ MultiTaskFullyAsyncTrainer
-    │  └─ MultiTaskCheckpointEngineManager
-    └─ MultiTaskFullyAsyncRollouter
-       └─ MultiTaskLLMServerManager
-          ├─ MultiTaskGlobalRequestLoadBalancer
-          └─ MultiTaskvLLMReplica
-             ├─ VERL CheckpointEngineWorker
-             └─ MultiTaskvLLMHttpServer
-```
+---
 
-092203 合同只保留四份 owner 真值：
+## 3. 组件分工：哪些模块负责什么
 
-- **M / Manager**：`replica_state[ReplicaKey]`、`replica_kind[ReplicaKey]`；
-- **E / CE Manager**：`effective_replicas` 和参数侧事实；
-- **R / LB**：原生 route/inflight + `active_request_server` + `attempt_state`；SETTLED request 只保留有界 ACK-loss 查询窗口，超出窗口时连同旧 continuation proof 一并回收；
-- **C / Rollouter**：复用原生 `max_concurrent_samples`，生产窗口复用 `paused`。
+| 组件 | 职责 |
+| --- | --- |
+| **GS / GroupScheduler** | 任务注册、Lease/资源归属账本、操作分发 |
+| **TaskRunner** | 每个任务的控制入口；编排操作、查询进度和异常对账 |
+| **Trainer / G** | 保留原生训练和更新权重流程；参数同步与生命周期操作通过同一同步闸门 |
+| **E / CheckpointEngineManager** | 参与权重同步的副本、Bootstrap 和模型参数版本 |
+| **Rollouter / C** | 生成流程、生产容量、请求 drain 与服务发布 |
+| **M / LLMServerManager** | Native/Borrowed Replica 的创建、休眠、唤醒、销毁及状态 |
+| **R / LoadBalancer** | 服务路由、请求准入、在途请求和续推回执 |
 
-Trainer 持有唯一同步门 G。不存在公共 `ReplicaRecord` 或 `AttemptRecord`。
-生命周期状态只有 `CREATING / ACTIVE / DRAINING / DORMANT / RELEASED /
-QUARANTINED`。
+各模块只维护自己的事实，不使用一份重复的全局状态。操作采用 `OperationCommand` 分发，通过 `OperationRecord / OperationEvidence` 查询与证明结果；超时、ACK 丢失则按**同一 operation_id** 对账，不盲目重做资源变更。详细状态和接口见 [设计合同](docs/simplified-fusion-contract.md)。
 
-公共生命周期结构收敛为：
+---
+
+## 4. 与 VERL 的接线关系
+
+**入口不变、训练主循环不变。** VERL 原生 `fully_async_main` 在 `multitask.enabled=true` 时选择 MultiTask TaskRunner；否则使用原生 TaskRunner。MultiTask 通过少量 subclass 复用 VERL 的原生 Trainer、Rollouter、vLLM 和 Checkpoint Engine。
 
 ```text
-OperationCommand(operation_id, kind, target, lease_id, force?)
-OperationRecord(operation_id, status, result?)
-OperationEvidence(operation_id, type, timestamp, released_gpu_uuids=())
-Lease(lease_id, claims, expires_at)
+VERL fully_async_main（原生启动入口）
+  └─ MultiTaskFullyAsyncTaskRunner（每个任务一个）
+       ├─ MultiTaskFullyAsyncTrainer（继承 FullyAsyncTrainer）
+       │    └─ MultiTaskCheckpointEngineManager → CheckpointEngine Worker
+       ├─ MultiTaskFullyAsyncRollouter（继承 FullyAsyncRollouter）
+       │    └─ MultiTaskLLMServerManager
+       │         ├─ MultiTaskGlobalRequestLoadBalancer
+       │         └─ MultiTaskvLLMReplica → MultiTaskvLLMHttpServer
+       └─ MultiTaskMessageQueue（完成样本恰好一次提交）
+
+多个 TaskRunner ↔ 同一个 GroupScheduler（GS，独立 Ray Actor）
 ```
 
-`ReplicaKey` 只是共享身份。Lease 的 claim 至少携带 Ray `pg_id/bundle_index`
-调度键和 `node_id/gpu_uuid` 物理校验键；首版只允许整 GPU claim，并要求 borrowed
-`world_size` 严格等于 borrower 任务自己的 TP×DP×PP 拓扑，不能仅凭 claim 数改变模型并行拓扑。
+**正常训练数据流：** VERL 初始化 Trainer/独立 Rollout Server → 参数同步 → AgentLoop 经 LB 请求 vLLM 生成 → MessageQueue 提交完成样本 → Trainer 消费样本并更新权重；MultiTask 保留原生业务循环。
 
-## 当前已落代码的控制面能力
+**跨任务控制流：** Rollouter 上报可借资源 → GS 管理 Lease 和分发操作 → 对应 TaskRunner 调用 Trainer/Rollouter 的生命周期动作 → Manager、Checkpoint Engine 和 LB 更新各自事实 → TaskRunner 返回 Evidence，GS 再推进 Lease。E2E 使用同一控制接口执行实际操作。
 
-- TaskRunner 使用有限并发，让原生长时间 `run()` 执行期间仍能处理 GS 的
-  `submit_operation/query_operation`；operation journal 用锁保护；
-- 原生 STANDALONE replicas 初始化完成后登记为 `NATIVE/ACTIVE`，供 M 和空泡判断读取；borrowed ADD 一经 Manager 接受就用同一 `ReplicaKey` 登记为 `BORROWED/CREATING`，创建结果未能证明成功时收口到 `QUARANTINED`，不会跳过 M 直接发布服务；
-- LB 复用当前 VERL router API，并补逐 request `ADMITTED/TERMINATED/SETTLED`；新增 `commit_ready()` 在 LB 单写者内原子登记 server + `ReplicaKey→server_id` route，并保存 operation-scoped `SERVICE_COMMITTED` receipt，ACK 丢失可用 `query_ready_operation()` 对账而不重复上架；
-- 自然 release 进入 `SETTLED`；已验证 continuation 先进入 `TERMINATED`，随后由迟到 release 或退出提交收敛到 `SETTLED`；
-- GS 维护最小 Lease 账本；GS→TaskRunner 提交异常时保留已预写 operation/Lease reservation，`query_operation()` 的 UNKNOWN/空结果不再被解释成“确定未受理”，只能由同 command 重放或后续 evidence 对账。claim_id 永久绑定原 lease；首版一个 Lease 只覆盖一个完整 donor replica，且一个 lease_id 对应一次 borrower 生命周期。DONATE 的 RELEASED 只把已预留 claims 推进到 borrower handoff-ready，只有 borrowed REMOVE 的 RELEASED 才把 PG/bundle 与 GPU UUID 归还可授权池；RESTORE 受理后临时重新占住这些 claims 防止 wake 期间被新 lease 抢占，`SERVICE_COMMITTED` 通过同一 `advance_lease()` 关闭该周期并释放临时 reservation，下一轮借卡必须新 lease_id；首版固定 `max_colocate_count=2`，claim 的 `gpu_fraction=0.5` 仅是 Ray 调度记账份额，不能解释成“半张物理 GPU 可同时借给另一任务”；
-- RELEASED 必须与已登记的 `operation_id → lease_id` 对应，并完整覆盖 lease 的 GPU UUID 集合；runtime release 无法给出真实证据时 Manager 将目标从 DRAINING 收口到 QUARANTINED。TaskRunner 的同 operation UNKNOWN 重放会先查 Manager RELEASED 账本；若只是 E 已移除后的 R/C ACK 不确定，则在同一 G 下对账并解围栏，不重复释放物理资源；
-- native 参数同步继续复用原生实现，但进入同一个 Trainer G；CE Manager 增加 owner-local pending-bootstrap 投影，borrowed runtime 在 `WEIGHT_READY` 前不会进入父类 `replicas` effective set/普通全成员同步；`bootstrap_target()` 已复用原生 CE `prepare/build_topology/init/update/finalize` 协议只同步 pending target，并要求目标 server 的 `global_steps` 精确等于当前发布版本后才生成幂等 `WEIGHT_READY` receipt，匹配 operation 的证据才能提升为 effective；
-- Queue exactly-once 仍是原生样本之上的逻辑 key + digest 薄层；
-- 空泡上报只选择“移除后仍能保持当前 committed capacity”的 ACTIVE surplus replica，不再把所有 ACTIVE replica 都当作可捐候选；GS 对已有 idle report 的 DONATE 只接受 10s 内且包含目标 NATIVE ReplicaKey 的事实；Lease donor 按 Manager/Trainer 的规范身份 `native-{replica_rank}` 精确匹配，不再接受 `r{rank}` 命名别名；
-- borrowed placement 入口已在任何 Ray Actor 副作用前校验 borrower/source lease、claim、world_size、单节点 rank/local_rank、整卡约束和过期时间；Manager 同时按 borrower lease 建立幂等 `borrowed_operations` 记录并单调分配 `replica_rank`，相同 create 重试不会二次分配 rank、冲突重放会被拒绝；随后通过 Ray placement-group table 以 `pg_id` 核验 CREATED 状态、namespace、bundle/node 落点，并借 PG name 恢复后反查 handle id；Manager 内部 runtime backend 已接通 hidden borrowed runtime 创建和 verified borrowed destroy：创建成功只登记 `RUNTIME_READY/CREATING`，不会提前进入 E/R/C；destroy 只有在 server/worker 清理验证完成后才生成带完整 GPU UUID 的 `RELEASED`；`MultiTaskvLLMReplica` 进一步生成确定性的 borrower CE actor name、PG/bundle、Ray GPU/CPU 份额和 borrower rank/world 环境计划；底层 `_create_workers_from_claims()` 已按 claim clone `RayClassWithInitArgs`、建立 borrower 自己的 MASTER 通信根并用 `RayWorkerGroup.from_detached()` 包装新 handles，物理 placement 直接复用 VERL `CheckpointEngineWorker.__ray_call__` 执行只读 node/Ray accelerator/GPU UUID 探针；worker 创建后必须逐 rank 与 claim 核对 node/GPU UUID，失败时按确定性 actor name 执行 kill，并通过 Ray State API 确认不存在非 `DEAD` actor。`MultiTaskvLLMHttpServer` 现在还提供 vLLM `check_health()` 驱动的健康事实与单节点 graceful shutdown；`MultiTaskvLLMReplica.init_from_lease()` 能在底层完成 worker → 原生 `launch_servers()` → engine/server 健康校验，并在失败时按 server/worker 名称执行 shutdown/kill + Ray State `DEAD` 核验。该 hidden-create primitive 已由 Manager 调用，ADD 现已从 TaskRunner 正常受理，并通过 Trainer G 完成 target-only current-Vpub bootstrap、E 提交与 R/C/M 发布；无法证明创建/装参/发布结果时仍按 UNKNOWN/QUARANTINED 规则收口；
-- GS 句柄只保留在 TaskRunner/Rollouter 跨任务边界，不再下沉到 Manager/LB；Manager/LB 只维护本任务 M/R 与 runtime/request 事实；
-- 对外 `OperationCommand` 仍只携带 `lease_id`；GS 在转发给 TaskRunner 时附带同一份已校验 Lease 快照，TaskRunner 只在内部生成 borrowed placement spec，再交给 Rollouter/Manager 校验。
+**入口接线方式：** 本仓不复制另一份 VERL 启动程序。第 6 节 E2E 启动器会检查当前 Python 实际导入的 VERL 入口，必要时备份并安装最小选择桥接；手动接入见第 5 节。
 
-## 已接通但仍需真实 GPU/runtime 验收的能力
+---
 
-以下主流程代码已经接通并由 TaskRunner 受理，但仍必须在真实 VERL/vLLM/CUDA/NCCL 组合完成验收；运行时无法证明 placement、权重、请求交接或资源释放时会显式失败/隔离，不用假 handle 或合成证据伪造成功：
+## 5. 安装与准备
 
-- ADD：hidden borrowed create → current-Vpub target bootstrap → E → R/C/M 已端到端接线；纯 placement 校验失败、runtime 创建前失败、或已证明 borrowed cleanup 的失败会以 FAILED+RELEASED 补偿收口，不再误记 UNKNOWN；真实 GPU/NCCL 验收仍需实际执行；
-- DONATE：自然 drain → E/R/C 退出 → native level-2 sleep → GPU UUID `RELEASED` → GS handoff-ready 已端到端接线；自然 drain 由 `multitask.drain_timeout_s`（默认 300s）设单次等待上限并周期输出日志，超时后保持 DRAINING 与原 operation 绑定，后续同 operation 继续排空，不自动切 FORCE；真实同卡让渡闭环仍需实际执行；
-- RESTORE 已在内部复用现有 `pending_bootstrap / bootstrap_target / commit_ready` 串起流程；weights-only wake 已移入 Trainer G 内的 CE bootstrap，随后完成当前 Vpub 全量装参、KV 恢复/版本确认并先提交 E，再 full wake、本地 C/M 就绪，最后由 R 对外发布；LB 回包丢失先按 `query_ready_operation()` 对账；E 提交前的 CE/bootstrap 失败可在 G 内 verified re-sleep 回 DORMANT；E 已 effective 后若 R 明确未发布，则先撤 C/M、再由 Trainer 在 G 内撤 E，最后真实 re-sleep 并以 RELEASED 补偿；R 仍未知则保持 runtime awake/ACTIVE 并 BLOCK G，同 operation 重放会重新查询 R，只有向前补齐或验证回滚成功才解围栏。opt-in GPU 验收还会先真实修改 sender output weights，避免只靠 `global_steps` 标签过关；当前环境尚未跑通该 GPU 闭环，但 TaskRunner 已受理 RESTORE，运行时按证据失败/隔离；
-- FORCE_VERIFIED：borrowed-only targeted abort + continuation proof + partial-rollout retry 已接线；partial handoff 超时保留 DRAINING 并按同 operation 续跑，已发 abort 不重复执行；abort ACK 本身未知时只有原 ADMITTED request 全部取得 continuation proof 才允许恢复到 EXIT_READY。并有 opt-in 两 GPU 验收入口；当前会话未实际运行该 GPU 用例；
-- native sleep 后还需用真实 GPU 实验确认显存让渡足以让 borrower 在同一物理 GPU 启动；控制面 receipt/mock 不作为验收。
+先确保目标 VERL Fully Async 和 Ray/vLLM（Ascend 使用 vLLM-Ascend）本身能正常运行。本仓不会替代这些环境依赖。
 
-首版 whole-GPU 借还还要求 VERL `_resolve_sleep_level()==2`；因此 MTP rollout / unmerged LoRA rollout 等会退化为 level-1 sleep 的配置在 runtime profile 阶段直接拒绝，不能生成 `RELEASED`。
-
-paused production window 现在由 Rollouter 内部 reporter 自动向 GS 发送 idle metadata；相同候选集每 5s 刷新一次，避免 GS 长期持有陈旧 bubble 事实；报告失败只重试元数据，不中断生成。
-
-因此 `multitask.enabled=true` 目前表示“启用 092203 控制面与 native subclass
-绑定”，不表示 GPU 借还闭环已经通过验收。
-
-## 验证
-
-本分支应分层验证，不把 mock/AST 当作 GPU 成功：
+- **只运行第 6 节 E2E：** 可以从源码目录直接运行，启动器自动把 `src/` 配置给本次进程和新建的 Ray Worker；不要求额外 `pip install -e .`。
+- **开发或单测：** 在仓库根目录安装：
 
 ```bash
-# 依赖轻量 unit
+python -m pip install -e '.[test]'
+```
+
+- **手动通过原生 VERL 入口启动：** 设置 `multitask.enabled=true` 前，先检查接线：
+
+```bash
+python scripts/e2e/ensure_verl_multitask_bridge.py --check-only
+```
+
+当前仅有一种支持的 Runtime Profile，**无需手动填写 `experimental_fully_async_standalone`**。必要的运行约束由 [runtime_profile.py](src/multi_task_scheduler/integration/verl/runtime_profile.py) 检查，E2E 启动器会自动配置符合首版范围的参数。
+
+入口补丁位于 [patches/verl-v0.10-fully-async-multitask-entry.patch](patches/verl-v0.10-fully-async-multitask-entry.patch)。多节点使用时须确保各节点都能访问相同源码和依赖。
+
+---
+
+## 6. 双任务 E2E：实际执行命令
+
+你当前环境中的 `examples/e2e/native_args.txt` 已包含实际模型、训练集及验证集路径时，**直接运行下面这条命令即可**，不必另传 `--model-path`、`--train-files`、`--val-files`：
+
+```bash
+cd /workspace/n00873601/multi_rl_task_lh_clone/verl/multi_task_verl
+
+python scripts/e2e/verify_two_verl_jobs.py \
+  --repo . \
+  --ray-address auto \
+  --start-local-ray \
+  --native-args /workspace/n00873601/multi_rl_task_lh_clone/verl/multi_task_verl/examples/e2e/native_args.txt \
+  --scenarios "lifecycle force"
+```
+
+`--scenarios "lifecycle force"` 验证两条真实资源流程：
+`DONATE → ADD → REMOVE → RESTORE`，以及
+`DONATE → ADD → FORCE REMOVE → RESTORE`。
+
+启动器会自动启动 donor/borrower 两个 VERL driver、将其注册到同一个 GS、依据真实 donor Placement Group 和设备身份生成测试 Lease，并运行所选场景。
+
+**换机器或重新 clone 时先检查参数文件：** 仓库原始样例中的模型路径可能仍是 `/REPLACE_WITH_VERL_REPO_DIR/...` 占位符；必须先在 `native_args.txt` 中写好本机真实模型及数据路径。配置好后无需在命令行重复传路径。
+
+常用变化：需要全部五项验收时改为 `--scenarios "control_plane exactly_once recovery lifecycle force"`；有**持久/多机 Ray** 时改用 `--ray-address <head地址>` 并删除 `--start-local-ray`。不希望启动器自动备份/桥接 VERL 入口时加 `--no-auto-bridge`。
+
+---
+
+## 7. CUDA 与 Ascend NPU
+
+| 配置 | CUDA | Ascend NPU |
+| --- | --- | --- |
+| `trainer.device` | `cuda` | `npu`（当前 NPU 参数样例） |
+| Ray 资源 | `GPU` | `NPU` |
+| 权重同步 | 原生 `nccl` | `multitask_hccl`（底层 HCCL） |
+| Native sleep | 支持条件下 level 2 | 平台安全的 level 1 |
+
+使用第 6 节启动器时，权重同步后端会根据设备自动选择；不需要手工修改 CUDA/NPU backend。CUDA 需要自己的原生训练参数文件，不能直接照搬 `trainer.device=npu` 的 NPU 样例。
+
+NPU 环境诊断（只检查版本、设备与模型文件结构，不代表真实模型已加载）：
+
+```bash
+VERL_MULTITASK_NPU_MODEL_PATH=/实际模型路径/Qwen3-0.6B \
+  python scripts/e2e/diagnose_npu_runtime.py
+```
+
+如需验证真实模型加载、NPU sleep 或参数恢复，运行第 8 节硬件测试。
+
+---
+
+## 8. 测试：按运行环境选择
+
+`tests/` 只有两类：[unit](tests/unit/)（CPU 快速回归）和 [integration](tests/integration/)（真实 Ray、VERL 或 GPU/NPU）。
+在仓库根目录按需要运行：
+
+```bash
+# 日常必跑：无需原生 VERL 或加速卡
 python -m pytest -q tests/unit
 
-# 有 Ray 环境后
-python -m pytest -q -m ray_integration tests/integration
+# CPU Ray 控制面（需要 Ray）
+python -m pytest -q tests/integration/ray
 
-# 指向兼容的真实 VERL checkout 后
-MT_VERL_SOURCE_ROOT=/absolute/path/to/verl \
-python -m pytest -q -m native tests/native_unit
-
-# 真实 CUDA/vLLM；1 GPU 验 DONATE→同卡 borrower→REMOVE，>=2 GPU 继续验 current-Vpub RESTORE
-VERL_MULTITASK_GPU_MODEL_PATH=/path/to/local/model \
-python -m pytest -q -s -m gpu_integration tests/integration/test_native_sleep_gpu.py
+# VERL 原生接线（需要真实 VERL、Ray 等 Python 依赖）
+python -m pytest -q tests/integration/verl
 ```
 
-当前分支已由 GitHub Actions 执行 `python -m pytest -q tests/unit`；截至
-`4d6e12c6a21d84881eb942aeec489654105599c5` 的 unit workflow 为 success。
-这只证明依赖轻量的控制面/unit 回归网为绿；native Ray/VERL 与真实 CUDA/vLLM/NCCL
-验收仍必须按上面的分层命令单独执行，不能由 unit 结果替代。
+CUDA/NPU 硬件测试需在对应实机运行；以下以已配置的本地模型路径为例：
 
-详细设计以当前 092203 设计文档和 `docs/simplified-fusion-contract.md` 为准。
+```bash
+# Ascend NPU：先单测真实模型加载，再按需测试 sleep / FORCE / RESTORE
+export VERL_MULTITASK_NPU_MODEL_PATH=/实际模型路径/Qwen3-0.6B
+python -m pytest -q -s -m npu_backend_smoke tests/integration/npu/test_native_sleep_npu.py
+python -m pytest -q -s -m npu_integration tests/integration/npu/test_native_sleep_npu.py
+
+# CUDA：真实 vLLM 和模型、设备验收
+VERL_MULTITASK_GPU_MODEL_PATH=/实际模型路径 \
+  python -m pytest -q -s -m gpu_integration tests/integration/cuda/test_native_sleep_gpu.py
+```
+
+CUDA 环境基线测试位于 `tests/integration/cuda/test_baseline_environment.py`，
+运行前须设置 `MT_GPU_TEST_CONFIG`。单测及各集成层的依赖、命令与边界见
+[tests/README.md](tests/README.md)；具体 Unit 文件职责见
+[tests/unit/README.md](tests/unit/README.md)。
+
+---
+
+## 9. E2E 验收结果与排错
+
+`verify_two_verl_jobs.py` 是唯一推荐的启动入口；内部由 `run_all.sh` 分发到五个 `validate_*` 验收脚本，用户无需逐个运行。
+
+`--scenarios` 允许选择以下场景；只需更改第 6 节命令的最后一行：
+
+| 场景 | 验证 |
+| --- | --- |
+| `control_plane` | GS/Lease、操作回执与恢复 |
+| `exactly_once` | 完成样本去重、冲突拒绝 |
+| `recovery` | UNKNOWN、异常和故障注入 |
+| `lifecycle` | DONATE → ADD → REMOVE → RESTORE |
+| `force` | DONATE → ADD → FORCE REMOVE → RESTORE |
+
+日志在 `logs/two_real_jobs/<运行时间>/`，其中 `orchestration_summary.json` 汇总最终结果，具体场景错误在 `scenarios/<场景>/<运行ID>/result.json`。
+
+```bash
+RUN=$(ls -dt logs/two_real_jobs/*/ | head -n 1)
+cat "${RUN}orchestration_summary.json"
+find "${RUN}scenarios" -name result.json -print
+grep -E 'FAIL|BLOCKED|Traceback|Error' "${RUN}e2e.log" | tail -n 40
+```
+
+`STATE=PASS` 且所选场景均为 PASS 才算该轮通过；退出码 `0=PASS`、`1=FAIL`、`2=BLOCKED`（环境或证明条件不足）。定位失败先查对应场景 `result.json`，再查 `donor.log` / `borrower.log`。
+
+**FORCE 验证范围：** 默认 `force: PASS` 证明对应生命周期闭环，不一定命中真实在途请求；要严格要求真实在途 abort/continuation 证据，增加 `--require-inflight-force`（含 `force` 场景时使用）。
+
+更详细的验收、异常恢复与手动 Lease 调试见 [E2E 验收文档](docs/e2e-acceptance.md)。
+
+---
+
+## 10. 实现原则
+
+- **尽量不改 VERL 主流程**：通过原生入口选择和最小 subclass 接线；
+- **Owner 单写者**：Manager、Checkpoint Engine、LB、Rollouter、GS 分别维护自己的真实状态；
+- **关键操作要有证据**：物理资源释放、参数版本、请求交接不能靠配置或推测；
+- **同一操作对账**：ACK 丢失或 UNKNOWN 使用相同 `operation_id` 幂等重放；
+- **失败时安全封锁**：证据不完整时保持 DRAINING/BLOCKED/QUARANTINED，不能提前恢复流量。
+
+更完整的时序与回滚路径见 [设计合同](docs/simplified-fusion-contract.md)。
+
+---
+
+## 11. 代码导航
+
+| 代码位置 | 主要内容 |
+| --- | --- |
+| [`scheduler/`](src/multi_task_scheduler/scheduler/) | GroupScheduler、Lease、任务注册 |
+| [`orchestration/`](src/multi_task_scheduler/orchestration/) | 操作、证据及同步闸门 |
+| [`integration/verl/experimental_fully_async/`](src/multi_task_scheduler/integration/verl/experimental_fully_async/) | VERL TaskRunner / Trainer / Rollouter / Manager 接线 |
+| [`rollout/`](src/multi_task_scheduler/rollout/) | vLLM Replica、路由、服务 |
+| [`checkpoint/`](src/multi_task_scheduler/checkpoint/) | Checkpoint Engine、参数同步 |
+| [`scripts/e2e/`](scripts/e2e/) | 双任务真实运行、分场景测试、诊断 |
+| [`tests/`](tests/) | 单测、Ray、Native 与真实硬件测试 |
+
+设计细节见 [simplified-fusion-contract.md](docs/simplified-fusion-contract.md)，验收规则见 [e2e-acceptance.md](docs/e2e-acceptance.md)。
+
+---
+
+## 12. 设计与融合来源
+
+当前分支：[chatgpt/0928-merge-verl-expansion](https://github.com/lh913137941/verl-multi-task/tree/chatgpt/0928-merge-verl-expansion)。
+
+本仓从 simplified-fusion 合同出发，吸收了 `verl_expansion` 中与现有 Lease、Owner 和 Evidence 机制兼容的实现；[历史参考](docs/verl-expansion-reference/) 仅用于对照。发生冲突时以当前代码和 [设计合同](docs/simplified-fusion-contract.md) 为准。

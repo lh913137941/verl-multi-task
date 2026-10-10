@@ -4,6 +4,7 @@ import asyncio
 import inspect
 
 import ray
+from verl.utils.device import get_resource_name
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
 
@@ -45,10 +46,13 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
                 "cannot inspect vLLM engine.sleep signature"
             ) from exc
         parameters = sleep_signature.parameters
-        if "level" not in parameters or "mode" not in parameters:
+        if "level" not in parameters:
             raise RuntimeError(
-                "MultiTask requires vLLM engine.sleep(level=..., mode=...)"
+                "MultiTask requires vLLM engine.sleep(level=...)"
             )
+        # mode="abort" is used when the backend exposes it. vLLM-Ascend
+        # follows VERL's portable sleep(level=...) API without requiring mode;
+        # admission fencing plus request drain remain the safety boundary.
 
     async def runtime_health(self) -> dict:
         """Return first-release server/engine health facts or raise if unhealthy."""
@@ -94,6 +98,17 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         engine = getattr(self, "engine", None)
         if engine is not None:
             await engine.wait_for_requests_to_drain()
+            # vLLM V1 AsyncLLM.shutdown() tears down EngineCore before it
+            # cancels its background output_handler. The handler may observe
+            # that planned teardown as EngineDeadError and report a spurious
+            # ERROR even when every request drained successfully. Cancel it
+            # only at this final BORROWED shutdown boundary, while EngineCore
+            # is still alive; do not interfere with normal request processing
+            # or native sleep/RESTORE.
+            output_handler = getattr(engine, "output_handler", None)
+            if isinstance(output_handler, asyncio.Task) and not output_handler.done():
+                output_handler.cancel()
+                await asyncio.gather(output_handler, return_exceptions=True)
 
         server_task = getattr(self, "_server_task", None)
         if server_task is not None and not server_task.done():
@@ -132,7 +147,7 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         return getattr(self, "_multitask_sleep_stage_value", "awake")
 
     def _set_multitask_sleep_stage(self, stage: str) -> None:
-        if stage not in {"awake", "level2", "weights"}:
+        if stage not in {"awake", "level1", "level2", "weights"}:
             raise ValueError(f"invalid multitask sleep stage: {stage!r}")
         self._multitask_sleep_stage_value = stage
 
@@ -145,34 +160,47 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         """
         engine = self._require_sleep_engine()
         stage = self._multitask_sleep_stage()
-        if stage == "level2":
+        if stage in {"level1", "level2"}:
             if not await engine.is_sleeping():
-                raise RuntimeError("level-2 sleep ledger disagrees with vLLM engine")
+                raise RuntimeError("sleep ledger disagrees with vLLM engine")
             self._submission_paused = True
             self._resume_event.clear()
-            return self._receipt(sleep_level=2, sleeping=True)
+            return self._receipt(
+                sleep_level=int(stage.removeprefix("level")),
+                sleeping=True,
+            )
         if stage == "weights":
-            # Keep admission fenced; VERL owns KV restore/reset semantics.
             self._submission_paused = True
             self._resume_event.clear()
             if await engine.is_sleeping():
                 await super().resume_kv_cache()
                 if await engine.is_sleeping():
                     raise RuntimeError(
-                        "RESTORE rollback could not restore KV before deep sleep"
+                        "RESTORE rollback could not restore KV before sleep"
                     )
         elif stage != "awake":
             raise RuntimeError(
-                f"cannot enter level-2 sleep from partial stage {stage!r}"
+                f"cannot enter sleep from partial stage {stage!r}"
             )
 
-        # Reuse VERL's own compatibility decision (MTP/LoRA/NPU may only
-        # support level 1). Whole-GPU lending requires level 2, so fail before
-        # mutating the local admission gate when this runtime cannot satisfy it.
+        # Reuse VERL's backend compatibility decision. CUDA whole-GPU lending
+        # requires level 2. vLLM-Ascend currently exposes level 1 as its
+        # deepest supported NPU release primitive.
         sleep_level = self._resolve_sleep_level()
-        if sleep_level != 2:
+        resource_name = get_resource_name()
+        expected_level = (
+            2 if resource_name == "GPU"
+            else 1 if resource_name == "NPU"
+            else None
+        )
+        if expected_level is None:
             raise NotImplementedError(
-                "whole-GPU DONATE requires a vLLM configuration safe for level-2 sleep"
+                f"native sleep is unsupported for Ray resource {resource_name!r}"
+            )
+        if sleep_level != expected_level:
+            raise NotImplementedError(
+                f"{resource_name} DONATE requires vLLM sleep level {expected_level}, "
+                f"got {sleep_level}"
             )
 
         self._submission_paused = True
@@ -184,18 +212,18 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
         # abort mode cannot abort user work and is compatible with both async-MP
         # and in-process engine clients.
         await engine.wait_for_requests_to_drain()
-        await engine.sleep(level=2, mode="abort")
+        sleep_parameters = inspect.signature(engine.sleep).parameters
+        if "mode" in sleep_parameters:
+            await engine.sleep(level=sleep_level, mode="abort")
+        else:
+            await engine.sleep(level=sleep_level)
         if not await engine.is_sleeping():
-            raise RuntimeError("vLLM engine did not enter level-2 sleep")
-        self._set_multitask_sleep_stage("level2")
+            raise RuntimeError(
+                f"vLLM engine did not enter level-{sleep_level} sleep"
+            )
+        self._set_multitask_sleep_stage(f"level{sleep_level}")
 
-        return {
-            "replica_rank": self.replica_rank,
-            "node_rank": self.node_rank,
-            "sleep_level": 2,
-            "sleeping": True,
-            "global_steps": self.global_steps,
-        }
+        return self._receipt(sleep_level=sleep_level, sleeping=True)
 
     async def wake_up(self, tags: list[str] | None = None) -> dict:
         """Wake selected vLLM allocations while keeping admission fenced.
@@ -214,7 +242,7 @@ class MultiTaskvLLMHttpServer(vLLMHttpServer):
             if not sleeping_before:
                 raise RuntimeError("weights-wake ledger disagrees with vLLM engine")
             return self._receipt(sleeping=True, fully_awake=False)
-        if tags is None and stage == "level2":
+        if tags is None and stage in {"level1", "level2"}:
             raise RuntimeError(
                 "full native wake requires weights-only RESTORE preparation"
             )

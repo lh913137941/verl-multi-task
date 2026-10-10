@@ -4,34 +4,29 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 
 import ray
 from verl.experimental.fully_async_policy.fully_async_rollouter import (
     FullyAsyncAgentLoopManager,
     FullyAsyncRollouter,
 )
+from verl.experimental.reward_loop import RewardLoopManager
 from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
 
-from verl.single_controller.ray.base import _unwrap_ray_remote
+from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
 from multi_task_scheduler.orchestration.contracts import (
     AttemptState,
     EvidenceType,
     OperationEvidence,
     OperationRecord,
     ReplicaKey,
+    require_operation_evidence as _require_evidence,
     ReplicaKind,
     ReplicaState,
 )
 
 from .llm_server_manager import MultiTaskLLMServerManager
-
-
-def _require_evidence(value, operation_id: str, expected: EvidenceType, label: str):
-    if not isinstance(value, OperationEvidence):
-        raise TypeError(f"{label} did not return OperationEvidence")
-    if value.operation_id != operation_id or value.type is not expected:
-        raise ValueError(f"{label} evidence does not match {operation_id}/{expected.value}")
-    return value
 
 
 def _continuation_prefix_digest(prompt_ids, token_ids) -> str:
@@ -65,6 +60,23 @@ class _ContinuationAwareServer:
         output = await self._server.generate.remote(*args, **kwargs)
         if getattr(output, "stop_reason", None) not in {"abort", "aborted"}:
             return output
+
+        # VERL rewrites the remaining max_tokens budget after an aborted
+        # attempt, but currently leaves min_tokens at its original logical
+        # request value. Keep the same semantics for the minimum budget:
+        # tokens already produced before FORCE handoff count toward min_tokens.
+        sampling_params = kwargs.get("sampling_params")
+        emitted_tokens = len(getattr(output, "token_ids", ()) or ())
+        if (
+            isinstance(sampling_params, dict)
+            and emitted_tokens > 0
+            and isinstance(sampling_params.get("min_tokens"), int)
+            and not isinstance(sampling_params.get("min_tokens"), bool)
+        ):
+            sampling_params["min_tokens"] = max(
+                0,
+                sampling_params["min_tokens"] - emitted_tokens,
+            )
 
         # FullyAsyncLLMServerClient will retry exactly prompt_ids + token_ids.
         prefix_digest = _continuation_prefix_digest(
@@ -130,9 +142,7 @@ class _MultiTaskFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(
-            self._clear_release_fence(request_id, release_ref)
-        )
+        loop.create_task(self._clear_release_fence(request_id, release_ref))
 
     async def _acquire_server(self, request_id: str, **extra):
         release_ref = self._release_fences.get(request_id)
@@ -141,7 +151,42 @@ class _MultiTaskFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
             if self._release_fences.get(request_id) is release_ref:
                 self._release_fences.pop(request_id, None)
 
-        server_id, server = await super()._acquire_server(request_id, **extra)
+        # Native FullyAsyncLLMServerClient retries empty routing only when
+        # initialized in only-hybrid mode. MultiTask may instead temporarily
+        # remove the LAST standalone server during DONATE/REMOVE, then restore
+        # it via ADD/RESTORE. Do not let a valid no-service handoff kill the
+        # streaming generation worker; retry only with LB-confirmed evidence.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(
+            300.0,
+            float(getattr(getattr(self.config, "multitask", None),
+                          "drain_timeout_s", 300.0)),
+        )
+        waiting = False
+        while True:
+            try:
+                server_id, server = await super()._acquire_server(request_id, **extra)
+                break
+            except RuntimeError as exc:
+                if "No available servers in load balancer" not in str(exc):
+                    raise
+                if not await self._load_balancer.is_service_restore_pending.remote():
+                    # Empty at initial boot or due to unrelated failure: fail
+                    # fast, do not mask incorrect routing setup.
+                    raise
+                if not waiting:
+                    print(
+                        "[MultiTaskRollouter] no active rollout server during "
+                        "lifecycle handoff; waiting for ADD/RESTORE",
+                        flush=True,
+                    )
+                    waiting = True
+                if loop.time() >= deadline:
+                    raise TimeoutError(
+                        "No rollout server restored before lifecycle wait deadline; "
+                        "check DONATE/REMOVE/ADD/RESTORE operation evidence"
+                    ) from exc
+                await asyncio.sleep(0.5)
         if not self._continuation_enabled:
             return server_id, server
         return server_id, _ContinuationAwareServer(
@@ -152,8 +197,40 @@ class _MultiTaskFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         )
 
 
+class _TaskScopedRewardLoopManager(RewardLoopManager):
+    """Retain native reward calculation, but scope its named Ray workers to a task."""
+
+    def __init__(self, *args, task_session: str, **kwargs):
+        if not isinstance(task_session, str) or not task_session:
+            raise ValueError("RewardLoop workers require task_session")
+        self._task_session = task_session
+        super().__init__(*args, **kwargs)
+
+    def _init_reward_loop_workers(self):
+        # Native VERL hardcodes reward_loop_worker_{i}. This task-local override
+        # changes ONLY the name while preserving native node affinity and
+        # RewardLoopWorker constructor/compute_score_batch behavior.
+        self.reward_loop_workers = []
+        node_ids = [
+            node["NodeID"]
+            for node in ray.nodes()
+            if node["Alive"] and node["Resources"].get("CPU", 0) > 0
+        ]
+        for i in range(self.config.reward.num_workers):
+            node_id = node_ids[i % len(node_ids)]
+            self.reward_loop_workers.append(
+                self.reward_loop_workers_class.options(
+                    name=f"reward_loop_worker_{i}_mt_{self._task_session}",
+                    scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                        node_id=node_id,
+                        soft=True,
+                    ),
+                ).remote(self.config, self.reward_router_address)
+            )
+
+
 @ray.remote(num_cpus=10, max_concurrency=100)
-class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
+class MultiTaskFullyAsyncRollouter(unwrap_native_actor_class(FullyAsyncRollouter)):
     def __init__(
         self,
         config,
@@ -185,6 +262,7 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         self._natural_drain_timeout_s = float(timeout_value)
         self._idle_report_signature = None
         self._idle_report_last_sent = None
+        self._idle_report_task = None
         super().__init__(
             config,
             tokenizer,
@@ -205,6 +283,20 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                     raise
                 await asyncio.sleep(delay)
                 delay *= 2
+
+    async def _create_reward_loop_manager(self):
+        """Use native reward functionality with a task-scoped worker namespace."""
+        if not self.task_session:
+            raise RuntimeError("RewardLoop manager requires task_session")
+        loop = asyncio.get_running_loop()
+        self.reward_loop_manager = await loop.run_in_executor(
+            None,
+            lambda: _TaskScopedRewardLoopManager(
+                config=self.config,
+                rm_resource_pool=None,
+                task_session=self.task_session,
+            ),
+        )
 
     async def _init_async_rollout_manager(self):
         enable_agent_reward_loop = (
@@ -235,6 +327,91 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                 else None
             ),
         )
+
+        # Keep native FullyAsyncRollouter.fit() untouched.  This existing
+        # multitask-only initialization hook is the narrow place to attach the
+        # advisory idle reporter; it exits after the native fit lifecycle has
+        # been observed running and then stopped.
+        if self.group_scheduler is not None and (
+            self._idle_report_task is None or self._idle_report_task.done()
+        ):
+            self._idle_report_task = asyncio.create_task(self._idle_report_loop())
+
+    async def native_placement_candidates(self) -> tuple[dict, ...]:
+        """Read-only snapshot from owned native replica and live CE worker.
+
+        Never infer GPU/NPU identity from a rank or from another task's PG.
+        Candidate eligibility (idle/bubble/lease ownership) remains a separate
+        GroupScheduler decision; this method does not donate any resource.
+        """
+        manager = getattr(self, "llm_server_manager", None)
+        if manager is None or not self.task_session:
+            raise RuntimeError("native placement is unavailable before rollout initialization")
+        table = ray.util.placement_group_table()
+        candidates = []
+        for key, kind in manager.replica_kind.items():
+            if (
+                key.task_session != self.task_session
+                or kind is not ReplicaKind.NATIVE
+                or manager.replica_state[key] is not ReplicaState.ACTIVE
+            ):
+                continue
+            runtime = manager.inspect_runtime(key)
+            if runtime is None or runtime.world_size != 1 or len(runtime.workers) != 1:
+                raise RuntimeError(f"native replica {key} lacks a verifiable TP=1 CE worker")
+            pool = runtime.resource_pool
+            pgs = getattr(pool, "pgs", None)
+            if not pgs or len(pgs) != 1 or pgs[0].bundle_count != 1:
+                raise RuntimeError(f"native replica {key} lacks a unique single-bundle PG")
+            pg = pgs[0]
+            pg_id = pg.id.hex()
+            info = table.get(pg_id)
+            if not info or info.get("state") != "CREATED":
+                raise RuntimeError(f"native replica {key} PG is not CREATED: {pg_id}")
+            name = info.get("name")
+            if not isinstance(name, str) or not name:
+                raise RuntimeError(f"native replica {key} PG is not named")
+            if ray.util.get_placement_group(name).id.hex() != pg_id:
+                raise RuntimeError(f"native replica {key} named PG identity changed")
+            placements = await runtime.worker_placements()
+            if len(placements) != 1:
+                raise RuntimeError(f"native replica {key} has ambiguous CE placement")
+            physical = placements[0]
+            if physical.get("pg_id") != pg_id:
+                raise RuntimeError(
+                    f"native CE worker is not a member of its replica-owned PG: {key}"
+                )
+            bundle = (info.get("bundles") or {})
+            bundle = bundle.get(0, bundle.get("0"))
+            nodes = info.get("bundles_to_node_id") or {}
+            node = nodes.get(0, nodes.get("0"))
+            device = physical.get("resource_name")
+            if device not in ("GPU", "NPU"):
+                raise RuntimeError(f"unsupported CE resource type: {device!r}")
+            if not isinstance(bundle, dict) or float(bundle.get(device, 0)) != 1.0:
+                raise RuntimeError(f"native PG bundle lacks one whole {device} allocation")
+            if float(bundle.get("CPU", 0)) < 1.0:
+                raise RuntimeError("native PG bundle lacks CPU for a borrowed CE actor")
+            if node != physical.get("node_id"):
+                raise RuntimeError(f"native CE node does not match PG bundle: {key}")
+            physical_id = physical.get("gpu_uuid")
+            if not isinstance(physical_id, str) or not physical_id:
+                raise RuntimeError(f"native CE did not prove physical accelerator identity: {key}")
+            if not isinstance(key.replica_id, str) or not key.replica_id.startswith("native-"):
+                raise RuntimeError(f"unexpected native replica ID: {key.replica_id!r}")
+            rank = runtime.replica_rank
+            if key.replica_id != f"native-{rank}":
+                raise RuntimeError(f"native replica rank mismatch: {key}")
+            candidates.append({
+                "donor_replica_rank": rank,
+                "pg_id": pg_id,
+                "pg_name": name,
+                "node_id": node,
+                "gpu_uuid": physical_id,
+                "bundle_index": 0,
+                "resource_name": device,
+            })
+        return tuple(sorted(candidates, key=lambda item: item["donor_replica_rank"]))
 
     def collect_idle_candidates(self) -> tuple[tuple[ReplicaKey, ReplicaKind], ...]:
         """Return only ACTIVE replicas whose removal preserves committed C.
@@ -285,25 +462,56 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         return await self.group_scheduler.submit_idle_report.remote(report)
 
     async def _idle_report_loop(self):
-        """Emit one metadata report per distinct paused surplus set."""
+        """Emit metadata while native fit is active, then exit with that lifecycle."""
+        observed_running = False
         while True:
             await asyncio.sleep(1.0)
-            # fit() owns cancellation of this reporter. Do not exit merely
-            # because native super().fit() has not set running=True yet.
-            if not getattr(self, "running", False):
+            running = bool(getattr(self, "running", False))
+            if running:
+                observed_running = True
+            elif observed_running:
                 self._idle_report_signature = None
+                self._idle_report_last_sent = None
+                return
+            else:
+                # The reporter is created during async-manager initialization,
+                # which precedes native fit() setting running=True.
+                self._idle_report_signature = None
+                self._idle_report_last_sent = None
                 continue
-            if not getattr(self, "paused", False) or self.group_scheduler is None:
+            if self.group_scheduler is None:
                 self._idle_report_signature = None
                 self._idle_report_last_sent = None
                 continue
 
+            # collect_idle_candidates() is already empty when native production
+            # resumes or the surplus disappears. Retract the previous report
+            # immediately rather than leaving GS a still-fresh (<=10s) false
+            # DONATE authorization. GS already accepts an empty candidate list.
             candidates = self.collect_idle_candidates()
             signature = tuple(
                 (key.task_session, key.replica_id, key.runtime_epoch, kind.value)
                 for key, kind in candidates
             )
             if not signature:
+                if self._idle_report_signature is not None:
+                    try:
+                        await self.group_scheduler.submit_idle_report.remote({
+                            "task_session": self.task_session,
+                            "candidates": (),
+                        })
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # An unacknowledged retraction is not safe to forget.
+                        # Retry next tick; GS also enforces bounded report age.
+                        print(
+                            "[MultiTaskRollouter] idle report retraction failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        continue
+                self._idle_report_signature = None
+                self._idle_report_last_sent = None
                 continue
             now = asyncio.get_running_loop().time()
             if (
@@ -326,14 +534,6 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
             else:
                 self._idle_report_signature = signature
                 self._idle_report_last_sent = now
-
-    async def fit(self):
-        reporter = asyncio.create_task(self._idle_report_loop())
-        try:
-            return await super().fit()
-        finally:
-            reporter.cancel()
-            await asyncio.gather(reporter, return_exceptions=True)
 
     async def prepare_replica(
         self,
@@ -432,35 +632,17 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         # reconciled by the existing service path rather than overwritten here.
         return False
 
-    async def _quarantine_verified_runtime_loss(
+    async def _begin_drain_once(
         self,
         replica_key: ReplicaKey,
         operation_id: str,
-        *,
-        route_already_draining: bool,
-    ) -> bool:
-        """Close R/C and quarantine M only after permanent runtime-loss proof."""
-        manager = self.llm_server_manager
-        probe = getattr(manager, "runtime_loss_verified", None)
-        if probe is None or not await probe(replica_key):
-            return False
-
-        self._pending_operation_targets[operation_id] = replica_key
-        lb = manager.global_load_balancer
-        if not route_already_draining:
-            await lb.begin_drain.remote(replica_key, operation_id)
-
+    ):
+        """Start R drain with one exact replay for lost-reply reconciliation."""
+        lb = self.llm_server_manager.global_load_balancer
         try:
-            manager.deactivate_service(replica_key)
-            self._update_max_concurrent_samples()
-        finally:
-            state = manager.replica_state.get(replica_key)
-            if state in {ReplicaState.ACTIVE, ReplicaState.DRAINING}:
-                manager.transition_replica(
-                    replica_key,
-                    ReplicaState.QUARANTINED,
-                )
-        return True
+            return await lb.begin_drain.remote(replica_key, operation_id)
+        except BaseException:
+            return await lb.begin_drain.remote(replica_key, operation_id)
 
     async def prepare_exit(
         self,
@@ -503,14 +685,10 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
             if not bool(getattr(async_training, "partial_rollout", False)):
                 raise ValueError("FORCE REMOVE requires async_training.partial_rollout=true")
 
-            server_id = await self._read_rpc(
-                lb.server_for_replica, replica_key
-            )
+            server_id = await self._read_rpc(lb.server_for_replica, replica_key)
             if not isinstance(server_id, str) or not server_id:
                 raise RuntimeError("FORCE target has no active route")
-            active_servers = tuple(
-                await self._read_rpc(lb.get_all_servers)
-            )
+            active_servers = tuple(await self._read_rpc(lb.get_all_servers))
             if not any(candidate != server_id for candidate in active_servers):
                 raise RuntimeError("FORCE REMOVE requires another active rollout server")
 
@@ -523,23 +701,16 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                 self._pending_operation_targets[operation_id] = replica_key
 
             try:
-                try:
-                    drained_server = await lb.begin_drain.remote(
-                        replica_key, operation_id
-                    )
-                except BaseException:
-                    drained_server = await lb.begin_drain.remote(
-                        replica_key, operation_id
-                    )
+                drained_server = await self._begin_drain_once(
+                    replica_key, operation_id
+                )
                 if drained_server != server_id:
                     raise RuntimeError("FORCE drain bound a different server")
 
                 recovery = self._force_exit_recovery.get(operation_id)
                 if recovery is None:
                     admitted_list = []
-                    for request_id in await self._read_rpc(
-                        lb.requests_for_server, server_id
-                    ):
+                    for request_id in await self._read_rpc(lb.requests_for_server, server_id):
                         if (
                             await self._read_rpc(lb.query_attempt, request_id)
                             is AttemptState.ADMITTED
@@ -590,6 +761,20 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                     else:
                         handoff_complete = confirmed >= aborted_count
                     if not unsettled and handoff_complete:
+                        print(
+                            "MULTITASK_FORCE_HANDOFF "
+                            + json.dumps(
+                                {
+                                    "operation_id": operation_id,
+                                    "admitted_count": len(admitted),
+                                    "abort_ack_known": aborted_count is not None,
+                                    "aborted_count": aborted_count,
+                                    "confirmed_count": confirmed,
+                                },
+                                sort_keys=True,
+                            ),
+                            flush=True,
+                        )
                         break
                     if loop.time() >= deadline:
                         raise TimeoutError(
@@ -599,16 +784,10 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
 
                 return OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
             except BaseException:
-                # FORCE uncertainty is normally resumable under the same op.
-                # A separately proved DEAD runtime is the only exception.
-                if await self._quarantine_verified_runtime_loss(
-                    replica_key,
-                    operation_id,
-                    route_already_draining=True,
-                ):
-                    raise RuntimeError(
-                        "runtime loss verified during FORCE; replica quarantined"
-                    )
+                # Once FORCE closes admission or abort may have happened, keep
+                # DRAINING and preserve the same operation's request facts.
+                # Replays resume this operation; they never reset M to ACTIVE
+                # and never blindly repeat an already-issued abort.
                 raise
 
         if state not in {ReplicaState.ACTIVE, ReplicaState.DRAINING}:
@@ -620,23 +799,14 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         self._pending_operation_targets[operation_id] = replica_key
 
         try:
-            try:
-                server_id = await lb.begin_drain.remote(replica_key, operation_id)
-            except BaseException:
-                # begin_drain is idempotent for the same operation. One retry
-                # reconciles the common case where R committed but the reply was
-                # lost; a second failure leaves the drain outcome unverified.
-                server_id = await lb.begin_drain.remote(replica_key, operation_id)
+            server_id = await self._begin_drain_once(replica_key, operation_id)
 
             loop = asyncio.get_running_loop()
             if self._natural_drain_timeout_s <= 0:
                 raise ValueError("multitask.drain_timeout_s must be positive")
             deadline = loop.time() + self._natural_drain_timeout_s
             next_log = loop.time() + 10.0
-            while await self._read_rpc(
-                lb.has_unsettled_requests,
-                server_id,
-            ):
+            while await self._read_rpc(lb.has_unsettled_requests, server_id):
                 now = loop.time()
                 if now >= deadline:
                     raise TimeoutError(
@@ -652,19 +822,20 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
                     next_log = now + 10.0
                 await asyncio.sleep(min(0.1, max(0.0, deadline - now)))
         except BaseException:
-            # Natural drain timeout/ACK uncertainty stays resumable unless the
-            # runtime itself is independently proved DEAD.
-            if await self._quarantine_verified_runtime_loss(
-                replica_key,
-                operation_id,
-                route_already_draining="server_id" in locals(),
-            ):
-                raise RuntimeError(
-                    "runtime loss verified during drain; replica quarantined"
-                )
+            # Natural drain timeout/ACK uncertainty is resumable. Preserve M as
+            # DRAINING and the same operation binding; do not silently upgrade
+            # to FORCE or quarantine away the only safe replay path.
             raise
 
         return OperationEvidence.now(operation_id, EvidenceType.EXIT_READY)
+
+    def clear_operation_binding(self, operation_id: str) -> bool:
+        """Drop terminal-operation replay state; UNKNOWN operations are never sent here."""
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("operation_id must be a nonempty string")
+        removed = self._pending_operation_targets.pop(operation_id, None)
+        self._force_exit_recovery.pop(operation_id, None)
+        return removed is not None
 
     def get_pending_target(self, operation_id: str) -> ReplicaKey:
         if not isinstance(operation_id, str) or not operation_id:
@@ -691,6 +862,74 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         if not isinstance(target, ReplicaKey):
             raise TypeError("query_release_operation requires ReplicaKey")
         return self.llm_server_manager.query_release_evidence(target, operation_id)
+
+    def _service_identity(self, target: ReplicaKey, label: str):
+        runtime = self.llm_server_manager.inspect_runtime(target)
+        if runtime is None:
+            raise RuntimeError(f"{label} runtime is unavailable")
+        server_id = getattr(runtime, "_server_address", None)
+        server_handle = getattr(runtime, "_server_handle", None)
+        if not isinstance(server_id, str) or not server_id or server_handle is None:
+            raise RuntimeError(f"{label} runtime lacks routable server identity")
+        return runtime, server_id, server_handle
+
+    def _activate_service_target(self, target: ReplicaKey) -> None:
+        manager = self.llm_server_manager
+        manager.activate_service(target)
+        try:
+            self._update_max_concurrent_samples()
+            manager.transition_replica(target, ReplicaState.ACTIVE)
+        except BaseException:
+            try:
+                manager.deactivate_service(target)
+                self._update_max_concurrent_samples()
+            except BaseException:
+                pass
+            raise
+
+    def _retract_service_target(self, target: ReplicaKey) -> None:
+        manager = self.llm_server_manager
+        manager.transition_replica(target, ReplicaState.DRAINING)
+        manager.deactivate_service(target)
+        self._update_max_concurrent_samples()
+
+    async def _commit_ready_or_reconcile(
+        self,
+        target: ReplicaKey,
+        server_id: str,
+        server_handle,
+        operation_id: str,
+        label: str,
+    ) -> OperationEvidence | None:
+        lb = self.llm_server_manager.global_load_balancer
+        try:
+            evidence = await lb.commit_ready.remote(
+                target,
+                server_id,
+                server_handle,
+                operation_id,
+            )
+            return _require_evidence(
+                evidence,
+                operation_id,
+                EvidenceType.SERVICE_COMMITTED,
+                f"{label} routing commit",
+            )
+        except BaseException:
+            try:
+                reconciled = await self._read_rpc(lb.query_ready_operation, operation_id)
+            except BaseException as exc:
+                raise RuntimeError(
+                    f"{label} routing commit outcome is unknown"
+                ) from exc
+            if reconciled is None:
+                return None
+            return _require_evidence(
+                reconciled,
+                operation_id,
+                EvidenceType.SERVICE_COMMITTED,
+                f"{label} routing ledger",
+            )
 
     async def commit_service_change(
         self, operation: OperationRecord
@@ -737,165 +976,63 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
         if state is ReplicaState.CREATING:
             if kind is not ReplicaKind.BORROWED:
                 raise ValueError("only BORROWED replicas may publish from CREATING")
-            runtime = manager.inspect_runtime(target)
-            if runtime is None:
-                raise RuntimeError("borrowed runtime is unavailable for ADD commit")
-            server_id = getattr(runtime, "_server_address", None)
-            server_handle = getattr(runtime, "_server_handle", None)
-            if not isinstance(server_id, str) or not server_id or server_handle is None:
-                raise RuntimeError("borrowed ADD runtime lacks routable server identity")
-
-            activated = False
+            _runtime, server_id, server_handle = self._service_identity(
+                target, "borrowed ADD"
+            )
             try:
-                manager.activate_service(target)
-                activated = True
-                self._update_max_concurrent_samples()
-                manager.transition_replica(target, ReplicaState.ACTIVE)
-                try:
-                    evidence = await lb.commit_ready.remote(
-                        target,
-                        server_id,
-                        server_handle,
-                        operation.operation_id,
-                    )
-                    _require_evidence(
-                        evidence,
-                        operation.operation_id,
-                        EvidenceType.SERVICE_COMMITTED,
-                        "ADD routing commit",
-                    )
-                except BaseException as commit_exc:
-                    try:
-                        reconciled = await self._read_rpc(
-                            lb.query_ready_operation,
-                            operation.operation_id,
-                        )
-                    except BaseException as reconcile_exc:
-                        raise RuntimeError(
-                            "ADD routing commit outcome is unknown"
-                        ) from reconcile_exc
-                    if reconciled is not None:
-                        evidence = _require_evidence(
-                            reconciled,
-                            operation.operation_id,
-                            EvidenceType.SERVICE_COMMITTED,
-                            "ADD routing ledger",
-                        )
-                    else:
-                        # R authoritatively reports no publish. Retract C/M but
-                        # do not destroy while E still says the runtime is an
-                        # effective receiver. Trainer owns G and will remove E
-                        # before calling finalize_release().
-                        manager.transition_replica(target, ReplicaState.DRAINING)
-                        if activated:
-                            manager.deactivate_service(target)
-                            activated = False
-                            self._update_max_concurrent_samples()
-                        return None
-
+                self._activate_service_target(target)
+                evidence = await self._commit_ready_or_reconcile(
+                    target,
+                    server_id,
+                    server_handle,
+                    operation.operation_id,
+                    "ADD",
+                )
+                if evidence is None:
+                    # R authoritatively reports no publish. Trainer still owns G
+                    # and removes E before the hidden runtime is destroyed.
+                    self._retract_service_target(target)
+                    return None
                 self._pending_operation_targets.pop(operation.operation_id, None)
                 return evidence
             except BaseException:
                 if manager.replica_state.get(target) is ReplicaState.CREATING:
-                    if activated:
-                        try:
-                            manager.deactivate_service(target)
-                            self._update_max_concurrent_samples()
-                        except BaseException:
-                            pass
                     manager.transition_replica(target, ReplicaState.QUARANTINED)
                 raise
 
-        # RESTORE reuses the same service-commit boundary after Trainer has
-        # proved current Vpub under G.  The vLLM engine may already be fully
-        # resident because CE resumed KV cache; runtime.wake_up() then acts as
-        # the final local-admission + health commit before R/C/M are published.
+        # RESTORE uses the same routing commit helper after Trainer proves Vpub.
         if state is ReplicaState.DORMANT:
             if kind is not ReplicaKind.NATIVE:
                 raise ValueError("only NATIVE replicas may restore from DORMANT")
-            runtime = None
-            activated = False
             try:
-                runtime = manager.inspect_runtime(target)
-                if runtime is None:
-                    raise RuntimeError("native runtime is unavailable for RESTORE commit")
+                runtime, server_id, server_handle = self._service_identity(
+                    target, "native RESTORE"
+                )
                 await runtime.wake_up()
-
-                server_id = getattr(runtime, "_server_address", None)
-                server_handle = getattr(runtime, "_server_handle", None)
-                if not isinstance(server_id, str) or not server_id or server_handle is None:
-                    raise RuntimeError("native RESTORE runtime lacks routable server identity")
-
-                # Trainer has already committed current-Vpub membership into E.
-                # Prepare owner-local service state before the externally visible
-                # R commit, but never re-sleep from this point without also
-                # rolling E back under G.
-                manager.activate_service(target)
-                activated = True
-                self._update_max_concurrent_samples()
-                manager.transition_replica(target, ReplicaState.ACTIVE)
-
+                self._activate_service_target(target)
                 try:
-                    evidence = await lb.commit_ready.remote(
+                    evidence = await self._commit_ready_or_reconcile(
                         target,
                         server_id,
                         server_handle,
                         operation.operation_id,
+                        "RESTORE",
                     )
-                    _require_evidence(
-                        evidence,
-                        operation.operation_id,
-                        EvidenceType.SERVICE_COMMITTED,
-                        "RESTORE routing commit",
-                    )
-                except BaseException as commit_exc:
-                    try:
-                        reconciled = await lb.query_ready_operation.remote(
-                            operation.operation_id
-                        )
-                    except BaseException as reconcile_exc:
-                        # R may already be open. Keep the current-Vpub runtime
-                        # awake and M/C ACTIVE; Trainer fences G on this error.
-                        raise RuntimeError(
-                            "RESTORE routing commit outcome is unknown"
-                        ) from reconcile_exc
-
-                    if reconciled is not None:
-                        try:
-                            evidence = _require_evidence(
-                                reconciled,
-                                operation.operation_id,
-                                EvidenceType.SERVICE_COMMITTED,
-                                "RESTORE routing ledger",
-                            )
-                        except (TypeError, ValueError) as exc:
-                            raise RuntimeError(
-                                "RESTORE routing ledger conflicts with the operation"
-                            ) from exc
-                    else:
-                        # R is definitely absent. Retract C/M while Trainer still
-                        # owns G, then return a definite no-publish marker. Trainer
-                        # removes E before finalize_release() re-enters level-2 sleep.
-                        manager.transition_replica(target, ReplicaState.DRAINING)
-                        if activated:
-                            manager.deactivate_service(target)
-                            activated = False
-                            self._update_max_concurrent_samples()
-                        return None
-
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "RESTORE routing ledger conflicts with the operation"
+                    ) from exc
+                if evidence is None:
+                    # R is definitely absent. Trainer removes E before
+                    # finalize_release() re-enters level-2 sleep.
+                    self._retract_service_target(target)
+                    return None
                 self._pending_operation_targets.pop(operation.operation_id, None)
                 return evidence
             except BaseException:
-                # Failures before ACTIVE/R publication still happen after E was
-                # committed. Do not manufacture DORMANT by sleeping behind E's
-                # back; quarantine the local runtime projection instead.
+                # Before ACTIVE publication, a mutated DORMANT projection cannot
+                # safely be advertised as sleeping.
                 if manager.replica_state.get(target) is ReplicaState.DORMANT:
-                    if activated:
-                        try:
-                            manager.deactivate_service(target)
-                            self._update_max_concurrent_samples()
-                        except BaseException:
-                            pass
                     manager.transition_replica(target, ReplicaState.QUARANTINED)
                 raise
 
@@ -905,8 +1042,8 @@ class MultiTaskFullyAsyncRollouter(_unwrap_ray_remote(FullyAsyncRollouter)):
             )
 
         try:
-            server_id = await lb.server_for_replica.remote(target)
-            if server_id is not None and await lb.has_unsettled_requests.remote(server_id):
+            server_id = await self._read_rpc(lb.server_for_replica, target)
+            if server_id is not None and await self._read_rpc(lb.has_unsettled_requests, server_id):
                 raise ValueError("cannot commit service exit while requests remain unsettled")
             await lb.finish_remove.remote(target)
             manager.deactivate_service(target)

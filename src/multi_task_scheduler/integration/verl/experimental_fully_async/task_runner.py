@@ -12,8 +12,9 @@ from verl.experimental.fully_async_policy.message_queue import MessageQueueClien
 from verl.experimental.separation.utils import create_resource_pool_manager
 from verl.trainer.ppo.utils import Role
 
-from verl.single_controller.ray.base import _unwrap_ray_remote
+from multi_task_scheduler.integration.verl.ray_actor import unwrap_native_actor_class
 from multi_task_scheduler.orchestration.contracts import (
+    CONTROL_RPC_TIMEOUT_S,
     EvidenceType,
     Lease,
     OperationCommand,
@@ -21,6 +22,7 @@ from multi_task_scheduler.orchestration.contracts import (
     OperationKind,
     OperationRecord,
     OperationStatus,
+    require_operation_evidence as _require_evidence,
 )
 from multi_task_scheduler.orchestration.operation_journal import OperationJournal
 from multi_task_scheduler.scheduler.discovery import get_or_create_group_scheduler
@@ -33,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 @ray.remote(num_cpus=1, max_concurrency=8)
-class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
+class MultiTaskFullyAsyncTaskRunner(unwrap_native_actor_class(FullyAsyncTaskRunner)):
     """Native run thread plus a small concurrent control surface for GS commands."""
 
     def __init__(self):
@@ -82,23 +84,6 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             "placement_epoch": command.target.runtime_epoch,
         }
 
-    @staticmethod
-    def _require_evidence(
-        value,
-        *,
-        operation_id: str,
-        expected: EvidenceType,
-    ) -> OperationEvidence:
-        if not isinstance(value, OperationEvidence):
-            raise TypeError(f"expected OperationEvidence({expected.value})")
-        if value.operation_id != operation_id:
-            raise ValueError("operation evidence belongs to another operation")
-        if value.type is not expected:
-            raise ValueError(
-                f"expected {expected.value} evidence, got {value.type.value}"
-            )
-        return value
-
     def _advance_lease(
         self,
         command: OperationCommand,
@@ -115,12 +100,62 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                         command.lease_id,
                         evidence,
                     ),
-                    timeout=30,
+                    timeout=CONTROL_RPC_TIMEOUT_S,
                 )
                 return
             except Exception as exc:
                 last_error = exc
         raise last_error
+
+    def _finish(
+        self,
+        operation_id: str,
+        status: OperationStatus,
+        result: str | None,
+    ) -> None:
+        with self._journal_lock:
+            self._operation_journal.finish(operation_id, status, result)
+
+        if status not in {OperationStatus.SUCCEEDED, OperationStatus.FAILED}:
+            return
+        rollouter = self.components.get("rollouter")
+        if rollouter is None:
+            return
+        last_error = None
+        for _attempt in range(2):
+            try:
+                ray.get(
+                    rollouter.clear_operation_binding.remote(operation_id),
+                    timeout=CONTROL_RPC_TIMEOUT_S,
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+        logger.warning(
+            "Could not clear terminal Rollouter binding for operation %s: %s",
+            operation_id,
+            last_error,
+        )
+
+    def _finish_failed_release(
+        self,
+        command: OperationCommand,
+        evidence,
+        message: str,
+    ) -> bool:
+        if not (
+            isinstance(evidence, OperationEvidence)
+            and evidence.type is EvidenceType.RELEASED
+        ):
+            return False
+        released = _require_evidence(
+            evidence,
+            operation_id=command.operation_id,
+            expected=EvidenceType.RELEASED,
+        )
+        self._advance_lease(command, released)
+        self._finish(command.operation_id, OperationStatus.FAILED, message)
+        return True
 
     def _launch_operation(self, operation_id: str) -> None:
         worker = threading.Thread(
@@ -180,17 +215,17 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             )
             launch = existing is None or reconciliation_launch
 
-        if launch:
-            try:
-                self._launch_operation(command.operation_id)
-            except BaseException as exc:
-                with self._journal_lock:
+            # Reserve/start under the journal lock. Otherwise concurrent
+            # exact-op UNKNOWN retries can both observe no worker, then each
+            # launch a lifecycle thread and repeat side effects.
+            if launch:
+                try:
+                    self._launch_operation(command.operation_id)
+                except BaseException as exc:
                     self._operation_threads.pop(command.operation_id, None)
                     if reconciliation_launch:
-                        # The prior UNKNOWN owner outcome still exists. A local
-                        # thread-launch failure creates no new owner fact and must
-                        # not erase preserved reconciliation inputs or rewrite
-                        # the old UNKNOWN into a resolved FAILED result.
+                        # A local thread-launch failure adds no owner fact and
+                        # must not rewrite the prior UNKNOWN into FAILED.
                         pass
                     else:
                         self._operation_leases.pop(command.operation_id, None)
@@ -199,8 +234,8 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                             OperationStatus.FAILED,
                             f"failed to launch lifecycle worker: {type(exc).__name__}: {exc}",
                         )
-                raise
-        return snapshot
+                    raise
+            return snapshot
 
     def query_operation(self, operation_id: str) -> OperationRecord:
         if not isinstance(operation_id, str) or not operation_id:
@@ -255,42 +290,20 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                         spec=placement_spec,
                     )
                 )
-                if (
-                    isinstance(prepare_result, OperationEvidence)
-                    and prepare_result.type is EvidenceType.RELEASED
+                if self._finish_failed_release(
+                    command,
+                    prepare_result,
+                    "ADD prepare failed; no borrower runtime remains",
                 ):
-                    rollback_evidence = self._require_evidence(
-                        prepare_result,
-                        operation_id=operation_id,
-                        expected=EvidenceType.RELEASED,
-                    )
-                    self._advance_lease(command, rollback_evidence)
-                    with self._journal_lock:
-                        self._operation_journal.finish(
-                            operation_id,
-                            OperationStatus.FAILED,
-                            "ADD prepare failed; no borrower runtime remains",
-                        )
                     return
                 evidence = ray.get(trainer.bootstrap_and_publish.remote(operation))
-                if (
-                    isinstance(evidence, OperationEvidence)
-                    and evidence.type is EvidenceType.RELEASED
+                if self._finish_failed_release(
+                    command,
+                    evidence,
+                    "ADD bootstrap failed; hidden runtime was verified RELEASED",
                 ):
-                    rollback_evidence = self._require_evidence(
-                        evidence,
-                        operation_id=operation_id,
-                        expected=EvidenceType.RELEASED,
-                    )
-                    self._advance_lease(command, rollback_evidence)
-                    with self._journal_lock:
-                        self._operation_journal.finish(
-                            operation_id,
-                            OperationStatus.FAILED,
-                            "ADD bootstrap failed; hidden runtime was verified RELEASED",
-                        )
                     return
-                final_evidence = self._require_evidence(
+                final_evidence = _require_evidence(
                     evidence,
                     operation_id=operation_id,
                     expected=EvidenceType.SERVICE_COMMITTED,
@@ -309,18 +322,17 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                         )
                     )
                     if prior_release is not None:
-                        final_evidence = self._require_evidence(
+                        final_evidence = _require_evidence(
                             prior_release,
                             operation_id=operation_id,
                             expected=EvidenceType.RELEASED,
                         )
                         self._advance_lease(command, final_evidence)
-                        with self._journal_lock:
-                            self._operation_journal.finish(
-                                operation_id,
-                                OperationStatus.SUCCEEDED,
-                                final_evidence.type.value,
-                            )
+                        self._finish(
+                            operation_id,
+                            OperationStatus.SUCCEEDED,
+                            final_evidence.type.value,
+                        )
                         return
 
                     # If E removal happened and G was fenced around an uncertain
@@ -350,17 +362,25 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                             ray.get(
                                 rollouter.get_pending_target.remote(operation_id)
                             )
-                        except BaseException:
-                            with self._journal_lock:
-                                self._operation_journal.finish(
-                                    operation_id,
-                                    OperationStatus.FAILED,
-                                    "exit preflight rejected before owner mutation: "
-                                    f"{type(exc).__name__}: {exc}",
-                                )
+                        except BaseException as query_exc:
+                            # Only an authoritative "no pending target" result
+                            # proves prepare_exit did not enter the owner path.
+                            # Query timeout / actor failure is not negative
+                            # evidence: preserve UNKNOWN for exact-op replay.
+                            cause = getattr(query_exc, "cause", None)
+                            if not isinstance(query_exc, KeyError) and not isinstance(cause, KeyError):
+                                raise RuntimeError(
+                                    "exit target binding query is inconclusive"
+                                ) from query_exc
+                            self._finish(
+                                operation_id,
+                                OperationStatus.FAILED,
+                                "exit preflight rejected before owner mutation: "
+                                f"{type(exc).__name__}: {exc}",
+                            )
                             return
                         raise
-                    self._require_evidence(
+                    _require_evidence(
                         exit_evidence,
                         operation_id=operation_id,
                         expected=EvidenceType.EXIT_READY,
@@ -369,14 +389,14 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                         trainer.remove_and_commit.remote(operation)
                     )
 
-                self._require_evidence(
+                _require_evidence(
                     service_evidence,
                     operation_id=operation_id,
                     expected=EvidenceType.SERVICE_COMMITTED,
                 )
 
                 release_evidence = ray.get(rollouter.finalize_release.remote(operation))
-                final_evidence = self._require_evidence(
+                final_evidence = _require_evidence(
                     release_evidence,
                     operation_id=operation_id,
                     expected=EvidenceType.RELEASED,
@@ -392,24 +412,13 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                     )
                 )
                 evidence = ray.get(trainer.restore_and_publish.remote(operation))
-                if (
-                    isinstance(evidence, OperationEvidence)
-                    and evidence.type is EvidenceType.RELEASED
+                if self._finish_failed_release(
+                    command,
+                    evidence,
+                    "RESTORE bootstrap failed; native runtime was verified re-slept",
                 ):
-                    rollback_evidence = self._require_evidence(
-                        evidence,
-                        operation_id=operation_id,
-                        expected=EvidenceType.RELEASED,
-                    )
-                    self._advance_lease(command, rollback_evidence)
-                    with self._journal_lock:
-                        self._operation_journal.finish(
-                            operation_id,
-                            OperationStatus.FAILED,
-                            "RESTORE bootstrap failed; native runtime was verified re-slept",
-                        )
                     return
-                final_evidence = self._require_evidence(
+                final_evidence = _require_evidence(
                     evidence,
                     operation_id=operation_id,
                     expected=EvidenceType.SERVICE_COMMITTED,
@@ -419,12 +428,11 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             else:  # pragma: no cover - OperationKind construction already fences this.
                 raise ValueError(f"unsupported operation kind: {command.kind!r}")
 
-            with self._journal_lock:
-                self._operation_journal.finish(
-                    operation_id,
-                    OperationStatus.SUCCEEDED,
-                    final_evidence.type.value,
-                )
+            self._finish(
+                operation_id,
+                OperationStatus.SUCCEEDED,
+                final_evidence.type.value,
+            )
 
         except BaseException as exc:
             status = OperationStatus.UNKNOWN
@@ -465,7 +473,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                 try:
                     ray.get(
                         self.group_scheduler.detach_task.remote(self.task_session),
-                        timeout=30,
+                        timeout=CONTROL_RPC_TIMEOUT_S,
                     )
                 except Exception:
                     logger.warning(
@@ -475,10 +483,24 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
                     )
                 self._attached_to_gs = False
 
+    def native_placement_candidates(self) -> tuple[dict, ...]:
+        """Read-only relay: donor-owned rollout/CE evidence for lease selection."""
+        if not self._control_ready or not self.task_session:
+            raise RuntimeError("TaskRunner is not ready for placement inspection")
+        rollouter = self.components.get("rollouter")
+        if rollouter is None:
+            raise RuntimeError("TaskRunner has no initialized Rollouter")
+        return tuple(
+            ray.get(
+                rollouter.native_placement_candidates.remote(),
+                timeout=CONTROL_RPC_TIMEOUT_S,
+            )
+        )
+
     def _replace_message_queue(self, config) -> None:
         """Swap the native empty startup queue for the queue-owned idempotent variant."""
         old_queue = self.components["message_queue"]
-        old_size = ray.get(old_queue.get_queue_size.remote(), timeout=30)
+        old_size = ray.get(old_queue.get_queue_size.remote(), timeout=CONTROL_RPC_TIMEOUT_S)
         if old_size != 0:
             raise RuntimeError(
                 "cannot replace native MessageQueue after samples have been enqueued"
@@ -486,7 +508,7 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
 
         max_queue_size = ray.get(
             self.components["rollouter"].get_max_queue_size.remote(),
-            timeout=30,
+            timeout=CONTROL_RPC_TIMEOUT_S,
         )
         ray.kill(old_queue, no_restart=True)
 
@@ -505,20 +527,94 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             ]
         )
 
+    def _attach_task_with_reconciliation(self) -> None:
+        """Register once; a delayed/lost Ray reply is not proof of non-delivery.
+
+        During real NPU startup Ray may take longer than the regular control
+        RPC timeout to deliver the attach acknowledgement. Re-wait the SAME
+        ObjectRef; never replay a potentially committed attach blindly.
+        """
+        task_id = self.task_session
+        actor = ray.get_runtime_context().current_actor
+        attached = self.group_scheduler.attach_task.remote(task_id, actor)
+        last_timeout = None
+        for attempt in range(3):
+            try:
+                ray.get(attached, timeout=CONTROL_RPC_TIMEOUT_S)
+                self._attached_to_gs = True
+                logger.info(
+                    "GroupScheduler registered TaskRunner %s (ack attempt %d)",
+                    task_id, attempt + 1,
+                )
+                return
+            except ray.exceptions.GetTimeoutError as exc:
+                last_timeout = exc
+                logger.warning(
+                    "GroupScheduler attach_task %s has no reply after %ds; "
+                    "waiting on original RPC (attempt %d/3)",
+                    task_id, int((attempt + 1) * CONTROL_RPC_TIMEOUT_S),
+                    attempt + 1,
+                )
+
+        # Read-only reconciliation: the attach RPC might have committed while
+        # its response was delayed. Only the same logical Ray actor can prove it.
+        try:
+            registered = ray.get(
+                self.group_scheduler.get_task_runners.remote(),
+                timeout=CONTROL_RPC_TIMEOUT_S,
+            )
+        except Exception as exc:
+            registered = None
+            logger.warning(
+                "GroupScheduler registration ledger query failed for %s: %r",
+                task_id, exc,
+            )
+
+        if isinstance(registered, dict) and task_id in registered:
+            actual = registered[task_id]
+            actor_id = getattr(actor, "_actor_id", None)
+            actual_id = getattr(actual, "_actor_id", None)
+            if actor_id is not None and actor_id == actual_id:
+                self._attached_to_gs = True
+                logger.warning(
+                    "GroupScheduler attached %s but registration ACK was delayed; "
+                    "ledger actor identity verified",
+                    task_id,
+                )
+                return
+            # Never remove a conflicting registration owned by a different actor.
+            raise RuntimeError(
+                f"GroupScheduler task_session {task_id} is bound to a different "
+                f"ActorHandle (expected={actor_id}, observed={actual_id})"
+            ) from last_timeout
+
+        # An outstanding attach could still execute after this timeout. Queue a
+        # compensating detach on the same single-writer GS actor. Its ordering
+        # after attach prevents a later ghost registration if GS becomes live.
+        try:
+            ray.get(
+                self.group_scheduler.detach_task.remote(task_id),
+                timeout=CONTROL_RPC_TIMEOUT_S,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"GroupScheduler attach_task {task_id} unconfirmed; "
+                f"compensating detach also unconfirmed ({type(exc).__name__}: {exc}); "
+                "check the GS actor's liveness and Ray scheduling"
+            ) from last_timeout
+        raise RuntimeError(
+            f"GroupScheduler attach_task {task_id} unconfirmed after "
+            "three control timeouts; compensating detach acknowledged. "
+            "Check Ray actor scheduling and GroupScheduler logs"
+        ) from last_timeout
+
     def _initialize_components(self, config) -> None:
         super()._initialize_components(config)
         # Parent initialization performs checkpoint restore, initial weight sync and
         # optional validation before training starts. At this point the training
         # sample queue must still be empty, so replacing it cannot lose samples.
         self._replace_message_queue(config)
-        ray.get(
-            self.group_scheduler.attach_task.remote(
-                self.task_session,
-                ray.get_runtime_context().current_actor,
-            ),
-            timeout=30,
-        )
-        self._attached_to_gs = True
+        self._attach_task_with_reconciliation()
         with self._journal_lock:
             self._control_ready = True
 
@@ -551,14 +647,32 @@ class MultiTaskFullyAsyncTaskRunner(_unwrap_ray_remote(FullyAsyncTaskRunner)):
             for role, worker_cls in self.components["role_worker_mapping"].items()
             if role != Role.Rollout
         }
+        # Native VERL names every trainer PG "trainer_poolverl_group_...", so
+        # two independent jobs collide in one Ray namespace. Scope pool names
+        # using the same TaskRunner identity already used for rollout replicas.
+        # Preserve role-to-pool ownership and resource counts unchanged.
+        if not self.task_session:
+            raise RuntimeError("Trainer resource pools require task_session")
+        resource_pool_manager = create_resource_pool_manager(
+            config, roles=list(trainer_role_mapping.keys())
+        )
+        pool_names = {
+            name: f"{name}_mt_{self.task_session}_"
+            for name in resource_pool_manager.resource_pool_spec
+        }
+        resource_pool_manager.resource_pool_spec = {
+            pool_names[name]: spec
+            for name, spec in resource_pool_manager.resource_pool_spec.items()
+        }
+        resource_pool_manager.mapping = {
+            role: pool_names[name]
+            for role, name in resource_pool_manager.mapping.items()
+        }
         trainer = MultiTaskFullyAsyncTrainer.remote(
             config=config,
             tokenizer=self.components["tokenizer"],
             role_worker_mapping=trainer_role_mapping,
-            resource_pool_manager=create_resource_pool_manager(
-                config,
-                roles=list(trainer_role_mapping.keys()),
-            ),
+            resource_pool_manager=resource_pool_manager,
             ray_worker_group_cls=self.components["ray_worker_group_cls"],
             device_name=config.trainer.device,
             task_session=self.task_session,

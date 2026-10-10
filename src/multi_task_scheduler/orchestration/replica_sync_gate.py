@@ -59,8 +59,6 @@ class ReplicaSyncGate:
         self._epoch = 0
         self._blocked_reason: str | None = None
         self._blocked_operation_id: str | None = None
-        self.wait_seconds = 0.0
-        self.max_owner_seconds = 0.0
 
     @property
     def owner(self) -> GateOwner | None:
@@ -119,9 +117,7 @@ class ReplicaSyncGate:
                 "Only the operation that blocked synchronization may reconcile it"
             )
 
-        wait_started = time.monotonic()
         await self._lock.acquire()
-        self.wait_seconds += time.monotonic() - wait_started
         try:
             # Another reconciler may have completed while this coroutine waited.
             if self._blocked_reason is None:
@@ -147,8 +143,6 @@ class ReplicaSyncGate:
                 self._blocked_operation_id = None
                 return True
             finally:
-                held_seconds = time.monotonic() - owner.acquired_at
-                self.max_owner_seconds = max(self.max_owner_seconds, held_seconds)
                 self._owner = None
         finally:
             self._lock.release()
@@ -168,7 +162,6 @@ class ReplicaSyncGate:
                 f"operation {operation_id!r} already owns the replica sync gate"
             )
 
-        wait_started = time.monotonic()
         try:
             if timeout is None:
                 await self._lock.acquire()
@@ -179,7 +172,6 @@ class ReplicaSyncGate:
                 f"timed out waiting for replica sync gate: {operation_id}"
             ) from exc
 
-        self.wait_seconds += time.monotonic() - wait_started
         # The previous owner may have failed while this coroutine was waiting.
         if self._blocked_reason is not None:
             self._lock.release()
@@ -200,8 +192,6 @@ class ReplicaSyncGate:
     async def _release(self, owner: GateOwner) -> bool:
         if not self._is_active(owner):
             return False
-        held_seconds = time.monotonic() - owner.acquired_at
-        self.max_owner_seconds = max(self.max_owner_seconds, held_seconds)
         self._owner = None
         self._lock.release()
         return True

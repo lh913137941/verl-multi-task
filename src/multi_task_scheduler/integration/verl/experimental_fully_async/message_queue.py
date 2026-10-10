@@ -38,10 +38,9 @@ class MultiTaskMessageQueue(_unwrap_ray_remote(MessageQueue)):
     """Reuse native queue behavior with a disk-backed exactly-once ledger.
 
     The previous Python dict retained one CompletionEvidence object for every
-    sample for the actor lifetime.  The ledger is exact during the Queue actor lifetime (old retries and
-    digest conflicts remain queryable) but rows live in a local SQLite file
-    rather than accumulating in actor heap memory. Actor restart replay
-    requires a separate durable queue/checkpoint protocol.
+    sample for the actor lifetime.  The ledger is still exact (old retries and
+    digest conflicts remain queryable) but rows now live in a local SQLite file
+    instead of accumulating in actor heap memory.
     """
 
     def __init__(self, config, max_queue_size: int = 1000, *, task_session: str):
@@ -162,9 +161,9 @@ class MultiTaskMessageQueue(_unwrap_ray_remote(MessageQueue)):
             self._completion_db.commit()
             self._next_completion_seq += 1
 
-            # Native enqueue may have mutated its queue before raising. An
-            # uncertain outcome must retain the provisional row: replaying
-            # without an ACK could otherwise admit the same sample twice.
+            # Native enqueue may have mutated the queue before raising.
+            # An uncertain result must retain the provisional ledger row
+            # so an exact replay cannot enqueue this logical sample again.
             original_return_value = await super().put_sample(sample)
 
             dropped_oldest = not original_return_value

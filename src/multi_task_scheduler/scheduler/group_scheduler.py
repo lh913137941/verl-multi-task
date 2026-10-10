@@ -8,6 +8,7 @@ import ray
 from ray.actor import ActorHandle
 
 from multi_task_scheduler.orchestration.contracts import (
+    CONTROL_RPC_TIMEOUT_S,
     EvidenceType,
     Lease,
     OperationCommand,
@@ -17,6 +18,7 @@ from multi_task_scheduler.orchestration.contracts import (
     OperationStatus,
     ReplicaKey,
     ReplicaKind,
+    native_replica_key,
 )
 
 RUNTIME_KIND = "verl-multi-task:experimental_fully_async_standalone:092203-r2"
@@ -136,19 +138,6 @@ class GroupScheduler:
 
             donor_task_id = lease.claims[0]["donor_task_id"]
             if command.kind is OperationKind.DONATE:
-                idle_report = self.idle_reports.get(command.target.task_session)
-                if idle_report is not None:
-                    age = time.monotonic() - idle_report["observed_at"]
-                    if age > _IDLE_REPORT_MAX_AGE_S:
-                        raise ValueError("DONATE idle report is stale; wait for a fresh paused-window report")
-                    reported = {
-                        candidate["replica_key"]: ReplicaKind(candidate["kind"])
-                        for candidate in idle_report["candidates"]
-                    }
-                    if reported.get(command.target) is not ReplicaKind.NATIVE:
-                        raise ValueError(
-                            "DONATE target is not a currently reported idle NATIVE replica"
-                        )
                 if history:
                     last_command = self.operation_commands.get(history[-1])
                     if (
@@ -158,6 +147,22 @@ class GroupScheduler:
                         raise ValueError(
                             "lease awaits RESTORE after borrowed REMOVE"
                         )
+                idle_report = self.idle_reports.get(command.target.task_session)
+                if idle_report is None:
+                    raise ValueError(
+                        "DONATE requires a fresh idle report containing the target NATIVE replica"
+                    )
+                age = time.monotonic() - idle_report["observed_at"]
+                if age > _IDLE_REPORT_MAX_AGE_S:
+                    raise ValueError("DONATE idle report is stale; wait for a fresh paused-window report")
+                reported = {
+                    candidate["replica_key"]: ReplicaKind(candidate["kind"])
+                    for candidate in idle_report["candidates"]
+                }
+                if reported.get(command.target) is not ReplicaKind.NATIVE:
+                    raise ValueError(
+                        "DONATE target is not a currently reported idle NATIVE replica"
+                    )
                 if command.target.task_session != donor_task_id:
                     raise ValueError("DONATE target does not own the lease claims")
                 if not self._target_matches_donor(command.target, lease):
@@ -230,7 +235,7 @@ class GroupScheduler:
         try:
             result = ray.get(
                 task_runner.submit_operation.remote(command, lease=lease),
-                timeout=30,
+                timeout=CONTROL_RPC_TIMEOUT_S,
             )
             if not isinstance(result, OperationRecord):
                 raise TypeError("TaskRunner returned a non-OperationRecord")
@@ -249,10 +254,10 @@ class GroupScheduler:
     def _target_matches_donor(target: ReplicaKey, lease: Lease) -> bool:
         """Match first-release donor identity without trusting a handle from GS."""
         claim = lease.claims[0]
-        rank = claim["donor_replica_rank"]
-        # Manager and Trainer both register native owner identity as
-        # ReplicaKey(task_session, f"native-{replica_rank}", epoch=0).
-        return target.replica_id == f"native-{rank}" and target.runtime_epoch == 0
+        return target == native_replica_key(
+            target.task_session,
+            claim["donor_replica_rank"],
+        )
 
     def open_lease(self, lease: Lease) -> Lease:
         """GS-internal ledger action; scheduler policy calls this before command issue."""
@@ -262,7 +267,14 @@ class GroupScheduler:
         if existing is not None:
             if existing != lease:
                 raise ValueError("conflicting lease replay")
-            return existing
+            # Lease is frozen but each claim is a mutable mapping. Never give
+            # callers a reference into the GS ownership ledger.
+            return Lease(existing.lease_id, existing.claims, existing.expires_at)
+
+        # Detach from caller-owned claim mappings before checking and storing
+        # authorization. A later in-process mutation must not silently change
+        # the lease while active_*_owner still holds the original claim keys.
+        lease = Lease(lease.lease_id, lease.claims, lease.expires_at)
 
         for claim_id in lease.claim_ids:
             owner = self.claim_id_owner.get(claim_id)
@@ -291,7 +303,7 @@ class GroupScheduler:
             self.active_bundle_owner[bundle_key] = lease.lease_id
         for gpu_uuid in lease.gpu_uuids:
             self.active_gpu_owner[gpu_uuid] = lease.lease_id
-        return lease
+        return Lease(lease.lease_id, lease.claims, lease.expires_at)
 
     def advance_lease(self, lease_id: str, evidence: OperationEvidence) -> dict:
         """GS-internal lease progression after exact operation evidence validation."""
