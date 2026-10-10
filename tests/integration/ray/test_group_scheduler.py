@@ -48,6 +48,18 @@ def claim(
     }
 
 
+
+
+def report_idle_native(gs, *, task_session="task-a", replica_id="native-0"):
+    return ray.get(gs.submit_idle_report.remote({
+        "task_session": task_session,
+        "candidates": ({
+            "replica_key": ReplicaKey(task_session, replica_id),
+            "kind": "NATIVE",
+        },),
+    }))
+
+
 def test_group_scheduler_minimal_lease_and_forwarding():
     ray.init(num_cpus=2, ignore_reinit_error=True)
     try:
@@ -57,6 +69,7 @@ def test_group_scheduler_minimal_lease_and_forwarding():
         lease = Lease("l1", (claim(),), 0)
         ray.get(gs.open_lease.remote(lease))
 
+        report_idle_native(gs)
         command = OperationCommand(
             "op-release",
             OperationKind.DONATE,
@@ -206,6 +219,7 @@ def test_restore_temporary_reservation_closes_one_shot_lease():
         lease = Lease("l1", (claim(),), 0)
         ray.get(gs.open_lease.remote(lease))
 
+        report_idle_native(gs)
         donate = OperationCommand(
             "op-donate",
             OperationKind.DONATE,
@@ -354,6 +368,7 @@ def test_expired_lease_blocks_new_use_but_not_reclaim():
                 )
             )
 
+        report_idle_native(gs)
         donate = OperationCommand(
             "op-donate",
             OperationKind.DONATE,
@@ -388,3 +403,40 @@ def test_idle_report_rejects_cross_task_candidate_identity():
             )
     finally:
         ray.shutdown()
+
+def test_donate_requires_a_fresh_idle_candidate_report():
+    ray.init(num_cpus=2, ignore_reinit_error=True)
+    try:
+        gs = GroupScheduler.remote()
+        runner = Runner.remote()
+        ray.get(gs.attach_task.remote("task-a", runner))
+        lease = Lease("l1", (claim(),), 0)
+        ray.get(gs.open_lease.remote(lease))
+        target = ReplicaKey("task-a", "native-0")
+        command = OperationCommand("op-no-report", OperationKind.DONATE, target, "l1")
+
+        with pytest.raises(ValueError, match="requires a fresh idle report"):
+            ray.get(gs.submit_operation.remote(command))
+
+        # An empty report retracts candidates; it never authorizes donation.
+        ray.get(gs.submit_idle_report.remote({"task_session": "task-a", "candidates": ()}))
+        with pytest.raises(ValueError, match="not a currently reported idle NATIVE"):
+            ray.get(gs.submit_operation.remote(
+                OperationCommand("op-empty-report", OperationKind.DONATE, target, "l1")
+            ))
+
+        # A report for another Native replica cannot authorize this target.
+        ray.get(gs.submit_idle_report.remote({
+            "task_session": "task-a",
+            "candidates": ({
+                "replica_key": ReplicaKey("task-a", "native-1"),
+                "kind": "NATIVE",
+            },),
+        }))
+        with pytest.raises(ValueError, match="not a currently reported idle NATIVE"):
+            ray.get(gs.submit_operation.remote(
+                OperationCommand("op-other-target", OperationKind.DONATE, target, "l1")
+            ))
+    finally:
+        ray.shutdown()
+
