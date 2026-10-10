@@ -145,21 +145,13 @@ handoff_ready_leases: set[str]           # DONATE RELEASED 后的可交接阶段
 | `attach_task(task_id, task_runner) -> None` | **新增注册入口**；验证真实 Ray ActorHandle，绑定 task_session；已有相同绑定可重放，冲突拒绝。 |
 | `detach_task(task_id) -> None` | **新增生命周期入口**；删除 task_runners 和过期 idle_reports，不代表清除运行中的 Lease。 |
 | `get_task_runners() -> dict[str, ActorHandle]` | **新增只读查询**；返回注册快照，避免外部修改内部映射。 |
-| `submit_idle_report(report) -> dict` | **新增空泡上报**；核验 task_session、ReplicaKey 与候选去重，返回 `{"accepted": True, "candidate_count": N}`。 |
-| `submit_operation(command) -> OperationRecord` | **新增操作路由**；校验 Lease、阶段与原 command 幂等；在 RPC **前**记录 operation intent、ADD borrower 或 RESTORE 预留，再转发 TaskRunner。 |
+| `submit_idle_report(report) -> dict` | **新增空泡上报**；核验 task_session、ReplicaKey 与候选去重，记录报告时间；空候选用于撤销先前候选。返回 `{"accepted": True, "candidate_count": N}`。 |
+| `submit_operation(command) -> OperationRecord` | **新增操作路由**；对新 DONATE 强制校验 10 秒内的报告包含精确目标且标为 NATIVE；然后校验 Lease、阶段与命令幂等，并在 RPC **前**记录操作意图及必要预留。 |
 | `_target_matches_donor(target, lease) -> bool` | **内部辅助**；核实本轮 donor identity 与 Lease claim 一致。 |
 | `open_lease(lease) -> Lease` | **GS 内部账本动作**；验证 Claim、PG bundle 和物理设备排他，登记一次 Lease；相同 Lease 可幂等返回快照。 |
 | `advance_lease(lease_id, evidence) -> dict` | **GS 内部对账动作**；仅接受同一操作的合法 evidence，推进 DONATE/REMOVE、RESTORE 成功或 ADD/RESTORE 安全补偿；精确重放保持幂等。 |
 
-**复用点**：见下文模块说明。 |
-| `detach_task(task_id) -> None` | **本模块现有方法**；解除注册。返回值见签名；**复用点**：见下文模块说明。 |
-| `get_task_runners() -> dict` | **本模块现有方法**；查询任务句柄。返回值见签名；**复用点**：见下文模块说明。 |
-| `submit_idle_report(report)` | **本模块现有方法**；接收候选。返回值与异常以源码实现为准；**复用点**：见下文模块说明。 |
-| `submit_operation(command) -> OperationRecord` | **本模块现有方法**；路由命令。返回值见签名；**复用点**：见下文模块说明。 |
-| `open_lease(lease) -> Lease` | **本模块现有方法**；登记 claims。返回值见签名；**复用点**：见下文模块说明。 |
-| `advance_lease(lease_id, evidence) -> dict` | **本模块现有方法**；按真实证据推进租约。返回值见签名；**复用点**：见下文模块说明。 |
-
-**复用点**：复用 Ray named/detached Actor、ActorHandle 与真实 PG 元数据；不代替 VERL ResourcePool。
+**复用点**：复用 Ray named/detached Actor、`ActorHandle`、单写者 Actor 串行语义与真实 PG/Claim 元数据；GS 不代替 VERL ResourcePool，不写 Manager/CE/LB/Rollouter 的 M/E/R/C。
 
 ### 1.8.2 `Discovery` — `scheduler/discovery.py`
 
